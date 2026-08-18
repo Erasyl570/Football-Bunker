@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -92,7 +93,6 @@ async def process_pm_reveal(callback: types.CallbackQuery):
     )
     await callback.message.edit_text(f"✅ <b>{title}</b> успешно отправлена в групповой чат!", parse_mode="HTML")
 
-    # АВТО-ПРОВЕРКА: Все ли вскрылись для этого раунда?
     if await db.are_all_revealed_for_round(chat_id, current_round):
         await bot.send_message(
             chat_id,
@@ -161,7 +161,6 @@ async def start_game(callback: types.CallbackQuery):
     scen = cards.generate_scenario(len(players))
     await db.update_lobby_scenario(chat_id, scen["text"], scen["winners_needed"])
     
-    # Рассылка карточек
     for p_name, p_id, _ in players:
         try:
             card = await db.get_player_card(chat_id, p_id)
@@ -216,9 +215,18 @@ async def process_vote(callback: types.CallbackQuery):
     target_id = int(callback.data.split("_")[1])
     voter = callback.from_user
     
+    # 1. Проверка на живого игрока
     card = await db.get_player_card(chat_id, voter.id)
     if not card or card[10] == 0:
         return await callback.answer("❌ Ты изгнан и не можешь голосовать!", show_alert=True)
+
+    # 2. Нельзя голосовать за себя
+    if voter.id == target_id:
+        return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
+
+    # 3. Нельзя голосовать дважды за один раунд
+    if await db.has_user_voted(chat_id, voter.id):
+        return await callback.answer("⚠️ Ты уже отдал свой голос в этом раунде!", show_alert=True)
 
     async with db.aiosqlite.connect(db.DB_NAME) as conn:
         async with conn.execute("SELECT username FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, target_id)) as cursor:
@@ -253,9 +261,18 @@ async def finish_voting_flow(chat_id: int):
     results_lines = [f"• <b>{t_name}</b>: {count} гол." for _, t_name, count in votes_data]
     results_text = "\n".join(results_lines)
 
-    kicked_id = votes_data[0][0]
-    kicked_name = votes_data[0][1]
-    
+    # Логика определения выбывающего (с обработкой ничьей)
+    max_votes = votes_data[0][2]
+    top_candidates = [v for v in votes_data if v[2] == max_votes]
+
+    tie_note = ""
+    if len(top_candidates) > 1:
+        chosen = random.choice(top_candidates)
+        kicked_id, kicked_name = chosen[0], chosen[1]
+        tie_note = f"\n\n⚽️ <i>Равное количество голосов! В серии пенальти роковой промах совершил <b>{kicked_name}</b>!</i>"
+    else:
+        kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
+
     await db.eliminate_player(chat_id, kicked_id)
     await db.clear_votes(chat_id)
     
@@ -267,10 +284,10 @@ async def finish_voting_flow(chat_id: int):
         winners_str = "\n".join([f"🏆 <b>{p[0]}</b>" for p in alive])
         await bot.send_message(
             chat_id,
-            f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
+            f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}{tie_note}\n\n"
             f"❌ Из команды изгнан: <b>{kicked_name}</b>\n\n"
             f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n\n"
-            f"Контракт с клубом получают лучшие форварды:\n{winners_str}",
+            f"Контракт с клубом получают 2 лучших форварда:\n{winners_str}",
             parse_mode="HTML"
         )
         await db.set_lobby_status(chat_id, "ended")
@@ -284,7 +301,7 @@ async def finish_voting_flow(chat_id: int):
 
         await bot.send_message(
             chat_id,
-            f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
+            f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}{tie_note}\n\n"
             f"❌ Из команды изгнан: <b>{kicked_name}</b>\n\n"
             f"🔥 <b>РАУНД {next_round}!</b>\n"
             f"Осталось претендентов: {len(alive)}. Нужно оставить: {winners_needed}.\n"
