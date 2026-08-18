@@ -48,12 +48,12 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT OR REPLACE INTO lobbies (chat_id, status, host_id, current_round) VALUES (?, 'waiting', ?, 1)",
+            "INSERT OR REPLACE INTO lobbies (chat_id, status, host_id, current_round, winners_needed) VALUES (?, 'waiting', ?, 1, 2)",
             (chat_id, host_id)
         )
         await db.commit()
 
-async def update_lobby_scenario(chat_id: int, scenario: str, winners_needed: int):
+async def update_lobby_scenario(chat_id: int, scenario: str, winners_needed: int = 2):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "UPDATE lobbies SET scenario = ?, winners_needed = ?, status = 'round1', current_round = 1 WHERE chat_id = ?",
@@ -135,6 +135,11 @@ async def reveal_trait(chat_id: int, user_id: int, trait: str):
         await db.execute(f"UPDATE players SET {col} = 1 WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         await db.commit()
 
+async def has_user_voted(chat_id: int, voter_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM votes WHERE chat_id = ? AND voter_id = ?", (chat_id, voter_id)) as cursor:
+            return await cursor.fetchone() is not None
+
 async def add_vote(chat_id: int, voter_id: int, target_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
@@ -145,16 +150,6 @@ async def get_voters_count(chat_id: int):
         async with db.execute("SELECT COUNT(DISTINCT voter_id) FROM votes WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
-
-async def get_voters(chat_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT p.username FROM votes v 
-            JOIN players p ON v.voter_id = p.user_id AND v.chat_id = p.chat_id
-            WHERE v.chat_id = ?
-        """, (chat_id,)) as cursor:
-            rows = await cursor.fetchall()
-            return [r[0] for r in rows]
 
 async def get_votes_detailed(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
