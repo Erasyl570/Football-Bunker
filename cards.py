@@ -83,7 +83,7 @@ def generate_scenario(players_count: int):
         "club": club,
         "winners_needed": winners_needed,
         "text": (
-            f"🏆 <b>СЦЕНАРИЙ: ПОДПИСАНИЕ В {club.upper()}!</b>\n\n"
+            f"🏆 <b>ПОДПИСАНИЕ В {club.upper()}!</b>\n\n"
             f"Клуб <b>{club}</b> срочно ищет <b>{winners_needed} форварда(ов)</b> в основной состав.\n"
             f"Всего претендентов на поле: <b>{players_count}</b>.\n\n"
             f"🎯 <b>Цель:</b> Вскрывайте характеристики, доказывайте свою пользу в чате "
