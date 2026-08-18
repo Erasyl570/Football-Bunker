@@ -1,4 +1,4 @@
- import aiosqlite
+import aiosqlite
 
 DB_NAME = "bunker.db"
 
