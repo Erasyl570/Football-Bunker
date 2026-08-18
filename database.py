@@ -93,6 +93,12 @@ async def get_alive_players(chat_id: int):
         async with db.execute("SELECT username, user_id FROM players WHERE chat_id = ? AND is_alive = 1", (chat_id,)) as cursor:
             return await cursor.fetchall()
 
+async def get_username(chat_id: int, user_id: int) -> str:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT username FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else "Игрок"
+
 async def get_player_card(chat_id: int, user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
@@ -112,7 +118,6 @@ async def get_player_revealed_count(chat_id: int, user_id: int):
             return row[0] if row else 0
 
 async def are_all_revealed_for_round(chat_id: int, current_round: int):
-    # Раунд 1 -> 2 карты, Раунд 2 -> 3 карты, Раунд 3 -> 4 карты, Раунд 4 -> 5 карт
     target_count = min(5, current_round + 1)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
