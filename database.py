@@ -56,7 +56,7 @@ async def create_lobby(chat_id: int, host_id: int):
 async def update_lobby_scenario(chat_id: int, scenario: str, winners_needed: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "UPDATE lobbies SET scenario = ?, winners_needed = ?, status = 'round1' WHERE chat_id = ?",
+            "UPDATE lobbies SET scenario = ?, winners_needed = ?, status = 'round1', current_round = 1 WHERE chat_id = ?",
             (scenario, winners_needed, chat_id)
         )
         await db.commit()
@@ -102,6 +102,24 @@ async def get_player_card(chat_id: int, user_id: int):
         """, (chat_id, user_id)) as cursor:
             return await cursor.fetchone()
 
+async def get_player_revealed_count(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT (rev_pos + rev_health + rev_skill + rev_inv + rev_secret)
+            FROM players WHERE chat_id = ? AND user_id = ?
+        """, (chat_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def are_all_revealed_for_round(chat_id: int, current_round: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT COUNT(*) FROM players 
+            WHERE chat_id = ? AND is_alive = 1 AND (rev_pos + rev_health + rev_skill + rev_inv + rev_secret) < ?
+        """, (chat_id, current_round)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] == 0
+
 async def reveal_trait(chat_id: int, user_id: int, trait: str):
     col_map = {
         "position": "rev_pos",
@@ -121,6 +139,12 @@ async def add_vote(chat_id: int, voter_id: int, target_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
         await db.commit()
+
+async def get_voters_count(chat_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(DISTINCT voter_id) FROM votes WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
 async def get_voters(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
