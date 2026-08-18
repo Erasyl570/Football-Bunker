@@ -122,12 +122,24 @@ async def add_vote(chat_id: int, voter_id: int, target_id: int):
         await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
         await db.commit()
 
-async def get_votes_count(chat_id: int):
+async def get_voters(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
-            SELECT target_id, COUNT(*) as cnt 
-            FROM votes WHERE chat_id = ? 
-            GROUP BY target_id 
+            SELECT p.username FROM votes v 
+            JOIN players p ON v.voter_id = p.user_id AND v.chat_id = p.chat_id
+            WHERE v.chat_id = ?
+        """, (chat_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
+
+async def get_votes_detailed(chat_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT target_id, p_target.username, COUNT(*) as cnt 
+            FROM votes v
+            JOIN players p_target ON v.target_id = p_target.user_id AND v.chat_id = p_target.chat_id
+            WHERE v.chat_id = ?
+            GROUP BY target_id
             ORDER BY cnt DESC
         """, (chat_id,)) as cursor:
             return await cursor.fetchall()
