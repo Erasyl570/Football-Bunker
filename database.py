@@ -48,3 +48,8 @@ async def get_players(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT username, user_id FROM players WHERE chat_id = ?", (chat_id,)) as cursor:
             return await cursor.fetchall()
+
+async def get_player_card(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT position, health, skill, inventory, secret FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
+            return await cursor.fetchone()
