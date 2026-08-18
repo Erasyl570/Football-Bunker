@@ -1,4 +1,4 @@
-import aiosqlite
+ import aiosqlite
 
 DB_NAME = "bunker.db"
 
@@ -112,11 +112,13 @@ async def get_player_revealed_count(chat_id: int, user_id: int):
             return row[0] if row else 0
 
 async def are_all_revealed_for_round(chat_id: int, current_round: int):
+    # Раунд 1 -> 2 карты, Раунд 2 -> 3 карты, Раунд 3 -> 4 карты, Раунд 4 -> 5 карт
+    target_count = min(5, current_round + 1)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
             SELECT COUNT(*) FROM players 
             WHERE chat_id = ? AND is_alive = 1 AND (rev_pos + rev_health + rev_skill + rev_inv + rev_secret) < ?
-        """, (chat_id, current_round)) as cursor:
+        """, (chat_id, target_count)) as cursor:
             row = await cursor.fetchone()
             return row[0] == 0
 
