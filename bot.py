@@ -189,14 +189,12 @@ async def join_game(callback: types.CallbackQuery):
         chat_id = callback.message.chat.id
         user = callback.from_user
         
-        dummy_pack = {
-            "position": "Определится при старте",
-            "health": "Определится при старте",
-            "skill": "Определится при старте",
-            "inventory": "Определится при старте",
-            "secret": "Определится при старте"
+        # Добавляем игрока в базу с пустыми картами до старта
+        empty_pack = {
+            "position": "Ожидает старта", "health": "Ожидает старта",
+            "skill": "Ожидает старта", "inventory": "Ожидает старта", "secret": "Ожидает старта"
         }
-        await db.add_player(chat_id, user.id, user.first_name, dummy_pack)
+        await db.add_player(chat_id, user.id, user.first_name, empty_pack)
         players = await db.get_players(chat_id)
         bot_info = await bot.get_me()
         
@@ -228,6 +226,7 @@ async def start_game(callback: types.CallbackQuery):
 
         await callback.answer("Игра начинается!")
         
+        # Генерируем пачку уникальных карточек форвардов на всех игроков сразу
         packs = cards.generate_game_packs(num_players)
         for idx, (p_name, p_id, _) in enumerate(players):
             await db.add_player(chat_id, p_id, p_name, packs[idx])
