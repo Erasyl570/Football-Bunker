@@ -78,7 +78,7 @@ def generate_player_pack():
 
 def generate_scenario(players_count: int):
     club = random.choice(CLUBS)
-    winners_needed = 2 if players_count >= 4 else 1
+    winners_needed = 2  # Всегда оставляем 2 победителя
     return {
         "club": club,
         "winners_needed": winners_needed,
