@@ -13,6 +13,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Порядок вскрытия карт: (код, название_в_чате, название_для_кнопки, индекс_в_card)
+TRAITS_ORDER = [
+    ("position", "⚽️ Позиция", "⚽️ Вскрыть Позицию", 0),
+    ("health", "🏥 Здоровье/Физуха", "🏥 Вскрыть Здоровье", 1),
+    ("skill", "🎯 Навык", "🎯 Вскрыть Навык", 2),
+    ("inventory", "🎒 Багаж", "🎒 Вскрыть Багаж", 3),
+    ("secret", "🤫 Секрет", "🤫 Вскрыть Секрет", 4)
+]
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject):
     args = command.args
@@ -39,29 +48,36 @@ async def show_trait_menu_pm(user_id: int, chat_id: int, message_obj: types.Mess
     target_count = min(5, current_round + 1)
     revealed_count = await db.get_player_revealed_count(chat_id, user_id)
 
+    # Формируем карточку игрока со статусом открытия карт
+    card_text_lines = ["🎴 <b>ТВОЯ КАРТОЧКА ИГРОКА:</b>\n"]
+    for trait_code, title, _, idx in TRAITS_ORDER:
+        val = card[idx]
+        is_rev = card[idx + 5]
+        if is_rev:
+            card_text_lines.append(f"{title}: <b>{val}</b> 🔓")
+        else:
+            card_text_lines.append(f"{title}: <i>[Скрыто 🔒]</i>")
+
+    card_status = "\n".join(card_text_lines)
+
     if revealed_count >= target_count:
         return await message_obj.answer(
-            f"⚠️ <b>Ты уже вскрыл нужное количество карт ({revealed_count}/{target_count}) для Раунда {current_round}!</b>\n"
-            f"Дождись остальных участников и фазы обсуждения.", 
+            f"{card_status}\n\n"
+            f"✅ <b>Ты открыл нужное количество карт ({revealed_count}/{target_count}) для Раунда {current_round}!</b>\n"
+            f"Возвращайся в общий чат и жди остальных участников.", 
             parse_mode="HTML"
         )
 
+    next_trait = TRAITS_ORDER[revealed_count]
+    next_code, next_title, next_btn_text, _ = next_trait
+
     builder = InlineKeyboardBuilder()
-    labels = [
-        ("⚽ Позиция", "position", card[5]),
-        ("🏥 Здоровье", "health", card[6]),
-        ("🎯 Навык", "skill", card[7]),
-        ("🎒 Багаж", "inventory", card[8]),
-        ("🤫 Секрет", "secret", card[9])
-    ]
-    
-    for name, code, is_rev in labels:
-        if is_rev == 0:
-            builder.button(text=f"Открыть {name}", callback_data=f"pmrev_{chat_id}_{code}")
-            
-    builder.adjust(2)
+    builder.button(text=f"🔓 {next_btn_text}", callback_data=f"pmrev_{chat_id}_{next_code}")
+
     await message_obj.answer(
-        f"🎴 <b>Раунд {current_round}: Выбери карту для вскрытия в чат ({revealed_count}/{target_count}):</b>", 
+        f"{card_status}\n\n"
+        f"🎯 <b>Раунд {current_round} ({revealed_count}/{target_count} открыто):</b>\n"
+        f"Следующая карта для вскрытия в общий чат: <b>{next_title}</b>", 
         reply_markup=builder.as_markup(), 
         parse_mode="HTML"
     )
@@ -90,7 +106,7 @@ async def process_pm_reveal(callback: types.CallbackQuery):
 
     val_map = {
         "position": (card[0], "⚽️ Позицию"),
-        "health": (card[1], "🏥 Здоровье"),
+        "health": (card[1], "🏥 Здоровье/Физуху"),
         "skill": (card[2], "🎯 Навык"),
         "inventory": (card[3], "🎒 Багаж"),
         "secret": (card[4], "🤫 Секрет")
@@ -99,25 +115,24 @@ async def process_pm_reveal(callback: types.CallbackQuery):
 
     await bot.send_message(
         chat_id, 
-        f"📢 <b>{user.first_name}</b> показывает всем свою <b>{title}</b>:\n👉 <i>{val}</i>", 
+        f"📢 <b>{user.first_name}</b> вскрывает свой параметр <b>{title}</b>:\n👉 <i>{val}</i>", 
         parse_mode="HTML"
     )
 
     if new_revealed_count < target_count:
         await callback.message.edit_text(
             f"✅ <b>{title}</b> отправлена в чат!\n\n"
-            f"⚠️ В этом раунде тебе нужно открыть еще 1 карту ({new_revealed_count}/{target_count}).", 
+            f"⚠️ В этом раунде тебе нужно открыть еще 1 карту.", 
             parse_mode="HTML"
         )
         await show_trait_menu_pm(user.id, chat_id, callback.message)
     else:
         await callback.message.edit_text(
             f"✅ <b>{title}</b> отправлена в чат!\n\n"
-            f"🎉 Ты открыл все требуемые карты ({new_revealed_count}/{target_count}) для Раунда {current_round}! Возвращайся в общий чат.", 
+            f"🎉 Все карты на Раунд {current_round} открыты ({new_revealed_count}/{target_count})! Возвращайся в общий чат.", 
             parse_mode="HTML"
         )
 
-    # АВТО-ПРОВЕРКА: Все ли открыли нужные карты?
     if await db.are_all_revealed_for_round(chat_id, current_round):
         curr_lobby = await db.get_lobby(chat_id)
         if curr_lobby[0] not in ["discussion", "voting"]:
@@ -128,15 +143,13 @@ async def process_pm_reveal(callback: types.CallbackQuery):
                 chat_id,
                 f"🎉 <b>Все живые игроки открыли по {req_cards}!</b>\n\n"
                 f"💬 <b>ОБСУЖДЕНИЕ (1 МИНУТА)!</b>\n"
-                f"У вас есть 60 секунд, чтобы обсудить кандидатов в чате и аргументировать, кто менее достоин контракта.\n\n"
+                f"У вас есть 60 секунд, чтобы обсудить кандидатов и решить, кто меньше всего подходит команде.\n\n"
                 f"⏳ <i>Голосование начнется автоматически через 1 минуту...</i>",
                 parse_mode="HTML"
             )
             
-            # Запускаем 1-минутный таймер обсуждения
             await asyncio.sleep(60)
             
-            # Проверяем, что лобби еще активно
             check_lobby = await db.get_lobby(chat_id)
             if check_lobby and check_lobby[0] == "discussion":
                 await start_voting_flow(chat_id, current_round)
@@ -169,7 +182,15 @@ async def join_game(callback: types.CallbackQuery):
     chat_id = callback.message.chat.id
     user = callback.from_user
     
-    await db.add_player(chat_id, user.id, user.first_name, cards.generate_player_pack())
+    # Временный пак при присоединении
+    dummy_pack = {
+        "position": "Определится при старте",
+        "health": "Определится при старте",
+        "skill": "Определится при старте",
+        "inventory": "Определится при старте",
+        "secret": "Определится при старте"
+    }
+    await db.add_player(chat_id, user.id, user.first_name, dummy_pack)
     players = await db.get_players(chat_id)
     bot_info = await bot.get_me()
     
@@ -191,26 +212,32 @@ async def join_game(callback: types.CallbackQuery):
 async def start_game(callback: types.CallbackQuery):
     chat_id = callback.message.chat.id
     players = await db.get_players(chat_id)
+    num_players = len(players)
     
-    if len(players) < 3:
-        return await callback.answer(f"⚠️ Сейчас участников: {len(players)}. Нужно минимум 3 человека!", show_alert=True)
+    if num_players < 3:
+        return await callback.answer(f"⚠️ Сейчас участников: {num_players}. Нужно минимум 3 человека!", show_alert=True)
 
     await callback.answer("Игра начинается!")
     
-    scen = cards.generate_scenario(len(players))
+    # Генерируем уникальные карточки для каждого игрока без повторов!
+    packs = cards.generate_game_packs(num_players)
+    for idx, (p_name, p_id, _) in enumerate(players):
+        await db.add_player(chat_id, p_id, p_name, packs[idx])
+
+    scen = cards.generate_scenario(num_players)
     await db.update_lobby_scenario(chat_id, scen["text"], scen["winners_needed"])
     
-    for p_name, p_id, _ in players:
+    for idx, (p_name, p_id, _) in enumerate(players):
         try:
-            card = await db.get_player_card(chat_id, p_id)
+            pack = packs[idx]
             text_card = (
-                f"🎴 <b>ТВОЯ КАРТОЧКА ИГРОКА</b>\n\n"
-                f"⚽️ <b>Позиция:</b> {card[0]}\n"
-                f"🏥 <b>Физуха/Здоровье:</b> {card[1]}\n"
-                f"🎯 <b>Навык:</b> {card[2]}\n"
-                f"🎒 <b>Багаж:</b> {card[3]}\n"
-                f"🤫 <b>Секрет:</b> {card[4]}\n\n"
-                f"<i>Вскрывай характеристики по одной через меню бота!</i>"
+                f"🎴 <b>ТВОЯ КАРТОЧКА ИГРОКА СФОРМИРОВАНА!</b>\n\n"
+                f"⚽️ <b>Позиция:</b> {pack['position']}\n"
+                f"🏥 <b>Здоровье:</b> {pack['health']}\n"
+                f"🎯 <b>Навык:</b> {pack['skill']}\n"
+                f"🎒 <b>Багаж:</b> {pack['inventory']}\n"
+                f"🤫 <b>Секрет:</b> {pack['secret']}\n\n"
+                f"<i>Вскрывай характеристики по порядку через меню бота!</i>"
             )
             await bot.send_message(p_id, text_card, parse_mode="HTML")
         except Exception:
@@ -224,8 +251,8 @@ async def start_game(callback: types.CallbackQuery):
     await callback.message.edit_text(
         f"{scen['text']}\n\n"
         f"🔥 <b>РАУНД 1: Вскрытие карт</b>\n"
-        f"Каждому игроку нужно вскрыть <b>2 характеристики</b> перед обсуждением!\n"
-        f"Нажмите кнопку ниже, чтобы перейти в ЛС и выбрать карты.",
+        f"Каждому игроку нужно последовательно вскрыть <b>2 характеристики</b> (Позицию и Здоровье)!\n"
+        f"Нажмите кнопку ниже, чтобы перейти в ЛС и открыть первую карту.",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
@@ -265,10 +292,7 @@ async def process_vote(callback: types.CallbackQuery):
     if await db.has_user_voted(chat_id, voter.id):
         return await callback.answer("⚠️ Ты уже отдал свой голос в этом раунде!", show_alert=True)
 
-    async with db.aiosqlite.connect(db.DB_NAME) as conn:
-        async with conn.execute("SELECT username FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, target_id)) as cursor:
-            row = await cursor.fetchone()
-            target_name = row[0] if row else "Игрока"
+    target_name = await db.get_username(chat_id, target_id)
 
     await db.add_vote(chat_id, voter.id, target_id)
     await callback.answer("Твой голос принят!")
@@ -321,7 +345,7 @@ async def finish_voting_flow(chat_id: int):
             f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}{tie_note}\n\n"
             f"❌ Из команды изгнан: <b>{kicked_name}</b>\n\n"
             f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n\n"
-            f"Контракт с клубом получают 2 лучших форварда:\n{winners_str}",
+            f"Контракт с клубом получают лучшие игроки:\n{winners_str}",
             parse_mode="HTML"
         )
         await db.set_lobby_status(chat_id, "ended")
@@ -339,7 +363,7 @@ async def finish_voting_flow(chat_id: int):
             f"❌ Из команды изгнан: <b>{kicked_name}</b>\n\n"
             f"🔥 <b>РАУНД {next_round}!</b>\n"
             f"Осталось претендентов: {len(alive)}. Нужно оставить: {winners_needed}.\n"
-            f"Перейдите в ЛС бота для выбора следующей карты!",
+            f"Перейдите в ЛС бота для вскрытия следующей карты!",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
         )
