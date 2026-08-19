@@ -33,62 +33,78 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
-async def auto_reveal_afk_players(chat_id: int, current_round: int):
-    """Случайно вскрывает карту тем, кто был AFK более 45 секунд."""
-    alive_players = await db.get_alive_players(chat_id)
-    
-    trait_names = {
-        "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
-        "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет"
-    }
-
-    for p_name, p_id in alive_players:
-        if not await db.has_revealed_in_round(chat_id, p_id, current_round):
-            unrevealed = await db.get_unrevealed_traits(chat_id, p_id)
-            if unrevealed:
-                chosen_trait = random.choice(unrevealed)
-                pack = await db.get_player_pack(chat_id, p_id)
-                
-                val = pack.get(chosen_trait, "-")
-                if chosen_trait == "age" and val != "-":
-                    val = f"{val} лет"
-                
-                await db.record_reveal(chat_id, p_id, chosen_trait, current_round)
-                
-                safe_name = html.escape(p_name)
-                safe_val = html.escape(str(val))
-                trait_title = trait_names.get(chosen_trait, chosen_trait)
-                
-                await bot.send_message(
-                    chat_id,
-                    f"⏱ <b>{safe_name}</b> не успел открыться! Бот автоматически открыл [{trait_title}]:\n👉 <b>{safe_val}</b>",
-                    parse_mode="HTML"
-                )
+async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, current_round: int):
+    unrevealed = await db.get_unrevealed_traits(chat_id, user_id)
+    if unrevealed:
+        chosen_trait = random.choice(unrevealed)
+        pack = await db.get_player_pack(chat_id, user_id)
+        
+        trait_names = {
+            "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
+            "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет"
+        }
+        
+        val = pack.get(chosen_trait, "-")
+        if chosen_trait == "age" and val != "-":
+            val = f"{val} лет"
+        
+        await db.record_reveal(chat_id, user_id, chosen_trait, current_round)
+        
+        safe_name = html.escape(user_name)
+        safe_val = html.escape(str(val))
+        trait_title = trait_names.get(chosen_trait, chosen_trait)
+        
+        await bot.send_message(
+            chat_id,
+            f"⏱ <b>{safe_name}</b> не успел открыть карту! Бот автоматически вскрыл [{trait_title}]:\n👉 <b>{safe_val}</b>",
+            parse_mode="HTML"
+        )
 
 async def start_round_flow(chat_id: int, current_round: int):
     all_players = await db.get_players(chat_id)
     total_count = len(all_players)
     bot_info = await bot.get_me()
 
-    # --- ЭТАП 1: ФАЗА ВСКРЫТИЯ КАРТ (45 СЕКУНД) ---
+    # --- ЭТАП 1: ПООЧЕРЕДНОЕ ВСКРЫТИЕ КАРТ ---
     await db.set_lobby_status(chat_id, "reveal_phase", current_round)
+    alive_players = await db.get_alive_players(chat_id)
     
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📩 Открыть карту в ЛС", url=f"https://t.me/{bot_info.username}")
-
     await bot.send_message(
         chat_id,
-        f"📢 <b>РАУНД {current_round}: ФАЗА ВСКРЫТИЯ КАРТ!</b>\n\n"
-        f"Перейдите в ЛС бота и выберите <b>1 карту</b> для публикации.\n"
-        f"⏳ <i>У вас есть 45 секунд! Если не успеете — бот откроет случайную карту за вас.</i>",
-        reply_markup=builder.as_markup(),
+        f"📢 <b>РАУНД {current_round}: ПООЧЕРЕДНОЕ ВСКРЫТИЕ КАРТ!</b>\n\n"
+        f"Игроки вытягивают по 1 карте строго по очереди.",
         parse_mode="HTML"
     )
-    
-    await asyncio.sleep(45)
-    
-    # Авто-вскрытие для AFK
-    await auto_reveal_afk_players(chat_id, current_round)
+
+    for p_name, p_id in alive_players:
+        await db.set_current_turn(chat_id, p_id)
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="📩 Открыть карту в ЛС", url=f"https://t.me/{bot_info.username}")
+        
+        safe_p_name = html.escape(p_name)
+        await bot.send_message(
+            chat_id,
+            f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n\n"
+            f"👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n"
+            f"⏳ <i>У тебя 25 секунд...</i>",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+        # Ждем 25 секунд либо пока игрок сам не откроет карту
+        for _ in range(25):
+            if await db.has_revealed_in_round(chat_id, p_id, current_round):
+                break
+            await asyncio.sleep(1)
+
+        # Если игрок так и не открыл карту за 25 секунд
+        if not await db.has_revealed_in_round(chat_id, p_id, current_round):
+            await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
+
+        await asyncio.sleep(2)
+
+    await db.set_current_turn(chat_id, 0)
 
     # --- ЭТАП 2: ФАЗА ОБСУЖДЕНИЯ (60 СЕКУНД) ---
     await db.set_lobby_status(chat_id, "discussion", current_round)
@@ -209,7 +225,7 @@ async def start_game(callback: types.CallbackQuery):
                 f"• Навык: {html.escape(pack['skill'])}\n"
                 f"• Багаж: {html.escape(pack['inventory'])}\n"
                 f"• Секрет: <i>{html.escape(pack['secret'])}</i>\n\n"
-                f"👇 <i>Нажимай кнопки ниже, чтобы открыть 1 карту за раунд в общий чат:</i>"
+                f"👇 <i>Нажимай кнопки ниже, когда настанет ТВОЯ очередь:</i>"
             )
             
             markup = await build_reveal_keyboard(chat_id, p_id)
@@ -254,11 +270,18 @@ async def process_reveal(callback: types.CallbackQuery):
             
         current_round = lobby[4]
 
+        # Проверка очереди хода
+        current_turn_id = await db.get_current_turn(target_chat_id)
+        if current_turn_id != user.id:
+            turn_username = await db.get_username(target_chat_id, current_turn_id)
+            safe_turn_user = html.escape(turn_username)
+            return await callback.answer(f"⚠️ Сейчас очередь игрока {safe_turn_user}! Дождись своего хода.", show_alert=True)
+
         if await db.is_trait_revealed(target_chat_id, user.id, trait):
             return await callback.answer("⚠️ Ты уже вскрыл эту характеристику!", show_alert=True)
 
         if await db.has_revealed_in_round(target_chat_id, user.id, current_round):
-            return await callback.answer(f"⚠️ В Раунде {current_round} ты уже открыл 1 карту! Дождись следующего раунда.", show_alert=True)
+            return await callback.answer(f"⚠️ В Раунде {current_round} ты уже открыл 1 карту!", show_alert=True)
 
         pack = await db.get_player_pack(target_chat_id, user.id)
         if not pack:
@@ -318,7 +341,6 @@ async def start_voting_flow(chat_id: int, round_num: int):
 
     await asyncio.sleep(60)
 
-    # Таймаут голосования: кикаем молчунов
     lobby = await db.get_lobby(chat_id)
     if lobby and lobby[0] == "voting":
         non_voters = await db.get_non_voted_alive_players(chat_id)
@@ -381,7 +403,6 @@ async def finish_voting_flow(chat_id: int):
     alive = await db.get_alive_players(chat_id)
     winners_needed = 2
 
-    # Если все были AFK и никто не проголосовал
     if not votes_data:
         if len(alive) <= winners_needed and len(alive) > 0:
             winners_str = "\n".join([f"🏆 <b>{html.escape(p[0])}</b>" for p in alive])
