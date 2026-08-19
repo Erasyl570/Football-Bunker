@@ -33,50 +33,56 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
-async def start_discussion_and_voting(chat_id: int, current_round: int):
-    await db.set_lobby_status(chat_id, "discussion", current_round)
-    
+async def start_round_flow(chat_id: int, current_round: int):
+    """Управляет раундом: сначала даёт время на вскрытие карт, затем запускает обсуждение."""
     all_players = await db.get_players(chat_id)
     total_count = len(all_players)
 
-    # ДЛЯ 3 ИЛИ 4 ИГРОКОВ: Раунды 1 и 2 без голосования
-    if total_count in (3, 4) and current_round < 3:
-        await bot.send_message(
-            chat_id,
-            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (90 СЕКУНД)!</b>\n\n"
-            f"Так как в игре {total_count} претендентов, голосование откроется <b>в Раунде 3</b>!\n"
-            f"Открывайте по <b>1 карте за раунд</b> в ЛС и доказывайте свою полезность.\n\n"
-            f"⏳ <i>Раунд {current_round + 1} начнется через 90 секунд...</i>",
-            parse_mode="HTML"
-        )
-        await asyncio.sleep(90)
-        
-        check_lobby = await db.get_lobby(chat_id)
-        if check_lobby and check_lobby[0] == "discussion":
-            next_round = current_round + 1
-            await start_discussion_and_voting(chat_id, next_round)
-        return
+    # --- ЭТАП 1: ФАЗА ВСКРЫТИЯ КАРТ (30 СЕКУНД) ---
+    await db.set_lobby_status(chat_id, "reveal_phase", current_round)
+    await bot.send_message(
+        chat_id,
+        f"📢 <b>РАУНД {current_round}: ФАЗА ВСКРЫТИЯ КАРТ!</b>\n\n"
+        f"Перейдите в ЛС с ботом и нажмите кнопку, чтобы открыть <b>1 карту</b> в общий чат!\n"
+        f"⏳ <i>На вскрытие дается 30 секунд, после чего начнется обсуждение...</i>",
+        parse_mode="HTML"
+    )
+    await asyncio.sleep(30)
 
-    if total_count in (3, 4) and current_round == 3:
-        msg_text = (
-            f"💬 <b>РАУНД 3: ВЕШАЮТСЯ КАРТЫ (90 СЕКУНД)!</b>\n\n"
-            f"🔓 <b>Вскрывайте карты в ЛС!</b>\n"
-            f"Приготовьтесь к первому решающему голосованию!\n\n"
+    # --- ЭТАП 2: ФАЗА ОБСУЖДЕНИЯ (90 СЕКУНД) ---
+    await db.set_lobby_status(chat_id, "discussion", current_round)
+
+    if total_count in (3, 4) and current_round < 3:
+        discussion_msg = (
+            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (90 СЕКУНД)!</b>\n\n"
+            f"Так как в игре {total_count} претендентов, первое голосование откроется <b>в Раунде 3</b>!\n"
+            f"Обсуждайте открытые характеристики и убедите команду оставить вас в составе.\n\n"
+            f"⏳ <i>Раунд {current_round + 1} начнется через 90 секунд...</i>"
+        )
+    elif total_count in (3, 4) and current_round == 3:
+        discussion_msg = (
+            f"💬 <b>РАУНД 3: ОБСУЖДЕНИЕ И ПОДГОТОВКА К ГОЛОСОВАНИЮ (90 СЕКУНД)!</b>\n\n"
+            f"Анализируйте карты соперников! По окончании таймера откроется голосование на вылет!\n\n"
             f"⏳ <i>Голосование начнется через 90 секунд...</i>"
         )
     else:
-        msg_text = (
+        discussion_msg = (
             f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (90 СЕКУНД)!</b>\n\n"
-            f"Вскрывайте карты в ЛС (максимум 1 за раунд) и убедите команду оставить вас!\n\n"
+            f"Обсуждайте характеристики соперников и доказывайте, почему вы полезнее для клуба!\n\n"
             f"⏳ <i>Голосование начнется через 90 секунд...</i>"
         )
 
-    await bot.send_message(chat_id, msg_text, parse_mode="HTML")
+    await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
     await asyncio.sleep(90)
-    
+
+    # Переход к голосованию или следующему раунду
     check_lobby = await db.get_lobby(chat_id)
     if check_lobby and check_lobby[0] == "discussion":
-        await start_voting_flow(chat_id, current_round)
+        if total_count in (3, 4) and current_round < 3:
+            next_round = current_round + 1
+            await start_round_flow(chat_id, next_round)
+        else:
+            await start_voting_flow(chat_id, current_round)
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -178,18 +184,20 @@ async def start_game(callback: types.CallbackQuery):
         
         pm_warning = ""
         if failed_pm_players:
-            pm_warning = f"\n\n⚠️ <b>ВНИМАНИЕ!</b> Следующие игроки не запустили бота в ЛС:\n" + ", ".join(failed_pm_players) + f"\nНажмите 👉 @{bot_username} и запустите бота!"
+            pm_warning = f"\n\n⚠️ <b>ВНИМАНИЕ!</b> Не получили карты в ЛС:\n" + ", ".join(failed_pm_players) + f"\nНажмите 👉 @{bot_username} и нажмите Start!"
 
-        await callback.message.edit_text(
+        # Публикуем сценарий отдельным сообщением в чат
+        scenario_msg = (
+            f"🎬 <b>СЦЕНАРИЙ ИГРЫ:</b>\n\n"
             f"{scen['text']}\n\n"
             f"👥 <b>ПРЕТЕНДЕНТЫ НА КОНТРАКТ:</b>\n{players_list_str}\n\n"
-            f"📩 <b>Карточки и кнопки отправлены каждому игроку в ЛС!</b>{pm_warning}\n\n"
-            f"🔥 Через 10 секунд начнется Раунд 1!",
-            parse_mode="HTML"
+            f"📩 <b>Карточки и кнопки отправлены каждому в ЛС!</b>{pm_warning}\n\n"
+            f"🔥 <i>Через 10 секунд начнется Раунд 1!</i>"
         )
+        await bot.send_message(chat_id, scenario_msg, parse_mode="HTML")
 
         await asyncio.sleep(10)
-        await start_discussion_and_voting(chat_id, 1)
+        await start_round_flow(chat_id, 1)
 
     except Exception as e:
         await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
@@ -208,11 +216,9 @@ async def process_reveal(callback: types.CallbackQuery):
             
         current_round = lobby[4]
 
-        # 1. Проверка: Открывал ли уже эту карту?
         if await db.is_trait_revealed(target_chat_id, user.id, trait):
             return await callback.answer("⚠️ Ты уже вскрыл эту характеристику!", show_alert=True)
 
-        # 2. Проверка КД: Не больше 1 карты за раунд!
         if await db.has_revealed_in_round(target_chat_id, user.id, current_round):
             return await callback.answer(f"⚠️ В Раунде {current_round} ты уже открыл 1 карту! Дождись следующего раунда.", show_alert=True)
 
@@ -221,9 +227,9 @@ async def process_reveal(callback: types.CallbackQuery):
             return await callback.answer("❌ Ошибка: ты не найден в этой игре!", show_alert=True)
 
         trait_titles = {
-            "position": ("Позицию", pack.get("position", "-")),
+            "position": ("Позиция", pack.get("position", "-")),
             "age": ("Возраст", f"{pack.get('age', '-')} лет"),
-            "price": ("Трансферную цену", pack.get("price", "-")),
+            "price": ("Трансферная цена", pack.get("price", "-")),
             "health": ("Здоровье", pack.get("health", "-")),
             "skill": ("Навык", pack.get("skill", "-")),
             "inventory": ("Багаж", pack.get("inventory", "-")),
@@ -235,23 +241,22 @@ async def process_reveal(callback: types.CallbackQuery):
 
         title, value = trait_titles[trait]
         
-        # Записываем открытие
         await db.record_reveal(target_chat_id, user.id, trait, current_round)
 
-        # Отправляем сообщение в общий чат
         safe_name = html.escape(user.first_name)
         safe_val = html.escape(str(value))
+        
+        # Отправляем в общий чат громкий анонс открытой карты
         await bot.send_message(
             target_chat_id,
-            f"🔓 <b>{safe_name}</b> открывает {title}:\n👉 <b>{safe_val}</b>",
+            f"🔓 <b>{safe_name}</b> открывает карту [<b>{title}</b>]:\n👉 <b>{safe_val}</b>",
             parse_mode="HTML"
         )
         
-        # Обновляем кнопки в ЛС (скрываем нажатую)
         new_markup = await build_reveal_keyboard(target_chat_id, user.id)
         await callback.message.edit_reply_markup(reply_markup=new_markup)
         
-        await callback.answer(f"Ты открыл {title} в общем чате!")
+        await callback.answer(f"Ты открыл карту {title} в общем чате!")
 
     except Exception as e:
         await callback.answer(f"❌ Ошибка отправки: {e}", show_alert=True)
@@ -342,7 +347,7 @@ async def finish_voting_flow(chat_id: int):
             f"Переходим к Раунду {next_round}. В игре остаются все {len(alive)} претендентов.",
             parse_mode="HTML"
         )
-        await start_discussion_and_voting(chat_id, next_round)
+        await start_round_flow(chat_id, next_round)
         return
 
     kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
@@ -375,7 +380,7 @@ async def finish_voting_flow(chat_id: int):
             f"Переходим к Раунду {next_round}. Осталось игроков: {len(alive)}.",
             parse_mode="HTML"
         )
-        await start_discussion_and_voting(chat_id, next_round)
+        await start_round_flow(chat_id, next_round)
 
 async def handle_ping(request):
     return web.Response(text="Bot Alive")
