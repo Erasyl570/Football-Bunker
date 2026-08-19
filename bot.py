@@ -1,6 +1,7 @@
 import asyncio
 import html
 import os
+import random
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -14,7 +15,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 async def build_reveal_keyboard(chat_id: int, user_id: int):
-    """Генерирует клавиатуру в ЛС только с теми картами, которые ещё не вскрыты."""
     builder = InlineKeyboardBuilder()
     traits = [
         ("position", "📢 Позицию"),
@@ -33,54 +33,93 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
+async def auto_reveal_afk_players(chat_id: int, current_round: int):
+    """Случайно вскрывает карту тем, кто был AFK более 45 секунд."""
+    alive_players = await db.get_alive_players(chat_id)
+    
+    trait_names = {
+        "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
+        "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет"
+    }
+
+    for p_name, p_id in alive_players:
+        if not await db.has_revealed_in_round(chat_id, p_id, current_round):
+            unrevealed = await db.get_unrevealed_traits(chat_id, p_id)
+            if unrevealed:
+                chosen_trait = random.choice(unrevealed)
+                pack = await db.get_player_pack(chat_id, p_id)
+                
+                val = pack.get(chosen_trait, "-")
+                if chosen_trait == "age" and val != "-":
+                    val = f"{val} лет"
+                
+                await db.record_reveal(chat_id, p_id, chosen_trait, current_round)
+                
+                safe_name = html.escape(p_name)
+                safe_val = html.escape(str(val))
+                trait_title = trait_names.get(chosen_trait, chosen_trait)
+                
+                await bot.send_message(
+                    chat_id,
+                    f"⏱ <b>{safe_name}</b> не успел открыться! Бот автоматически открыл [{trait_title}]:\n👉 <b>{safe_val}</b>",
+                    parse_mode="HTML"
+                )
+
 async def start_round_flow(chat_id: int, current_round: int):
-    """Управляет раундом: сначала даёт время на вскрытие карт, затем запускает обсуждение."""
     all_players = await db.get_players(chat_id)
     total_count = len(all_players)
+    bot_info = await bot.get_me()
 
-    # --- ЭТАП 1: ФАЗА ВСКРЫТИЯ КАРТ (30 СЕКУНД) ---
+    # --- ЭТАП 1: ФАЗА ВСКРЫТИЯ КАРТ (45 СЕКУНД) ---
     await db.set_lobby_status(chat_id, "reveal_phase", current_round)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📩 Открыть карту в ЛС", url=f"https://t.me/{bot_info.username}")
+
     await bot.send_message(
         chat_id,
         f"📢 <b>РАУНД {current_round}: ФАЗА ВСКРЫТИЯ КАРТ!</b>\n\n"
-        f"Перейдите в ЛС с ботом и нажмите кнопку, чтобы открыть <b>1 карту</b> в общий чат!\n"
-        f"⏳ <i>На вскрытие дается 30 секунд, после чего начнется обсуждение...</i>",
+        f"Перейдите в ЛС бота и выберите <b>1 карту</b> для публикации.\n"
+        f"⏳ <i>У вас есть 45 секунд! Если не успеете — бот откроет случайную карту за вас.</i>",
+        reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
-    await asyncio.sleep(30)
+    
+    await asyncio.sleep(45)
+    
+    # Авто-вскрытие для AFK
+    await auto_reveal_afk_players(chat_id, current_round)
 
-    # --- ЭТАП 2: ФАЗА ОБСУЖДЕНИЯ (90 СЕКУНД) ---
+    # --- ЭТАП 2: ФАЗА ОБСУЖДЕНИЯ (60 СЕКУНД) ---
     await db.set_lobby_status(chat_id, "discussion", current_round)
 
     if total_count in (3, 4) and current_round < 3:
         discussion_msg = (
-            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (90 СЕКУНД)!</b>\n\n"
-            f"Так как в игре {total_count} претендентов, первое голосование откроется <b>в Раунде 3</b>!\n"
-            f"Обсуждайте открытые характеристики и убедите команду оставить вас в составе.\n\n"
-            f"⏳ <i>Раунд {current_round + 1} начнется через 90 секунд...</i>"
+            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (60 СЕКУНД)!</b>\n\n"
+            f"Первое голосование откроется <b>в Раунде 3</b>.\n"
+            f"Обсуждайте открытые карты и доказывайте свою пользу!\n\n"
+            f"⏳ <i>Раунд {current_round + 1} начнется через 60 секунд...</i>"
         )
     elif total_count in (3, 4) and current_round == 3:
         discussion_msg = (
-            f"💬 <b>РАУНД 3: ОБСУЖДЕНИЕ И ПОДГОТОВКА К ГОЛОСОВАНИЮ (90 СЕКУНД)!</b>\n\n"
-            f"Анализируйте карты соперников! По окончании таймера откроется голосование на вылет!\n\n"
-            f"⏳ <i>Голосование начнется через 90 секунд...</i>"
+            f"💬 <b>РАУНД 3: ОБСУЖДЕНИЕ (60 СЕКУНД)!</b>\n\n"
+            f"Готовьтесь к первому голосованию на вылет!\n\n"
+            f"⏳ <i>Голосование начнется через 60 секунд...</i>"
         )
     else:
         discussion_msg = (
-            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (90 СЕКУНД)!</b>\n\n"
-            f"Обсуждайте характеристики соперников и доказывайте, почему вы полезнее для клуба!\n\n"
-            f"⏳ <i>Голосование начнется через 90 секунд...</i>"
+            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (60 СЕКУНД)!</b>\n\n"
+            f"Обсуждайте карты и решите, кто покидает команду.\n\n"
+            f"⏳ <i>Голосование начнется через 60 секунд...</i>"
         )
 
     await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
-    await asyncio.sleep(90)
+    await asyncio.sleep(60)
 
-    # Переход к голосованию или следующему раунду
     check_lobby = await db.get_lobby(chat_id)
     if check_lobby and check_lobby[0] == "discussion":
         if total_count in (3, 4) and current_round < 3:
-            next_round = current_round + 1
-            await start_round_flow(chat_id, next_round)
+            await start_round_flow(chat_id, current_round + 1)
         else:
             await start_voting_flow(chat_id, current_round)
 
@@ -186,7 +225,6 @@ async def start_game(callback: types.CallbackQuery):
         if failed_pm_players:
             pm_warning = f"\n\n⚠️ <b>ВНИМАНИЕ!</b> Не получили карты в ЛС:\n" + ", ".join(failed_pm_players) + f"\nНажмите 👉 @{bot_username} и нажмите Start!"
 
-        # Публикуем сценарий отдельным сообщением в чат
         scenario_msg = (
             f"🎬 <b>СЦЕНАРИЙ ИГРЫ:</b>\n\n"
             f"{scen['text']}\n\n"
@@ -240,13 +278,11 @@ async def process_reveal(callback: types.CallbackQuery):
             return await callback.answer("❌ Неизвестная характеристика!")
 
         title, value = trait_titles[trait]
-        
         await db.record_reveal(target_chat_id, user.id, trait, current_round)
 
         safe_name = html.escape(user.first_name)
         safe_val = html.escape(str(value))
         
-        # Отправляем в общий чат громкий анонс открытой карты
         await bot.send_message(
             target_chat_id,
             f"🔓 <b>{safe_name}</b> открывает карту [<b>{title}</b>]:\n👉 <b>{safe_val}</b>",
@@ -255,7 +291,6 @@ async def process_reveal(callback: types.CallbackQuery):
         
         new_markup = await build_reveal_keyboard(target_chat_id, user.id)
         await callback.message.edit_reply_markup(reply_markup=new_markup)
-        
         await callback.answer(f"Ты открыл карту {title} в общем чате!")
 
     except Exception as e:
@@ -273,12 +308,29 @@ async def start_voting_flow(chat_id: int, round_num: int):
 
     await bot.send_message(
         chat_id,
-        f"🗳 <b>ОБСУЖДЕНИЕ ОКОНЧЕНО! НАЧИНАЕТСЯ ГОЛОСОВАНИЕ (Раунд {round_num})!</b>\n\n"
-        f"Голосуйте кнопками ниже, кого изгнать из команды:\n"
+        f"🗳 <b>НАЧИНАЕТСЯ ГОЛОСОВАНИЕ (Раунд {round_num})!</b>\n\n"
+        f"Голосуйте кнопками ниже! У вас есть <b>60 секунд</b>.\n"
+        f"<i>Те, кто не проголосуют вовремя, будут кикнуты за AFK!</i>\n\n"
         f"<i>Проголосовали: 0/{len(alive_players)}</i>",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
+
+    await asyncio.sleep(60)
+
+    # Таймаут голосования: кикаем молчунов
+    lobby = await db.get_lobby(chat_id)
+    if lobby and lobby[0] == "voting":
+        non_voters = await db.get_non_voted_alive_players(chat_id)
+        for nv_id, nv_name in non_voters:
+            await db.eliminate_player(chat_id, nv_id)
+            await bot.send_message(
+                chat_id,
+                f"👞 <b>{html.escape(nv_name)}</b> исключен из игры за AFK в голосовании!",
+                parse_mode="HTML"
+            )
+
+        await finish_voting_flow(chat_id)
 
 @dp.callback_query(F.data.startswith("vote_"))
 async def process_vote(callback: types.CallbackQuery):
@@ -321,9 +373,27 @@ async def process_vote(callback: types.CallbackQuery):
 
 async def finish_voting_flow(chat_id: int):
     lobby = await db.get_lobby(chat_id)
-    votes_data = await db.get_votes_detailed(chat_id)
+    if not lobby or lobby[0] == "finishing":
+        return
     
+    await db.set_lobby_status(chat_id, "finishing")
+    votes_data = await db.get_votes_detailed(chat_id)
+    alive = await db.get_alive_players(chat_id)
+    winners_needed = 2
+
+    # Если все были AFK и никто не проголосовал
     if not votes_data:
+        if len(alive) <= winners_needed and len(alive) > 0:
+            winners_str = "\n".join([f"🏆 <b>{html.escape(p[0])}</b>" for p in alive])
+            await bot.send_message(chat_id, f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n\nОставшиеся игроки получают контракт:\n{winners_str}", parse_mode="HTML")
+            await db.set_lobby_status(chat_id, "ended")
+        elif len(alive) == 0:
+            await bot.send_message(chat_id, "❌ Все игроки выбыли из-за AFK! Игра завершена.", parse_mode="HTML")
+            await db.set_lobby_status(chat_id, "ended")
+        else:
+            next_round = lobby[4] + 1
+            await bot.send_message(chat_id, f"⚠️ Голосов не было. Переходим к Раунду {next_round}!", parse_mode="HTML")
+            await start_round_flow(chat_id, next_round)
         return
 
     results_lines = [f"• <b>{html.escape(t_name)}</b>: {count} гол." for _, t_name, count in votes_data]
@@ -332,9 +402,6 @@ async def finish_voting_flow(chat_id: int):
     max_votes = votes_data[0][2]
     top_candidates = [v for v in votes_data if v[2] == max_votes]
 
-    alive = await db.get_alive_players(chat_id)
-    winners_needed = 2
-
     if len(top_candidates) > 1:
         await db.clear_votes(chat_id)
         next_round = lobby[4] + 1
@@ -342,9 +409,8 @@ async def finish_voting_flow(chat_id: int):
         await bot.send_message(
             chat_id,
             f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
-            f"🤝 <b>НИЧЬЯ!</b> Голоса разделились при равном счете.\n"
-            f"В этом раунде никто не выбывает!\n\n"
-            f"Переходим к Раунду {next_round}. В игре остаются все {len(alive)} претендентов.",
+            f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает.\n"
+            f"Переходим к Раунду {next_round}.",
             parse_mode="HTML"
         )
         await start_round_flow(chat_id, next_round)
