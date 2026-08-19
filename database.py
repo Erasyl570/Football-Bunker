@@ -1,4 +1,5 @@
 import aiosqlite
+import json
 
 DB_NAME = "bunker.db"
 
@@ -7,10 +8,9 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS lobbies (
                 chat_id INTEGER PRIMARY KEY,
-                status TEXT DEFAULT 'waiting',
                 host_id INTEGER,
+                status TEXT,
                 scenario TEXT,
-                winners_needed INTEGER DEFAULT 2,
                 current_round INTEGER DEFAULT 1
             )
         """)
@@ -18,18 +18,9 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS players (
                 chat_id INTEGER,
                 user_id INTEGER,
-                username TEXT,
-                position TEXT,
-                health TEXT,
-                skill TEXT,
-                inventory TEXT,
-                secret TEXT,
+                user_name TEXT,
+                pack_json TEXT,
                 is_alive INTEGER DEFAULT 1,
-                rev_pos INTEGER DEFAULT 0,
-                rev_health INTEGER DEFAULT 0,
-                rev_skill INTEGER DEFAULT 0,
-                rev_inv INTEGER DEFAULT 0,
-                rev_secret INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
@@ -45,101 +36,75 @@ async def init_db():
 
 async def create_lobby(chat_id: int, host_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM lobbies WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT OR REPLACE INTO lobbies (chat_id, status, host_id, current_round, winners_needed) VALUES (?, 'waiting', ?, 1, 2)",
-            (chat_id, host_id)
+            "INSERT INTO lobbies (chat_id, host_id, status) VALUES (?, ?, ?)",
+            (chat_id, host_id, "lobby")
         )
-        await db.commit()
-
-async def update_lobby_scenario(chat_id: int, scenario: str, winners_needed: int = 2):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE lobbies SET scenario = ?, winners_needed = ?, status = 'round1', current_round = 1 WHERE chat_id = ?",
-            (scenario, winners_needed, chat_id)
-        )
-        await db.commit()
-
-async def set_lobby_status(chat_id: int, status: str, round_num: int = None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        if round_num:
-            await db.execute("UPDATE lobbies SET status = ?, current_round = ? WHERE chat_id = ?", (status, round_num, chat_id))
-        else:
-            await db.execute("UPDATE lobbies SET status = ? WHERE chat_id = ?", (status, chat_id))
         await db.commit()
 
 async def get_lobby(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT status, host_id, scenario, winners_needed, current_round FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            return await cursor.fetchone()
+        async with db.execute("SELECT status, host_id, scenario, current_round FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return (row[0], row[1], row[2], 0, row[3]) # Совместимость индексов c bot.py
+            return None
 
-async def add_player(chat_id: int, user_id: int, username: str, pack: dict):
+async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
     async with aiosqlite.connect(DB_NAME) as db:
+        if current_round is not None:
+            await db.execute("UPDATE lobbies SET status = ?, current_round = ? WHERE chat_id = ?", (status, current_round, chat_id))
+        else:
+            await db.execute("UPDATE lobbies SET status = ? WHERE chat_id = ?", (status, chat_id))
+        await db.commit()
+
+async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE lobbies SET scenario = ?, current_round = ? WHERE chat_id = ?", (scenario_text, current_round, chat_id))
+        await db.commit()
+
+async def add_player(chat_id: int, user_id: int, user_name: str, pack: dict):
+    async with aiosqlite.connect(DB_NAME) as db:
+        pack_json = json.dumps(pack, ensure_ascii=False)
         await db.execute("""
-            INSERT OR REPLACE INTO players 
-            (chat_id, user_id, username, position, health, skill, inventory, secret, is_alive, rev_pos, rev_health, rev_skill, rev_inv, rev_secret)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 0, 0, 0)
-        """, (chat_id, user_id, username, pack["position"], pack["health"], pack["skill"], pack["inventory"], pack["secret"]))
+            INSERT OR REPLACE INTO players (chat_id, user_id, user_name, pack_json, is_alive)
+            VALUES (?, ?, ?, ?, 1)
+        """, (chat_id, user_id, user_name, pack_json))
         await db.commit()
 
 async def get_players(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT username, user_id, is_alive FROM players WHERE chat_id = ?", (chat_id,)) as cursor:
+        async with db.execute("SELECT user_name, user_id, pack_json FROM players WHERE chat_id = ?", (chat_id,)) as cursor:
             return await cursor.fetchall()
 
 async def get_alive_players(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT username, user_id FROM players WHERE chat_id = ? AND is_alive = 1", (chat_id,)) as cursor:
+        async with db.execute("SELECT user_name, user_id FROM players WHERE chat_id = ? AND is_alive = 1", (chat_id,)) as cursor:
             return await cursor.fetchall()
-
-async def get_username(chat_id: int, user_id: int) -> str:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT username FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else "Игрок"
 
 async def get_player_card(chat_id: int, user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT position, health, skill, inventory, secret,
-                   rev_pos, rev_health, rev_skill, rev_inv, rev_secret, is_alive
-            FROM players WHERE chat_id = ? AND user_id = ?
-        """, (chat_id, user_id)) as cursor:
-            return await cursor.fetchone()
-
-async def get_player_revealed_count(chat_id: int, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT (rev_pos + rev_health + rev_skill + rev_inv + rev_secret)
-            FROM players WHERE chat_id = ? AND user_id = ?
-        """, (chat_id, user_id)) as cursor:
+        async with db.execute("SELECT user_name, pack_json, is_alive FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row else 0
+            if not row:
+                return None
+            # Для валидации выбывания в bot.py (индекс 10 -> is_alive)
+            return [row[0], row[1], 0, 0, 0, 0, 0, 0, 0, 0, row[2]]
 
-async def are_all_revealed_for_round(chat_id: int, current_round: int):
-    target_count = min(5, current_round + 1)
+async def get_player_pack(chat_id: int, user_id: int) -> dict:
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT COUNT(*) FROM players 
-            WHERE chat_id = ? AND is_alive = 1 AND (rev_pos + rev_health + rev_skill + rev_inv + rev_secret) < ?
-        """, (chat_id, target_count)) as cursor:
+        async with db.execute("SELECT pack_json FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
             row = await cursor.fetchone()
-            return row[0] == 0
+            if row and row[0]:
+                return json.loads(row[0])
+            return {}
 
-async def reveal_trait(chat_id: int, user_id: int, trait: str):
-    col_map = {
-        "position": "rev_pos",
-        "health": "rev_health",
-        "skill": "rev_skill",
-        "inventory": "rev_inv",
-        "secret": "rev_secret"
-    }
-    if trait not in col_map:
-        return
-    col = col_map[trait]
+async def clear_votes(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(f"UPDATE players SET {col} = 1 WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
 async def has_user_voted(chat_id: int, voter_id: int) -> bool:
@@ -152,28 +117,30 @@ async def add_vote(chat_id: int, voter_id: int, target_id: int):
         await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
         await db.commit()
 
-async def get_voters_count(chat_id: int):
+async def get_username(chat_id: int, user_id: int) -> str:
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(DISTINCT voter_id) FROM votes WHERE chat_id = ?", (chat_id,)) as cursor:
+        async with db.execute("SELECT user_name FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else "Игрок"
+
+async def get_voters_count(chat_id: int) -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM votes WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
 async def get_votes_detailed(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT target_id, p_target.username, COUNT(*) as cnt 
+        query = """
+            SELECT v.target_id, p.user_name, COUNT(v.voter_id) as cnt
             FROM votes v
-            JOIN players p_target ON v.target_id = p_target.user_id AND v.chat_id = p_target.chat_id
+            JOIN players p ON v.chat_id = p.chat_id AND v.target_id = p.user_id
             WHERE v.chat_id = ?
-            GROUP BY target_id
+            GROUP BY v.target_id
             ORDER BY cnt DESC
-        """, (chat_id,)) as cursor:
+        """
+        async with db.execute(query, (chat_id,)) as cursor:
             return await cursor.fetchall()
-
-async def clear_votes(chat_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-        await db.commit()
 
 async def eliminate_player(chat_id: int, user_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
