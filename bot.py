@@ -27,7 +27,7 @@ async def start_discussion_and_voting(chat_id: int, current_round: int):
             chat_id,
             f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (90 СЕКУНД)!</b>\n\n"
             f"Так как в игре {total_count} претендентов, голосование откроется <b>только в Раунде 3</b>!\n"
-            f"Изучайте свои карты в ЛС, открывайте характеристики и анализируйте соперников.\n\n"
+            f"Изучайте свои карты в ЛС, открывайте характеристики кнопками и анализируйте соперников.\n\n"
             f"⏳ <i>Раунд {current_round + 1} начнется через 90 секунд...</i>",
             parse_mode="HTML"
         )
@@ -40,12 +40,12 @@ async def start_discussion_and_voting(chat_id: int, current_round: int):
             await start_discussion_and_voting(chat_id, next_round)
         return
 
-    # РАУНД 3 ДЛЯ 3-4 ИГРОКОВ (ОТКРЫТИЕ 3 КАРТОЧЕК И СТАРТ ГОЛОСОВАНИЯ)
+    # РАУНД 3 ДЛЯ 3-4 ИГРОКОВ (СТАРТ ГОЛОСОВАНИЯ)
     if total_count in (3, 4) and current_round == 3:
         msg_text = (
             f"💬 <b>РАУНД 3: ВЕШАЮТСЯ КАРТЫ (90 СЕКУНД)!</b>\n\n"
-            f"🔓 <b>Открылись сразу 3 карточки характеристик!</b>\n"
-            f"Проверьте актуальные данные в ЛС и приготовитесь к первому решающему голосованию!\n\n"
+            f"🔓 <b>Открывайте характеристики в ЛС кнопками!</b>\n"
+            f"Приготовьтесь к первому решающему голосованию!\n\n"
             f"⏳ <i>Голосование начнется через 90 секунд...</i>"
         )
     else:
@@ -148,11 +148,19 @@ async def start_game(callback: types.CallbackQuery):
                 f"• Навык: {html.escape(pack['skill'])}\n"
                 f"• Багаж: {html.escape(pack['inventory'])}\n"
                 f"• Секрет: <i>{html.escape(pack['secret'])}</i>\n\n"
-                f"🤫 <i>Никому не показывай свои карточки!</i>"
+                f"👇 <i>Нажимай кнопки ниже, чтобы открыть характеристику в общий чат:</i>"
             )
             
+            builder = InlineKeyboardBuilder()
+            builder.button(text="📢 Вскрыть Позицию", callback_data=f"reveal_position_{chat_id}")
+            builder.button(text="📢 Вскрыть Здоровье", callback_data=f"reveal_health_{chat_id}")
+            builder.button(text="📢 Вскрыть Навык", callback_data=f"reveal_skill_{chat_id}")
+            builder.button(text="📢 Вскрыть Багаж", callback_data=f"reveal_inventory_{chat_id}")
+            builder.button(text="📢 Вскрыть Секрет", callback_data=f"reveal_secret_{chat_id}")
+            builder.adjust(2)
+            
             try:
-                await bot.send_message(p_id, pm_card_text, parse_mode="HTML")
+                await bot.send_message(p_id, pm_card_text, reply_markup=builder.as_markup(), parse_mode="HTML")
             except Exception:
                 failed_pm_players.append(f"<a href='tg://user?id={p_id}'>{html.escape(p_name)}</a>")
 
@@ -165,7 +173,7 @@ async def start_game(callback: types.CallbackQuery):
         await callback.message.edit_text(
             f"{scen['text']}\n\n"
             f"👥 <b>ПРЕТЕНДЕНТЫ НА КОНТРАКТ:</b>\n{players_list_str}\n\n"
-            f"📩 <b>Карточки с характеристиками отправлены каждому игроку в ЛС!</b>{pm_warning}\n\n"
+            f"📩 <b>Карточки с характеристиками и кнопками отправлены каждому игроку в ЛС!</b>{pm_warning}\n\n"
             f"🔥 Через 10 секунд начнется Раунд 1!",
             parse_mode="HTML"
         )
@@ -175,6 +183,44 @@ async def start_game(callback: types.CallbackQuery):
 
     except Exception as e:
         await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("reveal_"))
+async def process_reveal(callback: types.CallbackQuery):
+    try:
+        parts = callback.data.split("_")
+        trait = parts[1]
+        target_chat_id = int(parts[2])
+        user = callback.from_user
+
+        pack = await db.get_player_pack(target_chat_id, user.id)
+        if not pack:
+            return await callback.answer("❌ Ошибка: ты не найден в этой игре!", show_alert=True)
+
+        trait_titles = {
+            "position": ("Позицию", pack.get("position", "-")),
+            "health": ("Здоровье", pack.get("health", "-")),
+            "skill": ("Навык", pack.get("skill", "-")),
+            "inventory": ("Багаж", pack.get("inventory", "-")),
+            "secret": ("Секрет", pack.get("secret", "-"))
+        }
+
+        if trait not in trait_titles:
+            return await callback.answer("❌ Неизвестная характеристика!")
+
+        title, value = trait_titles[trait]
+        safe_name = html.escape(user.first_name)
+        safe_val = html.escape(str(value))
+
+        await bot.send_message(
+            target_chat_id,
+            f"🔓 <b>{safe_name}</b> открывает {title}:\n👉 <b>{safe_val}</b>",
+            parse_mode="HTML"
+        )
+        
+        await callback.answer(f"Ты открыл {title} в общем чате!")
+
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка отправки: {e}", show_alert=True)
 
 async def start_voting_flow(chat_id: int, round_num: int):
     await db.set_lobby_status(chat_id, "voting")
@@ -249,9 +295,8 @@ async def finish_voting_flow(chat_id: int):
     top_candidates = [v for v in votes_data if v[2] == max_votes]
 
     alive = await db.get_alive_players(chat_id)
-    winners_needed = 2  # ВСЕГДА 2 КОНТРАКТА В ИГРЕ
+    winners_needed = 2
 
-    # Если ничья
     if len(top_candidates) > 1:
         await db.clear_votes(chat_id)
         next_round = lobby[4] + 1
@@ -268,7 +313,6 @@ async def finish_voting_flow(chat_id: int):
         await start_discussion_and_voting(chat_id, next_round)
         return
 
-    # Изгнание проигравшего
     kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
 
     await db.eliminate_player(chat_id, kicked_id)
