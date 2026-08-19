@@ -60,14 +60,34 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
             parse_mode="HTML"
         )
 
+async def announce_winners_and_end(chat_id: int, alive_players: list):
+    """Объявление финала и завершение игры"""
+    if not alive_players:
+        await bot.send_message(chat_id, "❌ Все игроки выбыли из игры! Победителей нет.", parse_mode="HTML")
+    else:
+        winners_str = "\n".join([f"🏆 <b>{html.escape(p[0])}</b>" for p in alive_players])
+        await bot.send_message(
+            chat_id,
+            f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n\n"
+            f"Оставшиеся игроки получают контракт с клубом:\n{winners_str}",
+            parse_mode="HTML"
+        )
+    await db.set_lobby_status(chat_id, "ended")
+
 async def start_round_flow(chat_id: int, current_round: int):
+    alive_players = await db.get_alive_players(chat_id)
+    
+    # ПРОВЕРКА: Если осталось 2 или меньше игроков — игра сразу завершается!
+    if len(alive_players) <= 2:
+        await announce_winners_and_end(chat_id, alive_players)
+        return
+
     all_players = await db.get_players(chat_id)
     total_count = len(all_players)
     bot_info = await bot.get_me()
 
     # --- ЭТАП 1: ПООЧЕРЕДНОЕ ВСКРЫТИЕ КАРТ ---
     await db.set_lobby_status(chat_id, "reveal_phase", current_round)
-    alive_players = await db.get_alive_players(chat_id)
     
     await bot.send_message(
         chat_id,
@@ -92,13 +112,11 @@ async def start_round_flow(chat_id: int, current_round: int):
             parse_mode="HTML"
         )
 
-        # Ждем 25 секунд либо пока игрок сам не откроет карту
         for _ in range(25):
             if await db.has_revealed_in_round(chat_id, p_id, current_round):
                 break
             await asyncio.sleep(1)
 
-        # Если игрок так и не открыл карту за 25 секунд
         if not await db.has_revealed_in_round(chat_id, p_id, current_round):
             await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
 
@@ -270,7 +288,6 @@ async def process_reveal(callback: types.CallbackQuery):
             
         current_round = lobby[4]
 
-        # Проверка очереди хода
         current_turn_id = await db.get_current_turn(target_chat_id)
         if current_turn_id != user.id:
             turn_username = await db.get_username(target_chat_id, current_turn_id)
@@ -324,6 +341,11 @@ async def start_voting_flow(chat_id: int, round_num: int):
     await db.clear_votes(chat_id)
     
     alive_players = await db.get_alive_players(chat_id)
+    
+    if len(alive_players) <= 2:
+        await announce_winners_and_end(chat_id, alive_players)
+        return
+
     builder = InlineKeyboardBuilder()
     for p_name, p_id in alive_players:
         builder.button(text=f"❌ {p_name}", callback_data=f"vote_{p_id}")
@@ -401,20 +423,17 @@ async def finish_voting_flow(chat_id: int):
     await db.set_lobby_status(chat_id, "finishing")
     votes_data = await db.get_votes_detailed(chat_id)
     alive = await db.get_alive_players(chat_id)
-    winners_needed = 2
 
+    # 1. Проверка если выжило 2 или меньше участников (например, из-за AFK-киков)
+    if len(alive) <= 2:
+        await announce_winners_and_end(chat_id, alive)
+        return
+
+    # 2. Если никто не проголосовал
     if not votes_data:
-        if len(alive) <= winners_needed and len(alive) > 0:
-            winners_str = "\n".join([f"🏆 <b>{html.escape(p[0])}</b>" for p in alive])
-            await bot.send_message(chat_id, f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n\nОставшиеся игроки получают контракт:\n{winners_str}", parse_mode="HTML")
-            await db.set_lobby_status(chat_id, "ended")
-        elif len(alive) == 0:
-            await bot.send_message(chat_id, "❌ Все игроки выбыли из-за AFK! Игра завершена.", parse_mode="HTML")
-            await db.set_lobby_status(chat_id, "ended")
-        else:
-            next_round = lobby[4] + 1
-            await bot.send_message(chat_id, f"⚠️ Голосов не было. Переходим к Раунду {next_round}!", parse_mode="HTML")
-            await start_round_flow(chat_id, next_round)
+        next_round = lobby[4] + 1
+        await bot.send_message(chat_id, f"⚠️ Голосов не было. Переходим к Раунду {next_round}!", parse_mode="HTML")
+        await start_round_flow(chat_id, next_round)
         return
 
     results_lines = [f"• <b>{html.escape(t_name)}</b>: {count} гол." for _, t_name, count in votes_data]
@@ -423,10 +442,22 @@ async def finish_voting_flow(chat_id: int):
     max_votes = votes_data[0][2]
     top_candidates = [v for v in votes_data if v[2] == max_votes]
 
+    # 3. Ничья
     if len(top_candidates) > 1:
         await db.clear_votes(chat_id)
-        next_round = lobby[4] + 1
+        
+        # Если осталось ровно 2 игрока, ничья означает завершение игры
+        if len(alive) <= 2:
+            await bot.send_message(
+                chat_id,
+                f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
+                f"🤝 <b>НИЧЬЯ!</b> Оставшиеся претенденты делят контракт между собой.",
+                parse_mode="HTML"
+            )
+            await announce_winners_and_end(chat_id, alive)
+            return
 
+        next_round = lobby[4] + 1
         await bot.send_message(
             chat_id,
             f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
@@ -437,34 +468,30 @@ async def finish_voting_flow(chat_id: int):
         await start_round_flow(chat_id, next_round)
         return
 
+    # 4. Выбывание игрока
     kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
 
     await db.eliminate_player(chat_id, kicked_id)
     await db.clear_votes(chat_id)
     
-    alive = await db.get_alive_players(chat_id)
+    alive_after = await db.get_alive_players(chat_id)
     safe_kicked_name = html.escape(kicked_name)
 
-    if len(alive) <= winners_needed:
-        winners_str = "\n".join([f"🏆 <b>{html.escape(p[0])}</b>" for p in alive])
-        
+    if len(alive_after) <= 2:
         await bot.send_message(
             chat_id,
             f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
-            f"❌ Из команды изгнан: <b>{safe_kicked_name}</b>\n\n"
-            f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n\n"
-            f"Контракт с клубом получают 2 лучших игрока:\n{winners_str}",
+            f"❌ Из команды изгнан: <b>{safe_kicked_name}</b>",
             parse_mode="HTML"
         )
-        await db.set_lobby_status(chat_id, "ended")
+        await announce_winners_and_end(chat_id, alive_after)
     else:
         next_round = lobby[4] + 1
-
         await bot.send_message(
             chat_id,
             f"📊 <b>ИТОГИ ГОЛОСОВАНИЯ:</b>\n{results_text}\n\n"
             f"❌ Из команды изгнан: <b>{safe_kicked_name}</b>\n\n"
-            f"Переходим к Раунду {next_round}. Осталось игроков: {len(alive)}.",
+            f"Переходим к Раунду {next_round}. Осталось игроков: {len(alive_after)}.",
             parse_mode="HTML"
         )
         await start_round_flow(chat_id, next_round)
