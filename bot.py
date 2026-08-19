@@ -33,6 +33,41 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
+async def build_players_summary(chat_id: int) -> str:
+    """Формирует единый список игроков и их характеристик (открытые/❌)"""
+    alive_players = await db.get_alive_players(chat_id)
+    if not alive_players:
+        return ""
+
+    trait_structure = [
+        ("position", "💼", "Позиция"),
+        ("age", "👤", "Возраст"),
+        ("price", "💰", "Цена"),
+        ("health", "❤️", "Здоровье"),
+        ("skill", "🎯", "Навык"),
+        ("inventory", "🎒", "Багаж"),
+        ("secret", "🔍", "Секрет")
+    ]
+
+    players_blocks = []
+    for idx, (p_name, p_id) in enumerate(alive_players, 1):
+        pack = await db.get_player_pack(chat_id, p_id) or {}
+        player_lines = [f"<b>{idx}. {html.escape(p_name)}</b>"]
+
+        for trait_key, emoji, title in trait_structure:
+            is_revealed = await db.is_trait_revealed(chat_id, p_id, trait_key)
+            if is_revealed:
+                val = pack.get(trait_key, "-")
+                if trait_key == "age" and val != "-":
+                    val = f"{val} лет"
+                player_lines.append(f"{emoji} {title}: <b>{html.escape(str(val))}</b>")
+            else:
+                player_lines.append(f"{emoji} {title}: ❌")
+
+        players_blocks.append("\n".join(player_lines))
+
+    return "\n\n".join(players_blocks)
+
 async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, current_round: int):
     unrevealed = await db.get_unrevealed_traits(chat_id, user_id)
     if unrevealed:
@@ -61,7 +96,6 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
         )
 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
-    """Объявление финала и завершение игры"""
     if not alive_players:
         await bot.send_message(chat_id, "❌ Все игроки выбыли из игры! Победителей нет.", parse_mode="HTML")
     else:
@@ -77,7 +111,6 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
 async def start_round_flow(chat_id: int, current_round: int):
     alive_players = await db.get_alive_players(chat_id)
     
-    # ПРОВЕРКА: Если осталось 2 или меньше игроков — игра сразу завершается!
     if len(alive_players) <= 2:
         await announce_winners_and_end(chat_id, alive_players)
         return
@@ -124,15 +157,18 @@ async def start_round_flow(chat_id: int, current_round: int):
 
     await db.set_current_turn(chat_id, 0)
 
-    # --- ЭТАП 2: ФАЗА ОБСУЖДЕНИЯ (60 СЕКУНД) ---
+    # --- ЭТАП 2: ФАЗА ОБСУЖДЕНИЯ ---
     await db.set_lobby_status(chat_id, "discussion", current_round)
 
-    if total_count in (3, 4) and current_round < 3:
+    has_voting = not (total_count in (3, 4) and current_round < 3)
+    discussion_time = 60 if has_voting else 30
+
+    if not has_voting:
         discussion_msg = (
-            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (60 СЕКУНД)!</b>\n\n"
+            f"💬 <b>РАУНД {current_round}: ОБСУЖДЕНИЕ (30 СЕКУНД)!</b>\n\n"
             f"Первое голосование откроется <b>в Раунде 3</b>.\n"
-            f"Обсуждайте открытые карты и доказывайте свою пользу!\n\n"
-            f"⏳ <i>Раунд {current_round + 1} начнется через 60 секунд...</i>"
+            f"Обсуждайте открытые карты!\n\n"
+            f"⏳ <i>Раунд {current_round + 1} начнется через 30 секунд...</i>"
         )
     elif total_count in (3, 4) and current_round == 3:
         discussion_msg = (
@@ -148,11 +184,11 @@ async def start_round_flow(chat_id: int, current_round: int):
         )
 
     await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
-    await asyncio.sleep(60)
+    await asyncio.sleep(discussion_time)
 
     check_lobby = await db.get_lobby(chat_id)
     if check_lobby and check_lobby[0] == "discussion":
-        if total_count in (3, 4) and current_round < 3:
+        if not has_voting:
             await start_round_flow(chat_id, current_round + 1)
         else:
             await start_voting_flow(chat_id, current_round)
@@ -346,17 +382,26 @@ async def start_voting_flow(chat_id: int, round_num: int):
         await announce_winners_and_end(chat_id, alive_players)
         return
 
+    summary_text = await build_players_summary(chat_id)
+
     builder = InlineKeyboardBuilder()
     for p_name, p_id in alive_players:
         builder.button(text=f"❌ {p_name}", callback_data=f"vote_{p_id}")
     builder.adjust(2)
 
-    await bot.send_message(
-        chat_id,
+    voting_msg = (
+        f"📋 <b>ОТКРЫТЫЕ ХАРАКТЕРИСТИКИ ИГРОКОВ:</b>\n\n"
+        f"{summary_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
         f"🗳 <b>НАЧИНАЕТСЯ ГОЛОСОВАНИЕ (Раунд {round_num})!</b>\n\n"
         f"Голосуйте кнопками ниже! У вас есть <b>60 секунд</b>.\n"
         f"<i>Те, кто не проголосуют вовремя, будут кикнуты за AFK!</i>\n\n"
-        f"<i>Проголосовали: 0/{len(alive_players)}</i>",
+        f"<i>Проголосовали: 0/{len(alive_players)}</i>"
+    )
+
+    await bot.send_message(
+        chat_id,
+        voting_msg,
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
@@ -424,12 +469,10 @@ async def finish_voting_flow(chat_id: int):
     votes_data = await db.get_votes_detailed(chat_id)
     alive = await db.get_alive_players(chat_id)
 
-    # 1. Проверка если выжило 2 или меньше участников (например, из-за AFK-киков)
     if len(alive) <= 2:
         await announce_winners_and_end(chat_id, alive)
         return
 
-    # 2. Если никто не проголосовал
     if not votes_data:
         next_round = lobby[4] + 1
         await bot.send_message(chat_id, f"⚠️ Голосов не было. Переходим к Раунду {next_round}!", parse_mode="HTML")
@@ -442,11 +485,9 @@ async def finish_voting_flow(chat_id: int):
     max_votes = votes_data[0][2]
     top_candidates = [v for v in votes_data if v[2] == max_votes]
 
-    # 3. Ничья
     if len(top_candidates) > 1:
         await db.clear_votes(chat_id)
         
-        # Если осталось ровно 2 игрока, ничья означает завершение игры
         if len(alive) <= 2:
             await bot.send_message(
                 chat_id,
@@ -468,7 +509,6 @@ async def finish_voting_flow(chat_id: int):
         await start_round_flow(chat_id, next_round)
         return
 
-    # 4. Выбывание игрока
     kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
 
     await db.eliminate_player(chat_id, kicked_id)
