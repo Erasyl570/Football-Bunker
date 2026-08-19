@@ -32,7 +32,6 @@ async def init_db():
                 PRIMARY KEY (chat_id, voter_id)
             )
         """)
-        # Таблица фиксации вскрытых характеристик
         await db.execute("""
             CREATE TABLE IF NOT EXISTS reveals (
                 chat_id INTEGER,
@@ -112,7 +111,6 @@ async def get_player_pack(chat_id: int, user_id: int) -> dict:
                 return json.loads(row[0])
             return {}
 
-# Функции контроля КД и скрытия открытых кнопок
 async def record_reveal(chat_id: int, user_id: int, trait: str, round_num: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -131,6 +129,13 @@ async def has_revealed_in_round(chat_id: int, user_id: int, round_num: int) -> b
         async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND round_num = ?", (chat_id, user_id, round_num)) as cursor:
             return await cursor.fetchone() is not None
 
+async def get_unrevealed_traits(chat_id: int, user_id: int):
+    all_traits = ["position", "age", "price", "health", "skill", "inventory", "secret"]
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT trait FROM reveals WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
+            revealed = [row[0] for row in await cursor.fetchall()]
+    return [t for t in all_traits if t not in revealed]
+
 async def clear_votes(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
@@ -140,6 +145,17 @@ async def has_user_voted(chat_id: int, voter_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT 1 FROM votes WHERE chat_id = ? AND voter_id = ?", (chat_id, voter_id)) as cursor:
             return await cursor.fetchone() is not None
+
+async def get_non_voted_alive_players(chat_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        query = """
+            SELECT p.user_id, p.user_name 
+            FROM players p
+            WHERE p.chat_id = ? AND p.is_alive = 1
+            AND p.user_id NOT IN (SELECT voter_id FROM votes WHERE chat_id = ?)
+        """
+        async with db.execute(query, (chat_id, chat_id)) as cursor:
+            return await cursor.fetchall()
 
 async def add_vote(chat_id: int, voter_id: int, target_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
