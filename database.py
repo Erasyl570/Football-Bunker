@@ -32,6 +32,16 @@ async def init_db():
                 PRIMARY KEY (chat_id, voter_id)
             )
         """)
+        # Таблица фиксации вскрытых характеристик
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reveals (
+                chat_id INTEGER,
+                user_id INTEGER,
+                trait TEXT,
+                round_num INTEGER,
+                PRIMARY KEY (chat_id, user_id, trait)
+            )
+        """)
         await db.commit()
 
 async def create_lobby(chat_id: int, host_id: int):
@@ -39,8 +49,9 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM lobbies WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status) VALUES (?, ?, ?)",
+            "INSERT INTO lobbies (chat_id, host_id, status, current_round) VALUES (?, ?, ?, 1)",
             (chat_id, host_id, "lobby")
         )
         await db.commit()
@@ -50,7 +61,7 @@ async def get_lobby(chat_id: int):
         async with db.execute("SELECT status, host_id, scenario, current_round FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
             if row:
-                return (row[0], row[1], row[2], 0, row[3]) # Совместимость индексов c bot.py
+                return (row[0], row[1], row[2], 0, row[3])
             return None
 
 async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
@@ -91,7 +102,6 @@ async def get_player_card(chat_id: int, user_id: int):
             row = await cursor.fetchone()
             if not row:
                 return None
-            # Для валидации выбывания в bot.py (индекс 10 -> is_alive)
             return [row[0], row[1], 0, 0, 0, 0, 0, 0, 0, 0, row[2]]
 
 async def get_player_pack(chat_id: int, user_id: int) -> dict:
@@ -101,6 +111,25 @@ async def get_player_pack(chat_id: int, user_id: int) -> dict:
             if row and row[0]:
                 return json.loads(row[0])
             return {}
+
+# Функции контроля КД и скрытия открытых кнопок
+async def record_reveal(chat_id: int, user_id: int, trait: str, round_num: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO reveals (chat_id, user_id, trait, round_num) VALUES (?, ?, ?, ?)",
+            (chat_id, user_id, trait, round_num)
+        )
+        await db.commit()
+
+async def is_trait_revealed(chat_id: int, user_id: int, trait: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND trait = ?", (chat_id, user_id, trait)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def has_revealed_in_round(chat_id: int, user_id: int, round_num: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND round_num = ?", (chat_id, user_id, round_num)) as cursor:
+            return await cursor.fetchone() is not None
 
 async def clear_votes(chat_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
