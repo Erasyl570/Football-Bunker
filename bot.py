@@ -14,6 +14,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+async def is_game_active(chat_id: int) -> bool:
+    """Проверяет, существует ли и активна ли игра в чате"""
+    lobby = await db.get_lobby(chat_id)
+    return lobby is not None and lobby[0] not in ("ended", "cancelled")
+
 async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
     traits = [
@@ -34,7 +39,6 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
     return builder.as_markup()
 
 async def build_players_summary(chat_id: int) -> str:
-    """Формирует единый список игроков и их характеристик (открытые/❌)"""
     alive_players = await db.get_alive_players(chat_id)
     if not alive_players:
         return ""
@@ -96,6 +100,7 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
         )
 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
+    await db.set_lobby_status(chat_id, "ended")
     if not alive_players:
         await bot.send_message(chat_id, "❌ Все игроки выбыли из игры! Победителей нет.", parse_mode="HTML")
     else:
@@ -106,11 +111,12 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
             f"Оставшиеся игроки получают контракт с клубом:\n{winners_str}",
             parse_mode="HTML"
         )
-    await db.set_lobby_status(chat_id, "ended")
 
 async def start_round_flow(chat_id: int, current_round: int):
+    if not await is_game_active(chat_id):
+        return
+
     alive_players = await db.get_alive_players(chat_id)
-    
     if len(alive_players) <= 2:
         await announce_winners_and_end(chat_id, alive_players)
         return
@@ -130,6 +136,9 @@ async def start_round_flow(chat_id: int, current_round: int):
     )
 
     for p_name, p_id in alive_players:
+        if not await is_game_active(chat_id):
+            return
+
         await db.set_current_turn(chat_id, p_id)
         
         builder = InlineKeyboardBuilder()
@@ -146,14 +155,22 @@ async def start_round_flow(chat_id: int, current_round: int):
         )
 
         for _ in range(25):
+            if not await is_game_active(chat_id):
+                return
             if await db.has_revealed_in_round(chat_id, p_id, current_round):
                 break
             await asyncio.sleep(1)
+
+        if not await is_game_active(chat_id):
+            return
 
         if not await db.has_revealed_in_round(chat_id, p_id, current_round):
             await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
 
         await asyncio.sleep(2)
+
+    if not await is_game_active(chat_id):
+        return
 
     await db.set_current_turn(chat_id, 0)
 
@@ -186,6 +203,9 @@ async def start_round_flow(chat_id: int, current_round: int):
     await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
     await asyncio.sleep(discussion_time)
 
+    if not await is_game_active(chat_id):
+        return
+
     check_lobby = await db.get_lobby(chat_id)
     if check_lobby and check_lobby[0] == "discussion":
         if not has_voting:
@@ -196,6 +216,18 @@ async def start_round_flow(chat_id: int, current_round: int):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer("⚽️ <b>Футбольный Бункер запущен!</b>\nДобавь бота в групповой чат и напиши <code>/game</code> для старта.", parse_mode="HTML")
+
+@dp.message(Command("stopgame", "stop"))
+async def cmd_stopgame(message: types.Message):
+    if message.chat.type == "private":
+        return await message.answer("Остановить игру можно только в группах!")
+
+    chat_id = message.chat.id
+    if not await is_game_active(chat_id):
+        return await message.answer("⚠️ В этом чате нет активной игры.")
+
+    await db.set_lobby_status(chat_id, "ended")
+    await message.answer("🛑 <b>Игра принудительно остановлена!</b>", parse_mode="HTML")
 
 @dp.message(Command("game"))
 async def cmd_game(message: types.Message):
@@ -318,10 +350,10 @@ async def process_reveal(callback: types.CallbackQuery):
         target_chat_id = int(parts[2])
         user = callback.from_user
 
+        if not await is_game_active(target_chat_id):
+            return await callback.answer("❌ Игра завершена или не существует!", show_alert=True)
+
         lobby = await db.get_lobby(target_chat_id)
-        if not lobby:
-            return await callback.answer("❌ Игра не найдена!", show_alert=True)
-            
         current_round = lobby[4]
 
         current_turn_id = await db.get_current_turn(target_chat_id)
@@ -373,14 +405,16 @@ async def process_reveal(callback: types.CallbackQuery):
         await callback.answer(f"❌ Ошибка отправки: {e}", show_alert=True)
 
 async def start_voting_flow(chat_id: int, round_num: int):
-    await db.set_lobby_status(chat_id, "voting", round_num)
-    await db.clear_votes(chat_id)
-    
+    if not await is_game_active(chat_id):
+        return
+
     alive_players = await db.get_alive_players(chat_id)
-    
     if len(alive_players) <= 2:
         await announce_winners_and_end(chat_id, alive_players)
         return
+
+    await db.set_lobby_status(chat_id, "voting", round_num)
+    await db.clear_votes(chat_id)
 
     summary_text = await build_players_summary(chat_id)
 
@@ -408,8 +442,9 @@ async def start_voting_flow(chat_id: int, round_num: int):
 
     await asyncio.sleep(60)
 
+    # Выполняется ТОЛЬКО если голосование всё ещё идет в этом же раунде
     lobby = await db.get_lobby(chat_id)
-    if lobby and lobby[0] == "voting":
+    if lobby and lobby[0] == "voting" and lobby[4] == round_num:
         non_voters = await db.get_non_voted_alive_players(chat_id)
         for nv_id, nv_name in non_voters:
             await db.eliminate_player(chat_id, nv_id)
@@ -425,12 +460,23 @@ async def start_voting_flow(chat_id: int, round_num: int):
 async def process_vote(callback: types.CallbackQuery):
     try:
         chat_id = callback.message.chat.id
-        target_id = int(callback.data.split("_")[1])
         voter = callback.from_user
-        
-        card = await db.get_player_card(chat_id, voter.id)
-        if not card or card[10] == 0:
-            return await callback.answer("❌ Ты изгнан и не можешь голосовать!", show_alert=True)
+
+        if not await is_game_active(chat_id):
+            return await callback.answer("❌ В этом чате нет активной игры!", show_alert=True)
+
+        lobby = await db.get_lobby(chat_id)
+        if not lobby or lobby[0] != "voting":
+            return await callback.answer("⚠️ Сейчас не фаза голосования!", show_alert=True)
+
+        alive_players = await db.get_alive_players(chat_id)
+        alive_ids = [p[1] for p in alive_players]
+
+        # ЖЕСТКАЯ ПРОВЕРКА: состоял ли голосующий в списке ЖИВЫХ игроков данного чата
+        if voter.id not in alive_ids:
+            return await callback.answer("❌ Ты не участвуешь в этой игре или уже выбыл!", show_alert=True)
+
+        target_id = int(callback.data.split("_")[1])
 
         if voter.id == target_id:
             return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
@@ -452,17 +498,16 @@ async def process_vote(callback: types.CallbackQuery):
         )
 
         voters_count = await db.get_voters_count(chat_id)
-        alive_players = await db.get_alive_players(chat_id)
 
         if voters_count >= len(alive_players):
-            await bot.send_message(chat_id, "🎉 <b>Все игроки проголосовали! Подводим итоги...</b>", parse_mode="HTML")
+            await bot.send_message(chat_id, "🎉 <b>Все живые игроки проголосовали! Подводим итоги...</b>", parse_mode="HTML")
             await finish_voting_flow(chat_id)
     except Exception as e:
         await callback.answer(f"❌ Ошибка голосования: {e}", show_alert=True)
 
 async def finish_voting_flow(chat_id: int):
     lobby = await db.get_lobby(chat_id)
-    if not lobby or lobby[0] == "finishing":
+    if not lobby or lobby[0] not in ("voting", "discussion"):
         return
     
     await db.set_lobby_status(chat_id, "finishing")
