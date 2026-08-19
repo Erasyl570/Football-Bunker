@@ -11,9 +11,15 @@ async def init_db():
                 host_id INTEGER,
                 status TEXT,
                 scenario TEXT,
-                current_round INTEGER DEFAULT 1
+                current_round INTEGER DEFAULT 1,
+                current_turn_user_id INTEGER DEFAULT 0
             )
         """)
+        try:
+            await db.execute("ALTER TABLE lobbies ADD COLUMN current_turn_user_id INTEGER DEFAULT 0")
+        except Exception:
+            pass
+            
         await db.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 chat_id INTEGER,
@@ -50,7 +56,7 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round) VALUES (?, ?, ?, 1)",
+            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
             (chat_id, host_id, "lobby")
         )
         await db.commit()
@@ -70,6 +76,17 @@ async def set_lobby_status(chat_id: int, status: str, current_round: int = None)
         else:
             await db.execute("UPDATE lobbies SET status = ? WHERE chat_id = ?", (status, chat_id))
         await db.commit()
+
+async def set_current_turn(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE lobbies SET current_turn_user_id = ? WHERE chat_id = ?", (user_id, chat_id))
+        await db.commit()
+
+async def get_current_turn(chat_id: int) -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT current_turn_user_id FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
 async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1):
     async with aiosqlite.connect(DB_NAME) as db:
