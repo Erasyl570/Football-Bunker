@@ -4,6 +4,7 @@ import os
 import random
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
+from aiogram.types import LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 
@@ -14,8 +15,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Словарь ссылок на картинки карточек
+CARD_IMAGES = {
+    "position": "https://ibb.co/NdFFwrzx",
+    "age": "https://ibb.co/C5VSDX9Z",
+    "price": "https://ibb.co/BHTcfQHT",
+    "health": "https://ibb.co/MxKqYB5x",  # Добавь сюда ссылку на «Здоровье», когда загрузишь
+    "skill": "https://ibb.co/67Msx0xr",
+    "inventory": "https://ibb.co/Fk1HQpsz",
+    "secret": "https://ibb.co/8Dd9DQ5v"
+}
+
 async def is_game_active(chat_id: int) -> bool:
-    """Проверяет, существует ли и активна ли игра в чате"""
     lobby = await db.get_lobby(chat_id)
     return lobby is not None and lobby[0] not in ("ended", "cancelled")
 
@@ -92,11 +103,21 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
         safe_name = html.escape(user_name)
         safe_val = html.escape(str(val))
         trait_title = trait_names.get(chosen_trait, chosen_trait)
+        image_url = CARD_IMAGES.get(chosen_trait, "")
+        
+        msg_text = f'<a href="{image_url}">&#8203;</a>⏱ <b>{safe_name}</b> не успел открыть карту! Бот автоматически вскрыл [<b>{trait_title}</b>]:\n👉 <b>{safe_val}</b>'
+        preview_opts = LinkPreviewOptions(
+            is_disabled=False,
+            url=image_url,
+            prefer_large_media=True,
+            show_above_text=False
+        )
         
         await bot.send_message(
             chat_id,
-            f"⏱ <b>{safe_name}</b> не успел открыть карту! Бот автоматически вскрыл [{trait_title}]:\n👉 <b>{safe_val}</b>",
-            parse_mode="HTML"
+            msg_text,
+            parse_mode="HTML",
+            link_preview_options=preview_opts
         )
 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
@@ -390,11 +411,21 @@ async def process_reveal(callback: types.CallbackQuery):
 
         safe_name = html.escape(user.first_name)
         safe_val = html.escape(str(value))
-        
+        image_url = CARD_IMAGES.get(trait, "")
+
+        msg_text = f'<a href="{image_url}">&#8203;</a>🔓 <b>{safe_name}</b> открывает карту [<b>{title}</b>]:\n👉 <b>{safe_val}</b>'
+        preview_opts = LinkPreviewOptions(
+            is_disabled=False,
+            url=image_url,
+            prefer_large_media=True,
+            show_above_text=False
+        )
+
         await bot.send_message(
             target_chat_id,
-            f"🔓 <b>{safe_name}</b> открывает карту [<b>{title}</b>]:\n👉 <b>{safe_val}</b>",
-            parse_mode="HTML"
+            msg_text,
+            parse_mode="HTML",
+            link_preview_options=preview_opts
         )
         
         new_markup = await build_reveal_keyboard(target_chat_id, user.id)
@@ -442,7 +473,6 @@ async def start_voting_flow(chat_id: int, round_num: int):
 
     await asyncio.sleep(60)
 
-    # Выполняется ТОЛЬКО если голосование всё ещё идет в этом же раунде
     lobby = await db.get_lobby(chat_id)
     if lobby and lobby[0] == "voting" and lobby[4] == round_num:
         non_voters = await db.get_non_voted_alive_players(chat_id)
@@ -472,7 +502,6 @@ async def process_vote(callback: types.CallbackQuery):
         alive_players = await db.get_alive_players(chat_id)
         alive_ids = [p[1] for p in alive_players]
 
-        # ЖЕСТКАЯ ПРОВЕРКА: состоял ли голосующий в списке ЖИВЫХ игроков данного чата
         if voter.id not in alive_ids:
             return await callback.answer("❌ Ты не участвуешь в этой игре или уже выбыл!", show_alert=True)
 
