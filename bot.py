@@ -17,14 +17,15 @@ dp = Dispatcher()
 
 # Словарь ссылок на картинки карточек
 CARD_IMAGES = {
-    "position": "https://ibb.co/NdFFwrzx",
-    "age": "https://ibb.co/C5VSDX9Z",
-    "price": "https://ibb.co/BHTcfQHT",
-    "health": "https://ibb.co/MxKqYB5x",  # Добавь сюда ссылку на «Здоровье», когда загрузишь
-    "skill": "https://ibb.co/67Msx0xr",
-    "inventory": "https://ibb.co/Fk1HQpsz",
-    "secret": "https://ibb.co/8Dd9DQ5v"
+    "position": "https://i.ibb.co/rRQQn3Jk/E17684-E2-56-F4-4-D66-8727-A0411741-F102.png", 
+    "age": "https://i.ibb.co/SXVZG1m8/E13-D392-F-B727-4782-BE64-4-B3-FF6460-AE0.png",
+    "price": "https://i.ibb.co/gbtmrfbt/2-E013-C9-A-F562-435-D-8445-057199144-D69.png",
+    "health": "https://i.ibb.co/RktLxj4k/BE52-B7-D1-DE73-4-E85-9641-0242-E4-FA816-F.png",
+    "skill": "https://i.ibb.co/jPN42k2b/0-F0274-A2-6320-4-EE8-9-F2-F-9-CB9-E2-C35209.png",
+    "inventory": "https://i.ibb.co/qL8JH60p/5-A3-AD710-D4-C9-443-B-AD86-14029-ED7-D237.png",
+    "secret": "https://i.ibb.co/LzJ1zstj/7-DC7-EFD5-B294-4-EC8-BE3-D-EDF77-BFD93-DF.png"
 }
+
 
 async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
