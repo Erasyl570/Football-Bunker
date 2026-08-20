@@ -26,6 +26,12 @@ CARD_IMAGES = {
     "secret": "https://i.ibb.co/LzJ1zstj/7-DC7-EFD5-B294-4-EC8-BE3-D-EDF77-BFD93-DF.png"
 }
 
+def get_rank(wins: int) -> str:
+    if wins >= 20: return "🌟 Легенда Трансферов"
+    if wins >= 10: return "💼 Главный Скаут"
+    if wins >= 5:  return "⚽ Игрок Основы"
+    if wins >= 1:  return "👟 Перспективный Новичок"
+    return "📋 Агент на испытательном"
 
 async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
@@ -123,6 +129,15 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
     await db.set_lobby_status(chat_id, "ended")
+    
+    # Обновление статистики игроков
+    all_players = await db.get_players(chat_id)
+    alive_ids = {p[1] for p in alive_players}
+    
+    for p_name, p_id, _ in all_players:
+        is_win = (p_id in alive_ids) and (len(alive_players) > 0)
+        await db.update_user_stats(p_id, p_name, is_win)
+
     if not alive_players:
         await bot.send_message(chat_id, "❌ Все игроки выбыли из игры! Победителей нет.", parse_mode="HTML")
     else:
@@ -235,9 +250,49 @@ async def start_round_flow(chat_id: int, current_round: int):
         else:
             await start_voting_flow(chat_id, current_round)
 
+# --- КОМАНДЫ БОТА ---
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer("⚽️ <b>Футбольный Бункер запущен!</b>\nДобавь бота в групповой чат и напиши <code>/game</code> для старта.", parse_mode="HTML")
+
+@dp.message(Command("rules"))
+async def cmd_rules(message: types.Message):
+    rules_text = (
+        "📜 <b>ПРАВИЛА ИГРЫ «ТРАНСФЕРНЫЙ РЫНОК»</b>\n\n"
+        "⚽ <b>Концепция:</b>\n"
+        "Клуб попал в кризисную ситуацию и ищет усиление. Вы — кандидаты на трансфер. "
+        "Вам выдаются случайные характеристики: позиция, возраст, цена, здоровье, навыки, багаж и тайные секреты.\n\n"
+        "🎯 <b>Цель игры:</b>\n"
+        "Путем убеждения и тактических споров доказать другим игрокам, "
+        "что именно ваш персонаж идеален для подписания контракта, и избегать выбывания.\n\n"
+        "🔄 <b>Ход игры:</b>\n"
+        "1. <b>Получение пака:</b> Каждому в ЛС приходит скрытая карточка игрока.\n"
+        "2. <b>Раунды и открытие карт:</b> В каждый раунд открывается по 1 характеристике.\n"
+        "3. <b>Голосование:</b> В конце раунда чат выбирает, кто выбывает из просмотра.\n"
+        "4. <b>Финал:</b> Оставшиеся 2 игрока подписывают контракт и побеждают!"
+    )
+    await message.answer(rules_text, parse_mode="HTML")
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.full_name
+    
+    games, wins = await db.get_user_profile(user_id, username)
+    winrate = round((wins / games * 100), 1) if games > 0 else 0.0
+    rank = get_rank(wins)
+    
+    profile_text = (
+        f"🎴 <b>ПРОФИЛЬ ИГРОКА:</b> {html.escape(username)}\n"
+        f"🏅 <b>Статус:</b> {rank}\n"
+        f"───────────────────\n"
+        f"📊 <b>Статистика карьеры:</b>\n"
+        f"├ 🎮 Всего игр: <b>{games}</b>\n"
+        f"├ 🏆 Подписано контрактов: <b>{wins}</b>\n"
+        f"└ 📈 Процент успешности: <b>{winrate}%</b>"
+    )
+    await message.answer(profile_text, parse_mode="HTML")
 
 @dp.message(Command("stopgame", "stop"))
 async def cmd_stopgame(message: types.Message):
