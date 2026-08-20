@@ -47,7 +47,46 @@ async def init_db():
                 PRIMARY KEY (chat_id, user_id, trait)
             )
         """)
+        # Таблица профилей игроков
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                games_played INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0
+            )
+        """)
         await db.commit()
+
+# --- ФУНКЦИИ ДЛЯ ПРОФИЛЕЙ И СТАТИСТИКИ ---
+
+async def get_user_profile(user_id: int, username: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT games_played, wins FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                await db.execute("INSERT INTO users (user_id, username, games_played, wins) VALUES (?, ?, 0, 0)", (user_id, username))
+                await db.commit()
+                return (0, 0)
+            return (row[0], row[1])
+
+async def update_user_stats(user_id: int, username: str, won: bool):
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Создаем пользователя, если его нет
+        await db.execute("""
+            INSERT INTO users (user_id, username, games_played, wins)
+            VALUES (?, ?, 0, 0)
+            ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
+        """, (user_id, username))
+        
+        if won:
+            await db.execute("UPDATE users SET games_played = games_played + 1, wins = wins + 1 WHERE user_id = ?", (user_id,))
+        else:
+            await db.execute("UPDATE users SET games_played = games_played + 1 WHERE user_id = ?", (user_id,))
+            
+        await db.commit()
+
+# --- СТАРАЯ ЛОГИКА ИГРЫ ---
 
 async def create_lobby(chat_id: int, host_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
