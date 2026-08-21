@@ -517,7 +517,7 @@ async def start_voting_flow(chat_id: int, round_num: int):
         f"{summary_text}\n\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🗳 <b>НАЧИНАЕТСЯ ГОЛОСОВАНИЕ (Раунд {round_num})!</b>\n\n"
-        f"Голосуйте кнопками ниже! У вас есть <b>60 секунд</b>.\n"
+        f"Голосуйте кнопками ниже! У вас есть <b>1 минута 45 секунд</b>.\n"
         f"<i>Те, кто не проголосуют вовремя, будут кикнуты за AFK!</i>\n\n"
         f"<i>Проголосовали: 0/{len(alive_players)}</i>"
     )
@@ -529,7 +529,7 @@ async def start_voting_flow(chat_id: int, round_num: int):
         parse_mode="HTML"
     )
 
-    await asyncio.sleep(60)
+    await asyncio.sleep(105)
 
     lobby = await db.get_lobby(chat_id)
     if lobby and lobby[0] == "voting" and lobby[4] == round_num:
