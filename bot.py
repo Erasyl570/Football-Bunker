@@ -185,12 +185,12 @@ async def start_round_flow(chat_id: int, current_round: int):
             chat_id,
             f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n\n"
             f"👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n"
-            f"⏳ <i>У тебя 25 секунд...</i>",
+            f"⏳ <i>У тебя 40 секунд...</i>",
             reply_markup=builder.as_markup(),
             parse_mode="HTML"
         )
 
-        for _ in range(25):
+        for _ in range(40):
             if not await is_game_active(chat_id):
                 return
             if await db.has_revealed_in_round(chat_id, p_id, current_round):
