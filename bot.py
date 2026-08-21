@@ -130,7 +130,6 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
     await db.set_lobby_status(chat_id, "ended")
     
-    # Обновление статистики игроков
     all_players = await db.get_players(chat_id)
     alive_ids = {p[1] for p in alive_players}
     
@@ -368,9 +367,12 @@ async def start_game(callback: types.CallbackQuery):
 
         await callback.answer("Игра начинается!")
         
-        packs = cards.generate_game_packs(num_players)
+        # Сначала генерируем сценарий, чтобы получить выбранное амплуа (line)
         scen = cards.generate_scenario(num_players)
         await db.update_lobby_scenario(chat_id, scen["text"], 1)
+
+        # Передаем найденную линию (attacker, defender, midfielder) в генерацию карт
+        packs = cards.generate_game_packs(num_players, scen["line"])
 
         bot_username = (await bot.get_me()).username
         failed_pm_players = []
