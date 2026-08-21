@@ -3,19 +3,22 @@ import html
 import json
 import os
 import random
-import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import LinkPreviewOptions
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
+import google.generativeai as genai
 
 import database as db
 import cards
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -69,7 +72,7 @@ async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
     return lobby is not None and lobby[0] not in ("ended", "cancelled")
 
-# --- ОЦЕНКА ИТОГОВ С GEMINI AI ---
+# --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK) ---
 async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
     if not GEMINI_API_KEY:
         return "⚠️ <i>GEMINI_API_KEY не задан в переменных окружения. Оценка сценария недоступна.</i>"
@@ -95,17 +98,12 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         f"📝 <b>Причина:</b> [Короткое честное объяснение]"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=15) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                return f"⚠️ <i>Ошибка оценки AI (код статуса HTTP: {resp.status}).</i>"
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = await asyncio.to_thread(model.generate_content, prompt)
+        if response and response.text:
+            return response.text.strip()
+        return "⚠️ <i>Не удалось получить вердикт от ИИ.</i>"
     except Exception as e:
         return f"⚠️ <i>Ошибка вызова AI: {e}</i>"
 
@@ -122,7 +120,7 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
             builder.button(text=trait_label, callback_data=f"reveal:{trait_key}:{chat_id}")
             
     spec_info = await db.get_player_special_info(chat_id, user_id)
-    if spec_info and not spec_info[1]: # Не использована
+    if spec_info and not spec_info[1]:
         builder.button(text="✨ Спецкарта", callback_data=f"use_spec:{chat_id}")
 
     builder.adjust(2)
@@ -158,7 +156,7 @@ async def build_players_summary(chat_id: int) -> str:
             else:
                 player_lines.append(f"{prefix} {emoji} {title}: <i>🔒 Скрыто</i>")
 
-        players_blocks.append("\n".join(player_lines))
+        players_blocks.append("\n\n".join(player_lines))
 
     return "\n\n".join(players_blocks)
 
@@ -209,7 +207,7 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     )
 
     await bot.send_chat_action(chat_id, action="typing")
-    await asyncio.sleep(5)
+    await asyncio.sleep(3)
 
     lobby = await db.get_lobby(chat_id)
     scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
@@ -276,7 +274,6 @@ async def start_round_flow(chat_id: int, current_round: int):
         if not await is_game_active(chat_id): return
         await db.set_current_turn(chat_id, 0)
 
-        # ФАЗА ОБСУЖДЕНИЯ
         await db.set_lobby_status(chat_id, "discussion", current_round)
         has_voting = not (total_count in (3, 4) and current_round < 3)
         discussion_time = 60 if has_voting else 30
@@ -301,7 +298,7 @@ async def start_round_flow(chat_id: int, current_round: int):
         await asyncio.sleep(2)
         asyncio.create_task(start_round_flow(chat_id, current_round + 1))
 
-# --- СПЕЦ-КАРТЫ ЛОГИКА И ОБРАБОТКА ---
+# --- СПЕЦ-КАРТЫ ---
 
 @dp.callback_query(F.data.startswith("use_spec:"))
 async def handle_use_special_init(callback: types.CallbackQuery):
@@ -326,7 +323,6 @@ async def handle_use_special_init(callback: types.CallbackQuery):
     card_code = spec_info[0]
     other_players = [p for p in alive_players if p[1] != user_id]
 
-    # ЗЕРКАЛЬНЫЙ ЩИТ
     if card_code == "mirror":
         await db.update_player_special_status(target_chat_id, user_id, special_used=1, shield_active=1)
         await callback.answer("🪞 Зеркальный щит активирован!", show_alert=True)
@@ -337,7 +333,6 @@ async def handle_use_special_init(callback: types.CallbackQuery):
         )
         return
 
-    # ВЫБОР ЦЕЛИ
     builder = InlineKeyboardBuilder()
     for p_name, p_id in other_players:
         builder.button(text=f"👤 {p_name}", callback_data=f"target_spec:{card_code}:{p_id}:{target_chat_id}")
@@ -361,7 +356,6 @@ async def process_special_target(callback: types.CallbackQuery):
     if actor.id not in {p[1] for p in alive_players}:
         return await callback.answer("❌ Выбывшие игроки не могут использовать спец-карты!", show_alert=True)
 
-    # Проверка Зеркального щита у цели
     target_info = await db.get_player_special_info(chat_id, target_user_id)
     if target_info and target_info[3] == 1:
         await db.update_player_special_status(chat_id, target_user_id, shield_active=0)
@@ -375,7 +369,6 @@ async def process_special_target(callback: types.CallbackQuery):
     target_name = await db.get_username(chat_id, target_user_id)
     await db.update_player_special_status(chat_id, actor.id, special_used=1)
 
-    # 1. ФИКСИРОВАННЫЙ ОБМЕН (swap_*)
     if card_code.startswith("swap_"):
         category = card_code.replace("swap_", "")
         actor_pack = await db.get_player_pack(chat_id, actor.id)
@@ -416,7 +409,6 @@ async def process_special_target(callback: types.CallbackQuery):
             )
         await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-    # 2. ШПИОНАЖ
     elif card_code == "spy":
         target_pack = await db.get_player_pack(chat_id, target_user_id)
         unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
@@ -431,7 +423,6 @@ async def process_special_target(callback: types.CallbackQuery):
             )
         await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-    # 3. ЖЕЛТАЯ КАРТОЧКА
     elif card_code == "yellow_card":
         await db.update_player_special_status(chat_id, target_user_id, is_blocked=1)
         await bot.send_message(
@@ -441,7 +432,6 @@ async def process_special_target(callback: types.CallbackQuery):
         )
         await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-    # 4. ВСПЫШКА (ФИКС: Атакующий сам выбирает карту для вскрытия)
     elif card_code == "flash":
         unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
         if not unrevealed:
@@ -459,7 +449,6 @@ async def process_special_target(callback: types.CallbackQuery):
                 reply_markup=builder.as_markup(), parse_mode="HTML"
             )
 
-    # 5. ТРАНСФЕРНЫЙ ХАОС
     elif card_code == "chaos":
         actor_unrevealed = await db.get_unrevealed_traits(chat_id, actor.id)
         target_unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
