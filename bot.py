@@ -103,7 +103,7 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         # Вызов с таймаутом в 120 секунд для долгой генерации
         response = await model.generate_content_async(
             prompt,
-            request_options={"timeout": 120}
+            request_options={"timeout": 20}
         )
         if response and response.text:
             return response.text.strip()
