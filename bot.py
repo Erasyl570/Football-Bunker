@@ -44,6 +44,21 @@ SPECIAL_CARD_NAMES = {
     "chaos": "🎲 Трансферный хаос"
 }
 
+SPECIAL_CARD_DESCRIPTIONS = {
+    "swap_position": "Обменивает твою карту «Позиция» на позицию любого игрока.",
+    "swap_age": "Обменивает твою карту «Возраст» на возраст любого игрока.",
+    "swap_price": "Обменивает твою карту «Цена» на цену любого игрока.",
+    "swap_health": "Обменивает твою карту «Здоровье» на здоровье любого игрока.",
+    "swap_skill": "Обменивает твою карту «Навык» на навык любого игрока.",
+    "swap_inventory": "Обменивает твой «Багаж» на багаж любого игрока.",
+    "swap_secret": "Обменивает твой «Секрет» на секрет любого игрока.",
+    "spy": "Позволяет скрыто подсмотреть 1 закрытую карту любого соперника.",
+    "yellow_card": "Блокирует использование спец-карты выбранному игроку до конца игры.",
+    "flash": "Заставляет выбранного игрока принудительно вскрыть 1 свою закрытую карту.",
+    "mirror": "Защита: отражает действие следующей примененной против тебя спец-карты обратно.",
+    "chaos": "Случайно меняет одну твою закрытую карту с закрытой картой соперника."
+}
+
 TRAIT_LABELS = {
     "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
     "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет"
@@ -106,10 +121,8 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
             builder.button(text=trait_label, callback_data=f"reveal:{trait_key}:{chat_id}")
             
     spec_info = await db.get_player_special_info(chat_id, user_id)
-    if spec_info and not spec_info[1]: # не использована
-        card_code = spec_info[0]
-        card_title = SPECIAL_CARD_NAMES.get(card_code, "🃏 Спец-карта")
-        builder.button(text=f"✨ {card_title}", callback_data=f"use_spec:{chat_id}")
+    if spec_info and not spec_info[1]: # Не использована
+        builder.button(text="✨ Спецкарта", callback_data=f"use_spec:{chat_id}")
 
     builder.adjust(2)
     return builder.as_markup()
@@ -195,7 +208,6 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     )
 
     lobby = await db.get_lobby(chat_id)
-    # Исправлен индекс: scenario лежит в lobby[2]
     scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
     
     winners_data = []
@@ -212,71 +224,78 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     )
 
 async def start_round_flow(chat_id: int, current_round: int):
-    if not await is_game_active(chat_id): return
-
-    alive_players = await db.get_alive_players(chat_id)
-    if len(alive_players) <= 2:
-        await announce_winners_and_end(chat_id, alive_players)
-        return
-
-    all_players = await db.get_players(chat_id)
-    total_count = len(all_players)
-    bot_info = await bot.get_me()
-
-    await db.set_lobby_status(chat_id, "reveal_phase", current_round)
-    await bot.send_message(
-        chat_id,
-        f"📢 <b>РАУНД {current_round} | ВСКРЫТИЕ КАРТ</b>\n───────────────────\nИгроки вытягивают по 1 карте строго по очереди.",
-        parse_mode="HTML"
-    )
-
-    for p_name, p_id in alive_players:
+    try:
         if not await is_game_active(chat_id): return
-        await db.set_current_turn(chat_id, p_id)
-        
-        builder = InlineKeyboardBuilder()
-        builder.button(text="📩 Открыть карту / Спец-карту", url=f"https://t.me/{bot_info.username}")
-        
-        safe_p_name = html.escape(p_name)
+
+        alive_players = await db.get_alive_players(chat_id)
+        if len(alive_players) <= 2:
+            await announce_winners_and_end(chat_id, alive_players)
+            return
+
+        all_players = await db.get_players(chat_id)
+        total_count = len(all_players)
+        bot_info = await bot.get_me()
+
+        await db.set_lobby_status(chat_id, "reveal_phase", current_round)
         await bot.send_message(
             chat_id,
-            f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n───────────────────\n👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n⏳ <i>У тебя 40 секунд...</i>",
-            reply_markup=builder.as_markup(),
+            f"📢 <b>РАУНД {current_round} | ВСКРЫТИЕ КАРТ</b>\n───────────────────\nИгроки вытягивают по 1 карте строго по очереди.",
             parse_mode="HTML"
         )
 
-        for _ in range(40):
+        for p_name, p_id in alive_players:
             if not await is_game_active(chat_id): return
-            if await db.has_revealed_in_round(chat_id, p_id, current_round): break
-            await asyncio.sleep(1)
+            await db.set_current_turn(chat_id, p_id)
+            
+            builder = InlineKeyboardBuilder()
+            builder.button(text="📩 Открыть карту / Спец-карту", url=f"https://t.me/{bot_info.username}")
+            
+            safe_p_name = html.escape(p_name)
+            await bot.send_message(
+                chat_id,
+                f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n───────────────────\n👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n⏳ <i>У тебя 40 секунд...</i>",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+
+            for _ in range(40):
+                if not await is_game_active(chat_id): return
+                if await db.has_revealed_in_round(chat_id, p_id, current_round): break
+                await asyncio.sleep(1)
+
+            if not await is_game_active(chat_id): return
+            if not await db.has_revealed_in_round(chat_id, p_id, current_round):
+                await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
+
+            await asyncio.sleep(2)
 
         if not await is_game_active(chat_id): return
-        if not await db.has_revealed_in_round(chat_id, p_id, current_round):
-            await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
+        await db.set_current_turn(chat_id, 0)
 
+        # ФАЗА ОБСУЖДЕНИЯ
+        await db.set_lobby_status(chat_id, "discussion", current_round)
+        has_voting = not (total_count in (3, 4) and current_round < 3)
+        discussion_time = 60 if has_voting else 30
+
+        discussion_msg = f"💬 <b>РАУНД {current_round} | ОБСУЖДЕНИЕ ({discussion_time} СЕКУНД)</b>\n───────────────────\n"
+        discussion_msg += "Обсуждайте открытые карты и готовьтесь к голосованию!" if has_voting else "Первое голосование откроется в Раунде 3."
+        
+        await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
+        await asyncio.sleep(discussion_time)
+
+        if not await is_game_active(chat_id): return
+        check_lobby = await db.get_lobby(chat_id)
+        if check_lobby and check_lobby[0] == "discussion":
+            if not has_voting:
+                asyncio.create_task(start_round_flow(chat_id, current_round + 1))
+            else:
+                asyncio.create_task(start_voting_flow(chat_id, current_round))
+
+    except Exception as e:
+        print(f"[ERROR] Сбой в Раунде {current_round}: {e}")
+        await bot.send_message(chat_id, f"⚠️ Произошел сбой при переходе в Раунд {current_round + 1}. Возобновляем поток...", parse_mode="HTML")
         await asyncio.sleep(2)
-
-    if not await is_game_active(chat_id): return
-    await db.set_current_turn(chat_id, 0)
-
-    # ФАЗА ОБСУЖДЕНИЯ
-    await db.set_lobby_status(chat_id, "discussion", current_round)
-    has_voting = not (total_count in (3, 4) and current_round < 3)
-    discussion_time = 60 if has_voting else 30
-
-    discussion_msg = f"💬 <b>РАУНД {current_round} | ОБСУЖДЕНИЕ ({discussion_time} СЕКУНД)</b>\n───────────────────\n"
-    discussion_msg += "Обсуждайте открытые карты и готовьтесь к голосованию!" if has_voting else "Первое голосование откроется в Раунде 3."
-    
-    await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
-    await asyncio.sleep(discussion_time)
-
-    if not await is_game_active(chat_id): return
-    check_lobby = await db.get_lobby(chat_id)
-    if check_lobby and check_lobby[0] == "discussion":
-        if not has_voting:
-            await start_round_flow(chat_id, current_round + 1)
-        else:
-            await start_voting_flow(chat_id, current_round)
+        asyncio.create_task(start_round_flow(chat_id, current_round + 1))
 
 # --- СПЕЦ-КАРТЫ ЛОГИКА И ОБРАБОТКА ---
 
@@ -488,28 +507,37 @@ async def start_game(callback: types.CallbackQuery):
         packs = cards.generate_game_packs(num_players, scen["line"])
         special_cards_pool = list(SPECIAL_CARD_NAMES.keys())
 
-        bot_username = (await bot.get_me()).username
+        # Выдача уникальных спец-карт без повторов
+        if len(special_cards_pool) >= num_players:
+            assigned_cards = random.sample(special_cards_pool, num_players)
+        else:
+            assigned_cards = [random.choice(special_cards_pool) for _ in range(num_players)]
+
         failed_pm_players = []
 
         for idx, (p_name, p_id, _) in enumerate(players):
             pack = packs[idx]
             await db.add_player(chat_id, p_id, p_name, pack)
 
-            # Выдача спец-карты
-            assigned_spec = random.choice(special_cards_pool)
+            # Присвоение уникальной спец-карты
+            assigned_spec = assigned_cards[idx]
             await db.set_player_special_card(chat_id, p_id, assigned_spec)
             
+            spec_title = SPECIAL_CARD_NAMES.get(assigned_spec, "Спецкарта")
+            spec_desc = SPECIAL_CARD_DESCRIPTIONS.get(assigned_spec, "Описание отсутствует.")
+
             pm_card_text = (
                 f"📋 <b>ТВОЯ КАРТОЧКА ИГРОКА</b>\n───────────────────\n"
-                f"💼 <b>Позиция:</b> <code>{html.escape(pack['position'])}</code>\n"
+                f"💼 <b>Позиция:</b> <code>{html.escape(str(pack['position']))}</code>\n"
                 f"👤 <b>Возраст:</b> <code>{pack['age']} лет</code>\n"
                 f"💰 <b>Цена:</b> <code>{pack['price']}</code>\n"
-                f"❤️ <b>Здоровье:</b> <code>{html.escape(pack['health'])}</code>\n"
-                f"🎯 <b>Навык:</b> <code>{html.escape(pack['skill'])}</code>\n"
-                f"🎒 <b>Багаж:</b> <code>{html.escape(pack['inventory'])}</code>\n"
-                f"🔍 <b>Секрет:</b> <i>{html.escape(pack['secret'])}</i>\n"
+                f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack['health']))}</code>\n"
+                f"🎯 <b>Навык:</b> <code>{html.escape(str(pack['skill']))}</code>\n"
+                f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack['inventory']))}</code>\n"
+                f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack['secret']))}</i>\n"
                 f"───────────────────\n"
-                f"✨ <b>Спец-карта:</b> <b>{SPECIAL_CARD_NAMES[assigned_spec]}</b>\n"
+                f"✨ <b>Спец-карта:</b> <b>{spec_title}</b>\n"
+                f"ℹ️ <b>Что делает:</b> <i>{spec_desc}</i>\n"
                 f"───────────────────\n"
                 f"👇 <i>Используй кнопки ниже во время своего хода:</i>"
             )
@@ -534,7 +562,7 @@ async def start_game(callback: types.CallbackQuery):
         await bot.send_message(chat_id, scenario_msg, parse_mode="HTML")
 
         await asyncio.sleep(10)
-        await start_round_flow(chat_id, 1)
+        asyncio.create_task(start_round_flow(chat_id, 1))
 
     except Exception as e:
         await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
@@ -555,8 +583,8 @@ async def cmd_rules(message: types.Message):
         "2. В каждом раунде игроки по очереди раскрывают по 1 характеристике.\n"
         "3. После вскрытия карт проходит фаза обсуждения.\n"
         "4. В конце раунда проводится голосование — участник с наибольшим количеством голосов выбывает из игры.\n"
-        "5. Игра продолжается до тех пор, пока не останется 2 победныx претендента.\n\n"
-        "🤖 <b>Вердикт ИИ:</b> В финалe ИИ-эксперт анализирует оставшихся игроков и выносит окончательный вердикт: справилась ли команда с поставленной целью сценария!"
+        "5. Игра продолжается до тех пор, пока не останется 2 победных претендента.\n\n"
+        "🤖 <b>Вердикт ИИ:</b> В финале ИИ-эксперт анализирует оставшихся игроков и выносит окончательный вердикт: справилась ли команда с поставленной целью сценария!"
     )
     await message.answer(rules_text, parse_mode="HTML")
 
@@ -714,7 +742,7 @@ async def finish_voting_flow(chat_id: int):
         return
 
     if not votes_data:
-        await start_round_flow(chat_id, lobby[4] + 1)
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
         return
 
     max_votes = votes_data[0][2]
@@ -723,7 +751,7 @@ async def finish_voting_flow(chat_id: int):
     if len(top_candidates) > 1:
         await db.clear_votes(chat_id)
         await bot.send_message(chat_id, f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Переходим к Раунду {lobby[4] + 1}.", parse_mode="HTML")
-        await start_round_flow(chat_id, lobby[4] + 1)
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
         return
 
     kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
@@ -736,7 +764,7 @@ async def finish_voting_flow(chat_id: int):
     if len(alive_after) <= 2:
         await announce_winners_and_end(chat_id, alive_after)
     else:
-        await start_round_flow(chat_id, lobby[4] + 1)
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
 
 async def handle_ping(request):
     return web.Response(text="Bot Alive")
