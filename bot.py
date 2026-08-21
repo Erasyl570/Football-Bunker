@@ -15,6 +15,7 @@ import cards
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -54,7 +55,7 @@ SPECIAL_CARD_DESCRIPTIONS = {
     "swap_secret": "Обменивает твой «Секрет» на секрет любого игрока.",
     "spy": "Позволяет скрыто подсмотреть 1 закрытую карту любого соперника.",
     "yellow_card": "Блокирует использование спец-карты выбранному игроку до конца игры.",
-    "flash": "Заставляет выбранного игрока принудительно вскрыть 1 свою закрытую карту.",
+    "flash": "Принудительно вскрывает любую выбранную тобой закрытую карту соперника в общий чат.",
     "mirror": "Защита: отражает действие следующей примененной против тебя спец-карты обратно.",
     "chaos": "Случайно меняет одну твою закрытую карту с закрытой картой соперника."
 }
@@ -94,7 +95,7 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         f"📝 <b>Причина:</b> [Короткое честное объяснение]"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
@@ -207,7 +208,6 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
         parse_mode="HTML"
     )
 
-    # Имитация длительного анализа (статус «печатает...» и задержка)
     await bot.send_chat_action(chat_id, action="typing")
     await asyncio.sleep(5)
 
@@ -414,6 +414,7 @@ async def process_special_target(callback: types.CallbackQuery):
                 f"⚠️ <b>Внимание!</b> Кто-то анонимно применил на тебя «Обмен [{cat_title}]»!\n"
                 f"Твое новое скрытое значение: <b>{actor_val}</b>", parse_mode="HTML"
             )
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
     # 2. ШПИОНАЖ
     elif card_code == "spy":
@@ -428,6 +429,7 @@ async def process_special_target(callback: types.CallbackQuery):
                 f"👁 <b>ШПИОНАЖ:</b> У игрока <b>{html.escape(target_name)}</b> карта <b>[{TRAIT_LABELS.get(chosen, chosen)}]</b>: <code>{val}</code>",
                 parse_mode="HTML"
             )
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
     # 3. ЖЕЛТАЯ КАРТОЧКА
     elif card_code == "yellow_card":
@@ -437,23 +439,25 @@ async def process_special_target(callback: types.CallbackQuery):
             f"🟨 <b>ЖЕЛТАЯ КАРТОЧКА!</b> <b>{html.escape(actor.first_name)}</b> заблокировал спец-карту игрока <b>{html.escape(target_name)}</b> до конца игры!",
             parse_mode="HTML"
         )
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-    # 4. ВСПЫШКА
+    # 4. ВСПЫШКА (ФИКС: Атакующий сам выбирает карту для вскрытия)
     elif card_code == "flash":
         unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
         if not unrevealed:
-            await bot.send_message(chat_id, f"📸 <b>Вспышка:</b> У игрока {target_name} нет закрытых карт!")
+            await callback.message.edit_text(f"📸 У игрока {html.escape(target_name)} нет закрытых карт!")
         else:
             builder = InlineKeyboardBuilder()
             for u_trait in unrevealed:
-                builder.button(text=f"📸 Вскрыть {TRAIT_LABELS.get(u_trait, u_trait)}", callback_data=f"act_flash:{u_trait}:{chat_id}")
+                builder.button(
+                    text=f"📸 {TRAIT_LABELS.get(u_trait, u_trait)}", 
+                    callback_data=f"act_flash:{u_trait}:{target_user_id}:{chat_id}"
+                )
             builder.adjust(2)
-            await bot.send_message(
-                target_user_id,
-                f"📸 На тебя применили <b>«Вспышку»</b>! Выбери 1 свою закрытую карту для мгновенного показа в чат:",
+            await callback.message.edit_text(
+                f"📸 <b>ВСПЫШКА:</b> Выбери, какую закрытую карту игрока <b>{html.escape(target_name)}</b> принудительно вскрыть в общий чат:",
                 reply_markup=builder.as_markup(), parse_mode="HTML"
             )
-            await bot.send_message(chat_id, f"📸 <b>{html.escape(actor.first_name)}</b> применил «Вспышку» на <b>{html.escape(target_name)}</b>! Ожидаем вскрытия...")
 
     # 5. ТРАНСФЕРНЫЙ ХАОС
     elif card_code == "chaos":
@@ -474,34 +478,42 @@ async def process_special_target(callback: types.CallbackQuery):
 
             await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(a_trait, a_trait)}] случайно поменялась с закрытой картой {target_name}!", parse_mode="HTML")
             await bot.send_message(target_user_id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(t_trait, t_trait)}] случайно поменялась с чужой закрытой картой!", parse_mode="HTML")
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-    await callback.message.edit_text("✅ Спец-карта успешно использована!")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("act_flash:"))
 async def process_flash_reveal(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     trait = parts[1]
-    chat_id = int(parts[2])
-    user = callback.from_user
+    target_user_id = int(parts[2])
+    chat_id = int(parts[3])
+    actor = callback.from_user
 
     alive_players = await db.get_alive_players(chat_id)
-    if user.id not in {p[1] for p in alive_players}:
+    if actor.id not in {p[1] for p in alive_players}:
         return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
 
-    pack = await db.get_player_pack(chat_id, user.id)
+    target_name = await db.get_username(chat_id, target_user_id)
+    pack = await db.get_player_pack(chat_id, target_user_id)
     val = pack.get(trait, "-")
-    await db.record_reveal(chat_id, user.id, trait, 0)
+    if trait == "age" and val != "-":
+        val = f"{val} лет"
+
+    await db.record_reveal(chat_id, target_user_id, trait, 0)
 
     image_url = CARD_IMAGES.get(trait, "")
     msg_text = (
-        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> <b>{html.escape(user.first_name)}</b> под давлением принудительно открывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n'
+        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> '
+        f'<b>{html.escape(actor.first_name)}</b> принудительно вскрывает у '
+        f'<b>{html.escape(target_name)}</b> карту <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n'
         f'└ 👉 <b>{html.escape(str(val))}</b>'
     )
     preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
 
     await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
-    await callback.message.edit_text("✅ Карта вскрыта в общий чат!")
+    await callback.message.edit_text(f"✅ Ты успешно вскрыл карту [{TRAIT_LABELS.get(trait, trait)}] игрока {html.escape(target_name)}!")
+    await callback.answer()
 
 # --- СТАРТ ИГРЫ И ВЫДАЧА СПЕЦ-КАРТ ---
 
