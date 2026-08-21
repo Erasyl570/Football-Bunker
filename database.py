@@ -20,11 +20,7 @@ async def init_db():
                 current_turn_user_id INTEGER DEFAULT 0
             )
         """)
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN current_turn_user_id INTEGER DEFAULT 0")
-        except Exception:
-            pass
-            
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 chat_id INTEGER,
@@ -32,20 +28,26 @@ async def init_db():
                 user_name TEXT,
                 pack_json TEXT,
                 is_alive INTEGER DEFAULT 1,
-                PRIMARY KEY (chat_id, user_id)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS player_specials (
-                chat_id INTEGER,
-                user_id INTEGER,
-                card_code TEXT,
-                is_used INTEGER DEFAULT 0,
+                special_card TEXT DEFAULT '',
+                special_used INTEGER DEFAULT 0,
                 is_blocked INTEGER DEFAULT 0,
                 shield_active INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
+        
+        # Миграция колонок для спец-карт, если таблица уже существовала
+        for col, col_type in [
+            ("special_card", "TEXT DEFAULT ''"),
+            ("special_used", "INTEGER DEFAULT 0"),
+            ("is_blocked", "INTEGER DEFAULT 0"),
+            ("shield_active", "INTEGER DEFAULT 0")
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE players ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS votes (
                 chat_id INTEGER,
@@ -73,7 +75,7 @@ async def init_db():
         """)
         await db.commit()
 
-# --- ПРОФИЛИ И СТАТИСТИКА ---
+# --- СТАТИСТИКА ---
 
 async def get_user_profile(user_id: int, username: str):
     async with connect_db() as db:
@@ -98,7 +100,7 @@ async def update_user_stats(user_id: int, username: str, won: bool):
         """, (user_id, username, inc_win))
         await db.commit()
 
-# --- ЛОГИКА ИГРЫ И ЛОББИ ---
+# --- ЛОГИКА ЛОББИ ---
 
 async def create_lobby(chat_id: int, host_id: int):
     async with connect_db() as db:
@@ -106,7 +108,6 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM player_specials WHERE chat_id = ?", (chat_id,))
         await db.execute(
             "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
             (chat_id, host_id, "lobby")
@@ -145,7 +146,7 @@ async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round:
         await db.execute("UPDATE lobbies SET scenario = ?, current_round = ? WHERE chat_id = ?", (scenario_text, current_round, chat_id))
         await db.commit()
 
-# --- ИГРОКИ И ПАКЕТЫ ---
+# --- ИГРОКИ И ПАКЕТЫ ХАРАКТЕРИСТИК ---
 
 async def add_player(chat_id: int, user_id: int, user_name: str, pack: dict):
     async with connect_db() as db:
@@ -177,41 +178,39 @@ async def get_player_pack(chat_id: int, user_id: int) -> dict:
 async def update_player_pack(chat_id: int, user_id: int, pack: dict):
     async with connect_db() as db:
         pack_json = json.dumps(pack, ensure_ascii=False)
-        await db.execute(
-            "UPDATE players SET pack_json = ? WHERE chat_id = ? AND user_id = ?",
-            (pack_json, chat_id, user_id)
-        )
+        await db.execute("UPDATE players SET pack_json = ? WHERE chat_id = ? AND user_id = ?", (pack_json, chat_id, user_id))
         await db.commit()
 
-# --- СПЕЦ-КАРТЫ ---
+# --- СПЕЦ-КАРТЫ (МЕТОДЫ) ---
 
 async def set_player_special_card(chat_id: int, user_id: int, card_code: str):
     async with connect_db() as db:
         await db.execute("""
-            INSERT OR REPLACE INTO player_specials (chat_id, user_id, card_code, is_used, is_blocked, shield_active)
-            VALUES (?, ?, ?, 0, 0, 0)
-        """, (chat_id, user_id, card_code))
+            UPDATE players 
+            SET special_card = ?, special_used = 0, is_blocked = 0, shield_active = 0 
+            WHERE chat_id = ? AND user_id = ?
+        """, (card_code, chat_id, user_id))
         await db.commit()
 
 async def get_player_special_info(chat_id: int, user_id: int):
     async with connect_db() as db:
         async with db.execute(
-            "SELECT card_code, is_used, is_blocked, shield_active FROM player_specials WHERE chat_id = ? AND user_id = ?",
+            "SELECT special_card, special_used, is_blocked, shield_active FROM players WHERE chat_id = ? AND user_id = ?",
             (chat_id, user_id)
         ) as cursor:
             return await cursor.fetchone()
 
-async def update_player_special_status(chat_id: int, user_id: int, special_used: int = None, shield_active: int = None, is_blocked: int = None):
+async def update_player_special_status(chat_id: int, user_id: int, special_used: int = None, is_blocked: int = None, shield_active: int = None):
     async with connect_db() as db:
         if special_used is not None:
-            await db.execute("UPDATE player_specials SET is_used = ? WHERE chat_id = ? AND user_id = ?", (special_used, chat_id, user_id))
-        if shield_active is not None:
-            await db.execute("UPDATE player_specials SET shield_active = ? WHERE chat_id = ? AND user_id = ?", (shield_active, chat_id, user_id))
+            await db.execute("UPDATE players SET special_used = ? WHERE chat_id = ? AND user_id = ?", (special_used, chat_id, user_id))
         if is_blocked is not None:
-            await db.execute("UPDATE player_specials SET is_blocked = ? WHERE chat_id = ? AND user_id = ?", (is_blocked, chat_id, user_id))
+            await db.execute("UPDATE players SET is_blocked = ? WHERE chat_id = ? AND user_id = ?", (is_blocked, chat_id, user_id))
+        if shield_active is not None:
+            await db.execute("UPDATE players SET shield_active = ? WHERE chat_id = ? AND user_id = ?", (shield_active, chat_id, user_id))
         await db.commit()
 
-# --- ВСКРЫТИЕ И ГОЛОСОВАНИЕ ---
+# --- ВСКРЫТИЕ ХАРАКТЕРИСТИК ---
 
 async def record_reveal(chat_id: int, user_id: int, trait: str, round_num: int):
     async with connect_db() as db:
@@ -237,6 +236,8 @@ async def get_unrevealed_traits(chat_id: int, user_id: int):
         async with db.execute("SELECT trait FROM reveals WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
             revealed = [row[0] for row in await cursor.fetchall()]
     return [t for t in all_traits if t not in revealed]
+
+# --- ГОЛОСОВАНИЕ И ИСКЛЮЧЕНИЕ ---
 
 async def clear_votes(chat_id: int):
     async with connect_db() as db:
