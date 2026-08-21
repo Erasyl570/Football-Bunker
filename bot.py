@@ -72,7 +72,7 @@ async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
     return lobby is not None and lobby[0] not in ("ended", "cancelled")
 
-# --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK) ---
+# --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK С ТАЙМАУТОМ) ---
 async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
     if not GEMINI_API_KEY:
         return "⚠️ <i>GEMINI_API_KEY не задан в переменных окружения. Оценка сценария недоступна.</i>"
@@ -100,7 +100,11 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
 
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        # Вызов с таймаутом в 120 секунд для долгой генерации
+        response = await model.generate_content_async(
+            prompt,
+            request_options={"timeout": 120}
+        )
         if response and response.text:
             return response.text.strip()
         return "⚠️ <i>Не удалось получить вердикт от ИИ.</i>"
@@ -207,7 +211,6 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     )
 
     await bot.send_chat_action(chat_id, action="typing")
-    await asyncio.sleep(3)
 
     lobby = await db.get_lobby(chat_id)
     scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
