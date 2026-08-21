@@ -95,8 +95,11 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
             async with session.post(url, json=payload, headers=headers, timeout=12) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                return "⚠️ <i>Ошибка оценки AI (неверный ответ сервера).</i>"
+                    try:
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except (KeyError, IndexError):
+                        return "⚠️ <i>Ошибка обработки ответа AI.</i>"
+                return f"⚠️ <i>Ошибка оценки AI (код {resp.status}).</i>"
     except Exception as e:
         return f"⚠️ <i>Ошибка вызова AI: {e}</i>"
 
@@ -110,13 +113,13 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
     
     for trait_key, trait_label in traits:
         if not await db.is_trait_revealed(chat_id, user_id, trait_key):
-            builder.button(text=trait_label, callback_data=f"reveal_{trait_key}_{chat_id}")
+            builder.button(text=trait_label, callback_data=f"reveal:{trait_key}:{chat_id}")
             
     spec_info = await db.get_player_special_info(chat_id, user_id)
     if spec_info and not spec_info[1]: # если не использована
         card_code = spec_info[0]
         card_title = SPECIAL_CARD_NAMES.get(card_code, "🃏 Спец-карта")
-        builder.button(text=f"✨ {card_title}", callback_data=f"use_spec_{chat_id}")
+        builder.button(text=f"✨ {card_title}", callback_data=f"usespec:{chat_id}")
 
     builder.adjust(2)
     return builder.as_markup()
@@ -202,7 +205,7 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     )
 
     lobby = await db.get_lobby(chat_id)
-    scenario_text = lobby[1] if lobby else "Цель не указана."
+    scenario_text = lobby[2] if lobby else "Цель не указана."
     
     winners_data = []
     for p_name, p_id in alive_players:
@@ -286,9 +289,9 @@ async def start_round_flow(chat_id: int, current_round: int):
 
 # --- СПЕЦ-КАРТЫ ЛОГИКА И ОБРАБОТКА ---
 
-@dp.callback_query(F.data.startswith("use_spec_"))
+@dp.callback_query(F.data.startswith("usespec:"))
 async def handle_use_special_init(callback: types.CallbackQuery):
-    target_chat_id = int(callback.data.split("_")[2])
+    target_chat_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
 
     if not await is_game_active(target_chat_id):
@@ -311,7 +314,7 @@ async def handle_use_special_init(callback: types.CallbackQuery):
         await callback.answer("🪞 Зеркальный щит активирован!", show_alert=True)
         await bot.send_message(
             target_chat_id,
-            f"🪞 <b>{html.escape(callback.from_user.first_name)}</b> активировал <b>«Зеркальный щит»</b>! Вражеский эффект отзиркалится обратно.",
+            f"🪞 <b>{html.escape(callback.from_user.first_name)}</b> активировал <b>«Зеркальный щит»</b>! Вражеский эффект отразится обратно.",
             parse_mode="HTML"
         )
         return
@@ -319,7 +322,7 @@ async def handle_use_special_init(callback: types.CallbackQuery):
     # --- КАРТЫ С ВЫБОРОМ ЦЕЛИ ---
     builder = InlineKeyboardBuilder()
     for p_name, p_id in other_players:
-        builder.button(text=f"👤 {p_name}", callback_data=f"target_spec_{card_code}_{p_id}_{target_chat_id}")
+        builder.button(text=f"👤 {p_name}", callback_data=f"tspec:{card_code}:{p_id}:{target_chat_id}")
     builder.adjust(2)
 
     await callback.message.answer(
@@ -328,12 +331,12 @@ async def handle_use_special_init(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("target_spec_"))
+@dp.callback_query(F.data.startswith("tspec:"))
 async def process_special_target(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    card_code = parts[2]
-    target_user_id = int(parts[3])
-    chat_id = int(parts[4])
+    parts = callback.data.split(":")
+    card_code = parts[1]
+    target_user_id = int(parts[2])
+    chat_id = int(parts[3])
     actor = callback.from_user
 
     # Проверка Зеркального щита у цели
@@ -342,7 +345,7 @@ async def process_special_target(callback: types.CallbackQuery):
         await db.update_player_special_status(chat_id, target_user_id, shield_active=0)
         await bot.send_message(
             chat_id,
-            f"🪞 <b>ЗЕРКАЛЬНЫЙ ЩИТ!</b> Игрок <a href='tg://user?id={target_user_id}'>цель</a> отразил спец-карту <b>{SPECIAL_CARD_NAMES[card_code]}</b> обратно в <b>{html.escape(actor.first_name)}</b>!",
+            f"🪞 <b>ЗЕРКАЛЬНЫЙ ЩИТ!</b> Игрок <a href='tg://user?id={target_user_id}'>цель</a> отразил спец-карту <b>{SPECIAL_CARD_NAMES.get(card_code, card_code)}</b> обратно в <b>{html.escape(actor.first_name)}</b>!",
             parse_mode="HTML"
         )
         # Эффект срабатывает на самого нападающего
@@ -371,7 +374,6 @@ async def process_special_target(callback: types.CallbackQuery):
 
         cat_title = TRAIT_LABELS.get(category, category)
 
-        # Если хотя бы у одного открыта -> объявить в группу
         if actor_revealed or target_revealed:
             await bot.send_message(
                 chat_id,
@@ -381,10 +383,9 @@ async def process_special_target(callback: types.CallbackQuery):
                 parse_mode="HTML"
             )
         else:
-            # Если у обоих закрыта -> предупредить анонимно в ЛС
             await bot.send_message(
                 actor.id,
-                f"🔄 <b>Анонимный обмен выполнен!</b>\nТы поменялся картaми [{cat_title}] с игроком <b>{html.escape(target_name)}</b>.\n"
+                f"🔄 <b>Анонимный обмен выполнен!</b>\nТы поменялся картами [{cat_title}] с игроком <b>{html.escape(target_name)}</b>.\n"
                 f"Твое новое значение: <b>{target_val}</b>", parse_mode="HTML"
             )
             await bot.send_message(
@@ -403,7 +404,7 @@ async def process_special_target(callback: types.CallbackQuery):
             chosen = random.choice(unrevealed)
             val = target_pack.get(chosen, "-")
             await callback.message.answer(
-                f"👁 <b>ШПИОНАЖ:</b> У игрока <b>{html.escape(target_name)}</b> карта <b>[{TRAIT_LABELS[chosen]}]</b>: <code>{val}</code>",
+                f"👁 <b>ШПИОНАЖ:</b> У игрока <b>{html.escape(target_name)}</b> карта <b>[{TRAIT_LABELS.get(chosen, chosen)}]</b>: <code>{val}</code>",
                 parse_mode="HTML"
             )
 
@@ -424,7 +425,7 @@ async def process_special_target(callback: types.CallbackQuery):
         else:
             builder = InlineKeyboardBuilder()
             for u_trait in unrevealed:
-                builder.button(text=f"📸 Вскрыть {TRAIT_LABELS[u_trait]}", callback_data=f"act_flash_{u_trait}_{chat_id}")
+                builder.button(text=f"📸 Вскрыть {TRAIT_LABELS.get(u_trait, u_trait)}", callback_data=f"actflash:{u_trait}:{chat_id}")
             builder.adjust(2)
             await bot.send_message(
                 target_user_id,
@@ -450,17 +451,17 @@ async def process_special_target(callback: types.CallbackQuery):
             await db.update_player_pack(chat_id, actor.id, actor_pack)
             await db.update_player_pack(chat_id, target_user_id, target_pack)
 
-            await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS[a_trait]}] случайно поменялась с закрытой картой {target_name}!", parse_mode="HTML")
-            await bot.send_message(target_user_id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS[t_trait]}] случайно поменялась с чужой закрытой картой!", parse_mode="HTML")
+            await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(a_trait, a_trait)}] случайно поменялась с закрытой картой {target_name}!", parse_mode="HTML")
+            await bot.send_message(target_user_id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(t_trait, t_trait)}] случайно поменялась с чужой закрытой картой!", parse_mode="HTML")
 
     await callback.message.edit_text("✅ Спец-карта успешно использована!")
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("act_flash_"))
+@dp.callback_query(F.data.startswith("actflash:"))
 async def process_flash_reveal(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trait = parts[2]
-    chat_id = int(parts[3])
+    parts = callback.data.split(":")
+    trait = parts[1]
+    chat_id = int(parts[2])
     user = callback.from_user
 
     pack = await db.get_player_pack(chat_id, user.id)
@@ -469,7 +470,7 @@ async def process_flash_reveal(callback: types.CallbackQuery):
 
     image_url = CARD_IMAGES.get(trait, "")
     msg_text = (
-        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> <b>{html.escape(user.first_name)}</b> под давлением принудительно открывает <b>[{TRAIT_LABELS[trait]}]</b>:\n'
+        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> <b>{html.escape(user.first_name)}</b> под давлением принудительно открывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n'
         f'└ 👉 <b>{html.escape(str(val))}</b>'
     )
     preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
@@ -504,7 +505,6 @@ async def start_game(callback: types.CallbackQuery):
             pack = packs[idx]
             await db.add_player(chat_id, p_id, p_name, pack)
 
-            # Выдача случайной спец-карты
             assigned_spec = random.choice(special_cards_pool)
             await db.set_player_special_card(chat_id, p_id, assigned_spec)
             
@@ -554,6 +554,24 @@ async def start_game(callback: types.CallbackQuery):
 async def cmd_start(message: types.Message):
     await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nДобавь бота в групповой чат и введи <code>/game</code>, чтобы начать.", parse_mode="HTML")
 
+@dp.message(Command("profile"))
+@dp.message(Command("stats"))
+async def cmd_profile(message: types.Message):
+    user = message.from_user
+    games_played, wins = await db.get_user_profile(user.id, user.first_name)
+    rank = get_rank(wins)
+    winrate = round((wins / games_played * 100), 1) if games_played > 0 else 0
+    
+    text = (
+        f"👤 <b>ПРОФИЛЬ МЕНЕДЖЕРА</b>\n"
+        f"───────────────────\n"
+        f"📝 <b>Имя:</b> {html.escape(user.first_name)}\n"
+        f"🏅 <b>Звание:</b> {rank}\n"
+        f"🎮 <b>Сыграно игр:</b> {games_played}\n"
+        f"🏆 <b>Побед:</b> {wins} ({winrate}%)\n"
+    )
+    await message.answer(text, parse_mode="HTML")
+
 @dp.message(Command("game"))
 async def cmd_game(message: types.Message):
     if message.chat.type == "private":
@@ -590,10 +608,10 @@ async def join_game(callback: types.CallbackQuery):
     except Exception as e:
         await callback.answer(f"❌ Ошибка входа: {e}", show_alert=True)
 
-@dp.callback_query(F.data.startswith("reveal_"))
+@dp.callback_query(F.data.startswith("reveal:"))
 async def process_reveal(callback: types.CallbackQuery):
     try:
-        parts = callback.data.split("_")
+        parts = callback.data.split(":")
         trait = parts[1]
         target_chat_id = int(parts[2])
         user = callback.from_user
@@ -618,17 +636,18 @@ async def process_reveal(callback: types.CallbackQuery):
         await db.record_reveal(target_chat_id, user.id, trait, current_round)
         image_url = CARD_IMAGES.get(trait, "")
 
-        msg_text = f'<a href="{image_url}">&#8203;</a>🔓 <b>{html.escape(user.first_name)}</b> вскрывает <b>[{TRAIT_LABELS[trait]}]</b>:\n└ 👉 <b>{html.escape(str(val))}</b>'
+        msg_text = f'<a href="{image_url}">&#8203;</a>🔓 <b>{html.escape(user.first_name)}</b> вскрывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n└ 👉 <b>{html.escape(str(val))}</b>'
         preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
 
         await bot.send_message(target_chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
         new_markup = await build_reveal_keyboard(target_chat_id, user.id)
         await callback.message.edit_reply_markup(reply_markup=new_markup)
-        await callback.answer(f"Карта {TRAIT_LABELS[trait]} открыта!")
+        await callback.answer(f"Карта {TRAIT_LABELS.get(trait, trait)} открыта!")
     except Exception as e:
         await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
 
-# ГОЛОСОВАНИЕ И ИТОГИ
+# --- ГОЛОСОВАНИЕ И ИТОГИ ---
+
 async def start_voting_flow(chat_id: int, round_num: int):
     if not await is_game_active(chat_id): return
     alive_players = await db.get_alive_players(chat_id)
@@ -642,7 +661,7 @@ async def start_voting_flow(chat_id: int, round_num: int):
 
     builder = InlineKeyboardBuilder()
     for p_name, p_id in alive_players:
-        builder.button(text=f"❌ {p_name}", callback_data=f"vote_{p_id}")
+        builder.button(text=f"❌ {p_name}", callback_data=f"vote:{p_id}")
     builder.adjust(2)
 
     await bot.send_message(
@@ -660,14 +679,14 @@ async def start_voting_flow(chat_id: int, round_num: int):
             await bot.send_message(chat_id, f"👞 <b>{html.escape(nv_name)}</b> исключен за AFK!", parse_mode="HTML")
         await finish_voting_flow(chat_id)
 
-@dp.callback_query(F.data.startswith("vote_"))
+@dp.callback_query(F.data.startswith("vote:"))
 async def process_vote(callback: types.CallbackQuery):
     try:
         chat_id = callback.message.chat.id
         voter = callback.from_user
         if not await is_game_active(chat_id): return await callback.answer("❌ Нет активной игры!", show_alert=True)
         
-        target_id = int(callback.data.split("_")[1])
+        target_id = int(callback.data.split(":")[1])
         if voter.id == target_id: return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
         if await db.has_user_voted(chat_id, voter.id): return await callback.answer("⚠️ Ты уже проголосовал!", show_alert=True)
 
