@@ -94,7 +94,7 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         f"📝 <b>Причина:</b> [Короткое честное объяснение]"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
@@ -203,9 +203,13 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     
     await bot.send_message(
         chat_id,
-        f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nОставшиеся игроки претендуют на контракт:\n{winners_str}\n\n🤖 <i>ИИ эксперт анализирует соответствие цели сценария...</i>",
+        f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nОставшиеся игроки претендуют на контракт:\n{winners_str}\n\n🤖 <i>ИИ-эксперт изучает все карточки и формирует вердикт...</i>",
         parse_mode="HTML"
     )
+
+    # Имитация длительного анализа (статус «печатает...» и задержка)
+    await bot.send_chat_action(chat_id, action="typing")
+    await asyncio.sleep(5)
 
     lobby = await db.get_lobby(chat_id)
     scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
@@ -307,6 +311,11 @@ async def handle_use_special_init(callback: types.CallbackQuery):
     if not await is_game_active(target_chat_id):
         return await callback.answer("❌ Игра не активна!", show_alert=True)
 
+    alive_players = await db.get_alive_players(target_chat_id)
+    alive_ids = {p[1] for p in alive_players}
+    if user_id not in alive_ids:
+        return await callback.answer("❌ Выбывшие участники не могут использовать спец-карты!", show_alert=True)
+
     spec_info = await db.get_player_special_info(target_chat_id, user_id)
     if not spec_info or spec_info[1]:
         return await callback.answer("❌ Ты уже использовал свою спец-карту!", show_alert=True)
@@ -315,7 +324,6 @@ async def handle_use_special_init(callback: types.CallbackQuery):
         return await callback.answer("🟨 На тебя наложена Желтая карточка! Спец-карта заблокирована.", show_alert=True)
 
     card_code = spec_info[0]
-    alive_players = await db.get_alive_players(target_chat_id)
     other_players = [p for p in alive_players if p[1] != user_id]
 
     # ЗЕРКАЛЬНЫЙ ЩИТ
@@ -348,6 +356,10 @@ async def process_special_target(callback: types.CallbackQuery):
     target_user_id = int(parts[2])
     chat_id = int(parts[3])
     actor = callback.from_user
+
+    alive_players = await db.get_alive_players(chat_id)
+    if actor.id not in {p[1] for p in alive_players}:
+        return await callback.answer("❌ Выбывшие игроки не могут использовать спец-карты!", show_alert=True)
 
     # Проверка Зеркального щита у цели
     target_info = await db.get_player_special_info(chat_id, target_user_id)
@@ -473,6 +485,10 @@ async def process_flash_reveal(callback: types.CallbackQuery):
     chat_id = int(parts[2])
     user = callback.from_user
 
+    alive_players = await db.get_alive_players(chat_id)
+    if user.id not in {p[1] for p in alive_players}:
+        return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
+
     pack = await db.get_player_pack(chat_id, user.id)
     val = pack.get(trait, "-")
     await db.record_reveal(chat_id, user.id, trait, 0)
@@ -507,7 +523,6 @@ async def start_game(callback: types.CallbackQuery):
         packs = cards.generate_game_packs(num_players, scen["line"])
         special_cards_pool = list(SPECIAL_CARD_NAMES.keys())
 
-        # Выдача уникальных спец-карт без повторов
         if len(special_cards_pool) >= num_players:
             assigned_cards = random.sample(special_cards_pool, num_players)
         else:
@@ -519,7 +534,6 @@ async def start_game(callback: types.CallbackQuery):
             pack = packs[idx]
             await db.add_player(chat_id, p_id, p_name, pack)
 
-            # Присвоение уникальной спец-карты
             assigned_spec = assigned_cards[idx]
             await db.set_player_special_card(chat_id, p_id, assigned_spec)
             
@@ -645,6 +659,11 @@ async def process_reveal(callback: types.CallbackQuery):
         user = callback.from_user
 
         if not await is_game_active(target_chat_id): return await callback.answer("❌ Игра завершена!", show_alert=True)
+        
+        alive_players = await db.get_alive_players(target_chat_id)
+        if user.id not in {p[1] for p in alive_players}:
+            return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
+
         lobby = await db.get_lobby(target_chat_id)
         current_round = lobby[4]
 
@@ -714,6 +733,11 @@ async def process_vote(callback: types.CallbackQuery):
         voter = callback.from_user
         if not await is_game_active(chat_id): return await callback.answer("❌ Нет активной игры!", show_alert=True)
         
+        alive_players = await db.get_alive_players(chat_id)
+        alive_ids = {p[1] for p in alive_players}
+        if voter.id not in alive_ids:
+            return await callback.answer("❌ Выбывшие участники и зрители не могут голосовать!", show_alert=True)
+
         target_id = int(callback.data.split(":")[1])
         if voter.id == target_id: return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
         if await db.has_user_voted(chat_id, voter.id): return await callback.answer("⚠️ Ты уже проголосовал!", show_alert=True)
@@ -723,7 +747,6 @@ async def process_vote(callback: types.CallbackQuery):
         await callback.answer("Голос принят!")
         await bot.send_message(chat_id, f"🗳 <b>{html.escape(voter.first_name)}</b> проголосовал против <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
 
-        alive_players = await db.get_alive_players(chat_id)
         if await db.get_voters_count(chat_id) >= len(alive_players):
             await finish_voting_flow(chat_id)
     except Exception as e:
@@ -783,3 +806,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+```
