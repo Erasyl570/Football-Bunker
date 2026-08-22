@@ -2,14 +2,35 @@ import aiosqlite
 import json
 import os
 
-# На Render задаём DB_PATH=/var/data/bunker.db и подключаем Persistent Disk.
-# Локально, если переменная не задана, используется bunker.db.
-DB_NAME = os.getenv("DB_PATH", "bunker.db")
+DB_NAME = os.getenv("SQLITE_DB_PATH", "bunker.db")
+STATS_DATABASE_URL = os.getenv("STATS_DATABASE_URL") or os.getenv("DATABASE_URL")
+_stats_pool = None
 
 def connect_db():
     return aiosqlite.connect(DB_NAME, timeout=10.0)
 
+async def _init_stats_db():
+    global _stats_pool
+    if not STATS_DATABASE_URL:
+        return
+    try:
+        import asyncpg
+        _stats_pool = await asyncpg.create_pool(STATS_DATABASE_URL, min_size=1, max_size=3, command_timeout=10)
+        async with _stats_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS bunker_users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    games_played INTEGER NOT NULL DEFAULT 0,
+                    wins INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+    except Exception as e:
+        print(f"[STATS DB] Не удалось подключить внешнюю БД: {e}")
+        _stats_pool = None
+
 async def init_db():
+    await _init_stats_db()
     async with connect_db() as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         
@@ -36,6 +57,9 @@ async def init_db():
                 special_used INTEGER DEFAULT 0,
                 is_blocked INTEGER DEFAULT 0,
                 shield_active INTEGER DEFAULT 0,
+                muted_round INTEGER DEFAULT 0,
+                vote_redirect_target INTEGER DEFAULT 0,
+                vote_redirect_round INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
@@ -45,14 +69,16 @@ async def init_db():
             ("special_card", "TEXT DEFAULT ''"),
             ("special_used", "INTEGER DEFAULT 0"),
             ("is_blocked", "INTEGER DEFAULT 0"),
-            ("shield_active", "INTEGER DEFAULT 0")
+            ("shield_active", "INTEGER DEFAULT 0"),
+            ("muted_round", "INTEGER DEFAULT 0"),
+            ("vote_redirect_target", "INTEGER DEFAULT 0"),
+            ("vote_redirect_round", "INTEGER DEFAULT 0")
         ]:
             try:
                 await db.execute(f"ALTER TABLE players ADD COLUMN {col} {col_type}")
             except Exception:
                 pass
 
-        # Миграция для ничьих: после двух ничьих подряд включается пенальти.
         try:
             await db.execute("ALTER TABLE lobbies ADD COLUMN tie_count INTEGER DEFAULT 0")
         except Exception:
@@ -76,6 +102,13 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS hidden_captains (
+                chat_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                round_num INTEGER
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -88,6 +121,14 @@ async def init_db():
 # --- СТАТИСТИКА ---
 
 async def get_user_profile(user_id: int, username: str):
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT games_played, wins FROM bunker_users WHERE user_id = $1", user_id)
+            if not row:
+                await conn.execute("INSERT INTO bunker_users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", user_id, username)
+                return (0, 0)
+            await conn.execute("UPDATE bunker_users SET username = $2 WHERE user_id = $1", user_id, username)
+            return (row["games_played"], row["wins"])
     async with connect_db() as db:
         async with db.execute("SELECT games_played, wins FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
@@ -99,6 +140,17 @@ async def get_user_profile(user_id: int, username: str):
 
 async def update_user_stats(user_id: int, username: str, won: bool):
     inc_win = 1 if won else 0
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO bunker_users (user_id, username, games_played, wins)
+                VALUES ($1, $2, 1, $3)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    games_played = bunker_users.games_played + 1,
+                    wins = bunker_users.wins + EXCLUDED.wins
+            """, user_id, username, inc_win)
+        return
     async with connect_db() as db:
         await db.execute("""
             INSERT INTO users (user_id, username, games_played, wins)
@@ -119,7 +171,7 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id, tie_count) VALUES (?, ?, ?, 1, 0, 0)",
+            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
             (chat_id, host_id, "lobby")
         )
         await db.commit()
@@ -131,17 +183,6 @@ async def get_lobby(chat_id: int):
             if row:
                 return (row[0], row[1], row[2], 0, row[3])
             return None
-
-async def get_tie_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT tie_count FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row and row[0] is not None else 0
-
-async def set_tie_count(chat_id: int, tie_count: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET tie_count = ? WHERE chat_id = ?", (tie_count, chat_id))
-        await db.commit()
 
 async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
     async with connect_db() as db:
@@ -165,6 +206,22 @@ async def get_current_turn(chat_id: int) -> int:
 async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1):
     async with connect_db() as db:
         await db.execute("UPDATE lobbies SET scenario = ?, current_round = ? WHERE chat_id = ?", (scenario_text, current_round, chat_id))
+        await db.commit()
+
+async def get_tie_count(chat_id: int) -> int:
+    async with connect_db() as db:
+        async with db.execute("SELECT COALESCE(tie_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def increment_tie_count(chat_id: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE lobbies SET tie_count = COALESCE(tie_count, 0) + 1 WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+
+async def reset_tie_count(chat_id: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE lobbies SET tie_count = 0 WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
 # --- ИГРОКИ И ПАКЕТЫ ХАРАКТЕРИСТИК ---
@@ -229,6 +286,53 @@ async def update_player_special_status(chat_id: int, user_id: int, special_used:
             await db.execute("UPDATE players SET is_blocked = ? WHERE chat_id = ? AND user_id = ?", (is_blocked, chat_id, user_id))
         if shield_active is not None:
             await db.execute("UPDATE players SET shield_active = ? WHERE chat_id = ? AND user_id = ?", (shield_active, chat_id, user_id))
+        await db.commit()
+
+async def set_muted_round(chat_id: int, user_id: int, round_num: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE players SET muted_round = ? WHERE chat_id = ? AND user_id = ?", (round_num, chat_id, user_id))
+        await db.commit()
+
+async def is_muted_for_round(chat_id: int, user_id: int, round_num: int) -> bool:
+    async with connect_db() as db:
+        async with db.execute("SELECT muted_round FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return bool(row and row[0] == round_num)
+
+async def set_captain(chat_id: int, user_id: int, round_num: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE lobbies SET current_turn_user_id = current_turn_user_id WHERE chat_id = ?", (chat_id,))
+        # Храним скрытого капитана в отдельной таблице.
+        await db.execute("CREATE TABLE IF NOT EXISTS hidden_captains (chat_id INTEGER PRIMARY KEY, user_id INTEGER, round_num INTEGER)")
+        await db.execute("INSERT OR REPLACE INTO hidden_captains (chat_id, user_id, round_num) VALUES (?, ?, ?)", (chat_id, user_id, round_num))
+        await db.commit()
+
+async def get_captain(chat_id: int, round_num: int):
+    async with connect_db() as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS hidden_captains (chat_id INTEGER PRIMARY KEY, user_id INTEGER, round_num INTEGER)")
+        async with db.execute("SELECT user_id FROM hidden_captains WHERE chat_id = ? AND round_num = ?", (chat_id, round_num)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+async def set_vote_redirect(chat_id: int, user_id: int, target_id: int, round_num: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE players SET vote_redirect_target = ?, vote_redirect_round = ? WHERE chat_id = ? AND user_id = ?", (target_id, round_num, chat_id, user_id))
+        await db.commit()
+
+async def get_vote_redirect(chat_id: int, round_num: int):
+    async with connect_db() as db:
+        async with db.execute("SELECT user_id, vote_redirect_target FROM players WHERE chat_id = ? AND vote_redirect_round = ? AND vote_redirect_target != 0", (chat_id, round_num)) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], row[1]) if row else None
+
+async def clear_vote_redirect(chat_id: int, round_num: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE players SET vote_redirect_target = 0, vote_redirect_round = 0 WHERE chat_id = ? AND vote_redirect_round = ?", (chat_id, round_num))
+        await db.commit()
+
+async def redirect_votes(chat_id: int, owner_id: int, target_id: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE votes SET target_id = ? WHERE chat_id = ? AND target_id = ?", (target_id, chat_id, owner_id))
         await db.commit()
 
 # --- ВСКРЫТИЕ ХАРАКТЕРИСТИК ---
@@ -301,11 +405,15 @@ async def get_voters_count(chat_id: int) -> int:
 async def get_votes_detailed(chat_id: int):
     async with connect_db() as db:
         query = """
-            SELECT v.target_id, p.user_name, COUNT(v.voter_id) as cnt
+            SELECT v.target_id, p.user_name,
+                   SUM(CASE WHEN hc.user_id = v.voter_id THEN 2 ELSE 1 END) as cnt
             FROM votes v
             JOIN players p ON v.chat_id = p.chat_id AND v.target_id = p.user_id
+            LEFT JOIN hidden_captains hc
+              ON hc.chat_id = v.chat_id
+             AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
             WHERE v.chat_id = ?
-            GROUP BY v.target_id
+            GROUP BY v.target_id, p.user_name
             ORDER BY cnt DESC
         """
         async with db.execute(query, (chat_id,)) as cursor:
