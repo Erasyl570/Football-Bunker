@@ -591,6 +591,37 @@ async def start_game(callback: types.CallbackQuery):
 async def cmd_start(message: types.Message):
     await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nДобавь бота в групповой чат и введи <code>/game</code>, чтобы начать.", parse_mode="HTML")
 
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    user = message.from_user
+    games_played, wins = await db.get_user_profile(user.id, user.first_name)
+    winrate = (wins / games_played * 100) if games_played else 0.0
+
+    # Звания зависят от количества побед. Границы можно изменить позже,
+    # не затрагивая саму систему статистики.
+    ranks = [
+        (50, "🐐 Икона Бункера"),
+        (35, "💎 Легенда"),
+        (20, "🏆 Мастер Бункера"),
+        (10, "👑 Ветеран Бункера"),
+        (6, "🔥 Опасный соперник"),
+        (3, "🏃 Опытный игрок"),
+        (1, "⚽ Любитель"),
+        (0, "🥾 Новичок"),
+    ]
+    rank = next(title for min_wins, title in ranks if wins >= min_wins)
+
+    await message.answer(
+        f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n"
+        f"───────────────────\n"
+        f"⚽ <b>{html.escape(user.first_name)}</b>\n\n"
+        f"🎮 <b>Сыграно матчей:</b> {games_played}\n"
+        f"🏆 <b>Побед:</b> {wins}\n"
+        f"📊 <b>Винрейт:</b> {winrate:.1f}%\n"
+        f"🎖 <b>Звание:</b> {rank}",
+        parse_mode="HTML"
+    )
+
 @dp.message(Command("rules"))
 async def cmd_rules(message: types.Message):
     rules_text = (
@@ -776,14 +807,39 @@ async def finish_voting_flow(chat_id: int):
     top_candidates = [v for v in votes_data if v[2] == max_votes]
 
     if len(top_candidates) > 1:
-        await db.clear_votes(chat_id)
-        await bot.send_message(chat_id, f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Переходим к Раунду {lobby[4] + 1}.", parse_mode="HTML")
-        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
-        return
+        tie_count = await db.get_tie_count(chat_id)
 
-    kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
-    await db.eliminate_player(chat_id, kicked_id)
-    await db.clear_votes(chat_id)
+        # Первая ничья — даём игрокам ещё один раунд.
+        # Вторая ничья подряд — пенальти: случайно выбывает один из лидеров.
+        if tie_count == 0:
+            await db.set_tie_count(chat_id, 1)
+            await db.clear_votes(chat_id)
+            await bot.send_message(
+                chat_id,
+                f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Это первая ничья подряд.\n"
+                f"🔄 Получаете ещё один раунд, чтобы решить судьбу кандидатов.",
+                parse_mode="HTML"
+            )
+            asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+            return
+
+        # Вторая ничья подряд — бесконечного цикла больше не будет.
+        kicked = random.choice(top_candidates)
+        kicked_id, kicked_name = kicked[0], kicked[1]
+        await db.eliminate_player(chat_id, kicked_id)
+        await db.set_tie_count(chat_id, 0)
+        await db.clear_votes(chat_id)
+        await bot.send_message(
+            chat_id,
+            f"⚽ <b>ПЕНАЛЬТИ!</b> Вторая ничья подряд.\n"
+            f"❌ Случайным выбором из лидеров выбывает: <b>{html.escape(kicked_name)}</b>",
+            parse_mode="HTML"
+        )
+    else:
+        kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
+        await db.eliminate_player(chat_id, kicked_id)
+        await db.set_tie_count(chat_id, 0)
+        await db.clear_votes(chat_id)
     
     alive_after = await db.get_alive_players(chat_id)
     await bot.send_message(chat_id, f"❌ Из команды изгнан: <b>{html.escape(kicked_name)}</b>", parse_mode="HTML")
