@@ -334,9 +334,15 @@ async def handle_use_special_init(callback: types.CallbackQuery):
     lobby = await db.get_lobby(target_chat_id)
     phase = lobby[0] if lobby else ""
 
-    # Эти карты должны применяться до/во время голосования, но не раскрывают факт использования в группе.
-    if card_code in ("vote_redirect", "mute", "captain") and phase != "discussion":
-        return await callback.answer("⏳ Эту спец-карту можно использовать только во время обсуждения перед голосованием.", show_alert=True)
+    # Эти карты активируются только в фазе обсуждения, непосредственно перед РЕАЛЬНЫМ голосованием.
+    # Для 3-4 игроков в раундах 1-2 голосования ещё нет, поэтому карту там использовать нельзя.
+    total_players = len(await db.get_players(target_chat_id))
+    has_voting_this_round = not (total_players in (3, 4) and lobby[4] < 3)
+    if card_code in ("vote_redirect", "mute", "captain"):
+        if phase != "discussion" or not has_voting_this_round:
+            if phase == "discussion" and not has_voting_this_round:
+                return await callback.answer("⏳ В этом раунде голосования ещё не будет. Карта доступна перед голосованием.", show_alert=True)
+            return await callback.answer("⏳ Эту спец-карту можно использовать только во время обсуждения перед голосованием.", show_alert=True)
 
     if card_code == "vote_redirect":
         builder = InlineKeyboardBuilder()
@@ -355,13 +361,16 @@ async def handle_use_special_init(callback: types.CallbackQuery):
         return await callback.answer()
 
     if card_code == "captain":
-        choices = other_players
-        target = random.choice(choices) if choices else None
-        if target:
-            await db.set_captain(target_chat_id, target[1], lobby[4])
-            await db.update_player_special_status(target_chat_id, user_id, special_used=1)
-        await callback.answer("©️ Капитан назначен тайно.", show_alert=True)
-        return
+        # Владелец карты сам выбирает капитана, но выбранный игрок ничего не узнаёт.
+        builder = InlineKeyboardBuilder()
+        for p_name, p_id in other_players:
+            builder.button(text=f"👤 {p_name}", callback_data=f"secret_target:captain:{p_id}:{target_chat_id}")
+        builder.adjust(2)
+        await callback.message.answer(
+            "©️ <b>Скрытый капитан</b>\nВыбери игрока, который тайно получит двойной вес голоса.",
+            reply_markup=builder.as_markup(), parse_mode="HTML"
+        )
+        return await callback.answer()
 
     if card_code == "mirror":
         await db.update_player_special_status(target_chat_id, user_id, special_used=1, shield_active=1)
@@ -400,13 +409,20 @@ async def process_secret_target(callback: types.CallbackQuery):
     if not spec_info or spec_info[1] or spec_info[0] != card_code:
         return await callback.answer("❌ Эта спец-карта уже недоступна.", show_alert=True)
     lobby = await db.get_lobby(chat_id)
-    if not lobby or lobby[0] not in ("discussion", "voting"):
-        return await callback.answer("⏳ Сейчас эту карту использовать нельзя.", show_alert=True)
+    if not lobby or lobby[0] != "discussion":
+        return await callback.answer("⏳ Эту карту можно активировать только во время обсуждения.", show_alert=True)
+
+    total_players = len(await db.get_players(chat_id))
+    has_voting_this_round = not (total_players in (3, 4) and lobby[4] < 3)
+    if not has_voting_this_round:
+        return await callback.answer("⏳ В этом раунде голосования ещё не будет. Карта не потрачена.", show_alert=True)
 
     if card_code == "vote_redirect":
         await db.set_vote_redirect(chat_id, actor_id, target_user_id, lobby[4])
     elif card_code == "mute":
         await db.set_muted_round(chat_id, target_user_id, lobby[4])
+    elif card_code == "captain":
+        await db.set_captain(chat_id, target_user_id, lobby[4])
     else:
         return await callback.answer("❌ Неизвестная карта.", show_alert=True)
 
@@ -880,8 +896,11 @@ async def finish_voting_flow(chat_id: int):
     redirect = await db.get_vote_redirect(chat_id, lobby[4])
     if redirect:
         owner_id, target_id = redirect
+        # В votes_data первая колонка — ТОТ, ПРОТИВ КОГО голосовали,
+        # поэтому нельзя искать owner_id среди кандидатов: владелец карты голосует против кого-то другого.
+        # Проверяем, что владелец карты действительно получил единоличное большинство.
         owner_row = next((v for v in votes_data if v[0] == owner_id), None)
-        if owner_row and owner_row[2] == max_votes and len(top_candidates) == 1:
+        if owner_row is not None and owner_row[2] == max_votes and len(top_candidates) == 1:
             await db.redirect_votes(chat_id, owner_id, target_id)
             votes_data = await db.get_votes_detailed(chat_id)
         await db.clear_vote_redirect(chat_id, lobby[4])
