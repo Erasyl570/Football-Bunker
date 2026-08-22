@@ -428,7 +428,7 @@ def generate_scenario(players_count: int) -> dict:
     # 40% шанс на рыночное событие: требование по трансферной цене
     # либо появляется, либо меняется. Событие является частью сценария
     # и поэтому автоматически попадает в финальный промпт Gemini.
-    if random.random() < 0.40:
+    if random.random() < 0.20:
         if price_requirement is None:
             price_requirement = random.choice([80, 90, 100, 120, 130])
             market_event = (
