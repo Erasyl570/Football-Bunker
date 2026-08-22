@@ -670,12 +670,32 @@ async def start_game(callback: types.CallbackQuery):
         await db.update_lobby_scenario(chat_id, scen["text"], 1)
 
         packs = cards.generate_game_packs(num_players, scen["line"])
-        special_cards_pool = list(SPECIAL_CARD_NAMES.keys())
+        # Баланс спец-карт: карта обмена характеристикой (swap_*)
+        # может достаться только ОДНОМУ игроку за матч.
+        # Остальные игроки получают карты из пула без обменов.
+        swap_cards = [code for code in SPECIAL_CARD_NAMES if code.startswith("swap_")]
+        non_swap_cards = [code for code in SPECIAL_CARD_NAMES if not code.startswith("swap_")]
 
-        if len(special_cards_pool) >= num_players:
-            assigned_cards = random.sample(special_cards_pool, num_players)
-        else:
-            assigned_cards = [random.choice(special_cards_pool) for _ in range(num_players)]
+        if num_players >= 1:
+            # Ровно один случайный игрок получает один из 7 видов обмена.
+            exchange_card = random.choice(swap_cards)
+            assigned_cards = [None] * num_players
+            exchange_idx = random.randrange(num_players)
+            assigned_cards[exchange_idx] = exchange_card
+
+            remaining = num_players - 1
+            if remaining <= len(non_swap_cards):
+                other_cards = random.sample(non_swap_cards, remaining)
+            else:
+                other_cards = random.sample(non_swap_cards, len(non_swap_cards))
+                other_cards += random.choices(non_swap_cards, k=remaining - len(non_swap_cards))
+
+            random.shuffle(other_cards)
+            other_idx = 0
+            for i in range(num_players):
+                if assigned_cards[i] is None:
+                    assigned_cards[i] = other_cards[other_idx]
+                    other_idx += 1
 
         failed_pm_players = []
 
