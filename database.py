@@ -1,7 +1,10 @@
 import aiosqlite
 import json
+import os
 
-DB_NAME = "bunker.db"
+# На Render задаём DB_PATH=/var/data/bunker.db и подключаем Persistent Disk.
+# Локально, если переменная не задана, используется bunker.db.
+DB_NAME = os.getenv("DB_PATH", "bunker.db")
 
 def connect_db():
     return aiosqlite.connect(DB_NAME, timeout=10.0)
@@ -17,7 +20,8 @@ async def init_db():
                 status TEXT,
                 scenario TEXT,
                 current_round INTEGER DEFAULT 1,
-                current_turn_user_id INTEGER DEFAULT 0
+                current_turn_user_id INTEGER DEFAULT 0,
+                tie_count INTEGER DEFAULT 0
             )
         """)
         
@@ -47,6 +51,12 @@ async def init_db():
                 await db.execute(f"ALTER TABLE players ADD COLUMN {col} {col_type}")
             except Exception:
                 pass
+
+        # Миграция для ничьих: после двух ничьих подряд включается пенальти.
+        try:
+            await db.execute("ALTER TABLE lobbies ADD COLUMN tie_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS votes (
@@ -109,7 +119,7 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
+            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id, tie_count) VALUES (?, ?, ?, 1, 0, 0)",
             (chat_id, host_id, "lobby")
         )
         await db.commit()
@@ -121,6 +131,17 @@ async def get_lobby(chat_id: int):
             if row:
                 return (row[0], row[1], row[2], 0, row[3])
             return None
+
+async def get_tie_count(chat_id: int) -> int:
+    async with connect_db() as db:
+        async with db.execute("SELECT tie_count FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] is not None else 0
+
+async def set_tie_count(chat_id: int, tie_count: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE lobbies SET tie_count = ? WHERE chat_id = ?", (tie_count, chat_id))
+        await db.commit()
 
 async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
     async with connect_db() as db:
