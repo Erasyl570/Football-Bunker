@@ -92,16 +92,22 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         )
 
     prompt = (
-        f"Ты — суровый, честный и объективный футбольный эксперт.\n"
-        f"Оцени, смогла ли оставшаяся команда выполнить цель сценария.\n\n"
+        f"Ты — футбольный спортивный директор и эксперт по составу. Твоя задача — честно, но НЕ душнить: оцени, способны ли два оставшихся игрока разумно выполнить цель сценария как команда.\n\n"
         f"СЦЕНАРИЙ И ЦЕЛЬ:\n{scenario_text}\n\n"
-        f"СОСТАВ ПОБЕДИТЕЛЕЙ И ИХ КАРТОЧКИ:\n{players_summary}\n\n"
-        f"Правила ответа:\n"
-        f"1. Будь МАКСИМАЛЬНО честен. Если карты игроков не подходят под цель сценария — пиши ПРОВАЛ.\n"
-        f"2. Ответ должен быть очень коротким (2-3 предложения).\n"
-        f"3. Формат:\n"
+        f"СОСТАВ ПОБЕДИТЕЛЕЙ И ИХ АКТУАЛЬНЫЕ КАРТОЧКИ:\n{players_summary}\n\n"
+        f"СТРОГИЕ ПРАВИЛА ОЦЕНКИ:\n"
+        f"1. Сначала определи 2-3 ГЛАВНЫХ требования сценария. Не превращай второстепенные детали в обязательные условия.\n"
+        f"2. Если сценарий прямо требует определенную позицию (например, 2 форварда), это ключевое условие.\n"
+        f"3. Если в сценарии есть конкретный порог трансферной цены, он обязателен. Проверяй цену каждого игрока, если написано «каждого», и не придумывай другие пороги.\n"
+        f"4. Не требуй идеального соответствия всем характеристикам. Один слабый или неудобный параметр НЕ означает автоматически ПРОВАЛ.\n"
+        f"5. Если характеристика скрыта или неизвестна — считай её НЕИЗВЕСТНОЙ, а не плохой. Не додумывай негатив.\n"
+        f"6. Положительные характеристики могут компенсировать второстепенные недостатки. Если оба игрока в целом подходят и у команды есть реалистичный способ выполнить задачу — выбирай УСПЕХ.\n"
+        f"7. ПРОВАЛ ставь только при явном противоречии ключевым условиям сценария или если состав очевидно не способен выполнить цель. Не ищи повод придраться.\n"
+        f"8. Не учитывай, что игроки уже пережили предыдущие раунды: оцени только финальную пару и сам сценарий.\n"
+        f"9. Не выдумывай характеристики, которых нет в карточках.\n\n"
+        f"Формат ответа:\n"
         f"📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
-        f"📝 <b>Причина:</b> [Короткое честное объяснение]"
+        f"📝 <b>Причина:</b> [2-4 коротких предложения: что решило исход и какие характеристики были ключевыми]"
     )
 
     try:
@@ -135,6 +141,51 @@ async def build_reveal_keyboard(chat_id: int, user_id: int):
 
     builder.adjust(2)
     return builder.as_markup()
+
+async def build_private_card_text(chat_id: int, user_id: int) -> str:
+    pack = await db.get_player_pack(chat_id, user_id) or {}
+    username = await db.get_username(chat_id, user_id)
+    spec_info = await db.get_player_special_info(chat_id, user_id)
+    spec_code = spec_info[0] if spec_info else ""
+    spec_used = bool(spec_info[1]) if spec_info else False
+    spec_title = SPECIAL_CARD_NAMES.get(spec_code, "Спецкарта")
+    spec_desc = SPECIAL_CARD_DESCRIPTIONS.get(spec_code, "Описание отсутствует.")
+    if spec_used:
+        spec_title = f"{spec_title} (уже использована)"
+
+    return (
+        f"📋 <b>ТВОЯ АКТУАЛЬНАЯ КАРТОЧКА ИГРОКА</b>\n───────────────────\n"
+        f"💼 <b>Позиция:</b> <code>{html.escape(str(pack.get('position', '-')))}</code>\n"
+        f"👤 <b>Возраст:</b> <code>{pack.get('age', '-')} лет</code>\n"
+        f"💰 <b>Цена:</b> <code>{html.escape(str(pack.get('price', '-')))}</code>\n"
+        f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack.get('health', '-')))}</code>\n"
+        f"🎯 <b>Навык:</b> <code>{html.escape(str(pack.get('skill', '-')))}</code>\n"
+        f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack.get('inventory', '-')))}</code>\n"
+        f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret', '-')))}</i>\n"
+        f"───────────────────\n"
+        f"✨ <b>Спец-карта:</b> <b>{html.escape(spec_title)}</b>\n"
+        f"ℹ️ <b>Что делает:</b> <i>{html.escape(spec_desc)}</i>\n"
+        f"───────────────────\n"
+        f"👇 <i>Используй кнопки ниже во время своего хода.</i>"
+    )
+
+async def refresh_private_card(chat_id: int, user_id: int):
+    message_id = await db.get_private_card_message_id(chat_id, user_id)
+    if not message_id:
+        return
+    try:
+        text = await build_private_card_text(chat_id, user_id)
+        markup = await build_reveal_keyboard(chat_id, user_id)
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        # Старое сообщение может быть удалено/недоступно. Это не должно ломать игру.
+        print(f"[CARD REFRESH] Не удалось обновить ЛС игрока {user_id}: {e}")
 
 async def build_players_summary(chat_id: int) -> str:
     alive_players = await db.get_alive_players(chat_id)
@@ -195,6 +246,7 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
         await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
+    game_stats = await db.get_game_stats(chat_id)
     await db.set_lobby_status(chat_id, "ended")
     
     all_players = await db.get_players(chat_id)
@@ -230,7 +282,13 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     
     await bot.send_message(
         chat_id,
-        f"📊 <b>ИТОГИ СЦЕНАРИЯ</b>\n───────────────────\n{ai_verdict}",
+        f"📊 <b>ИТОГИ СЦЕНАРИЯ</b>\n───────────────────\n{ai_verdict}\n\n"
+        f"📈 <b>СТАТИСТИКА ИГРЫ</b>\n"
+        f"🎮 Раундов: <b>{game_stats['rounds']}</b>\n"
+        f"🗳 Голосов: <b>{game_stats['votes']}</b>\n"
+        f"🤝 Ничьих: <b>{game_stats['ties']}</b>\n"
+        f"⏭️ Скипов: <b>{game_stats['skips']}/3</b>\n"
+        f"🃏 Спецкарт использовано: <b>{game_stats['special_cards']}</b>",
         parse_mode="HTML"
     )
 
@@ -468,6 +526,8 @@ async def process_special_target(callback: types.CallbackQuery):
 
         await db.update_player_pack(chat_id, actor.id, actor_pack)
         await db.update_player_pack(chat_id, target_user_id, target_pack)
+        await refresh_private_card(chat_id, actor.id)
+        await refresh_private_card(chat_id, target_user_id)
 
         actor_revealed = await db.is_trait_revealed(chat_id, actor.id, category)
         target_revealed = await db.is_trait_revealed(chat_id, target_user_id, category)
@@ -550,6 +610,8 @@ async def process_special_target(callback: types.CallbackQuery):
 
             await db.update_player_pack(chat_id, actor.id, actor_pack)
             await db.update_player_pack(chat_id, target_user_id, target_pack)
+            await refresh_private_card(chat_id, actor.id)
+            await refresh_private_card(chat_id, target_user_id)
 
             await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(a_trait, a_trait)}] случайно поменялась с закрытой картой {target_name}!", parse_mode="HTML")
             await bot.send_message(target_user_id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(t_trait, t_trait)}] случайно поменялась с чужой закрытой картой!", parse_mode="HTML")
@@ -624,28 +686,11 @@ async def start_game(callback: types.CallbackQuery):
             assigned_spec = assigned_cards[idx]
             await db.set_player_special_card(chat_id, p_id, assigned_spec)
             
-            spec_title = SPECIAL_CARD_NAMES.get(assigned_spec, "Спецкарта")
-            spec_desc = SPECIAL_CARD_DESCRIPTIONS.get(assigned_spec, "Описание отсутствует.")
-
-            pm_card_text = (
-                f"📋 <b>ТВОЯ КАРТОЧКА ИГРОКА</b>\n───────────────────\n"
-                f"💼 <b>Позиция:</b> <code>{html.escape(str(pack['position']))}</code>\n"
-                f"👤 <b>Возраст:</b> <code>{pack['age']} лет</code>\n"
-                f"💰 <b>Цена:</b> <code>{pack['price']}</code>\n"
-                f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack['health']))}</code>\n"
-                f"🎯 <b>Навык:</b> <code>{html.escape(str(pack['skill']))}</code>\n"
-                f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack['inventory']))}</code>\n"
-                f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack['secret']))}</i>\n"
-                f"───────────────────\n"
-                f"✨ <b>Спец-карта:</b> <b>{spec_title}</b>\n"
-                f"ℹ️ <b>Что делает:</b> <i>{spec_desc}</i>\n"
-                f"───────────────────\n"
-                f"👇 <i>Используй кнопки ниже во время своего хода:</i>"
-            )
-            
+            pm_card_text = await build_private_card_text(chat_id, p_id)
             markup = await build_reveal_keyboard(chat_id, p_id)
             try:
-                await bot.send_message(p_id, pm_card_text, reply_markup=markup, parse_mode="HTML")
+                pm_message = await bot.send_message(p_id, pm_card_text, reply_markup=markup, parse_mode="HTML")
+                await db.set_private_card_message_id(chat_id, p_id, pm_message.message_id)
             except Exception:
                 failed_pm_players.append(f"<a href='tg://user?id={p_id}'>{html.escape(p_name)}</a>")
 
@@ -828,11 +873,15 @@ async def start_voting_flow(chat_id: int, round_num: int):
     builder = InlineKeyboardBuilder()
     for p_name, p_id in alive_players:
         builder.button(text=f"❌ {p_name}", callback_data=f"vote:{p_id}")
+
+    skip_count = await db.get_skip_count(chat_id)
+    if skip_count < 3:
+        builder.button(text=f"⏭️ СКИП ({skip_count}/3)", callback_data="vote:0")
     builder.adjust(2)
 
     await bot.send_message(
         chat_id,
-        f"📋 <b>ОТКРЫТЫЕ ХАРАКТЕРИСТИКИ</b>\n\n{summary_text}\n───────────────────\n🗳 <b>ГОЛОСОВАНИЕ (Раунд {round_num})</b>\n⏳ Время: 1 минута 45 секунд.",
+        f"📋 <b>ОТКРЫТЫЕ ХАРАКТЕРИСТИКИ</b>\n\n{summary_text}\n───────────────────\n🗳 <b>ГОЛОСОВАНИЕ (Раунд {round_num})</b>\n⏭️ <b>Скип:</b> можно пропустить максимум 3 голосования за игру. Скип работает как ничья — никто не выбывает, пенальти за него не будет.\n⏳ Время: 1 минута 45 секунд.",
         reply_markup=builder.as_markup(), parse_mode="HTML"
     )
     await asyncio.sleep(105)
@@ -858,13 +907,26 @@ async def process_vote(callback: types.CallbackQuery):
             return await callback.answer("❌ Выбывшие участники и зрители не могут голосовать!", show_alert=True)
 
         target_id = int(callback.data.split(":")[1])
-        if voter.id == target_id: return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
-        if await db.has_user_voted(chat_id, voter.id): return await callback.answer("⚠️ Ты уже проголосовал!", show_alert=True)
+        if target_id != 0 and voter.id == target_id:
+            return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
+        if target_id != 0 and target_id not in alive_ids:
+            return await callback.answer("❌ Этот игрок уже выбыл.", show_alert=True)
+        if await db.has_user_voted(chat_id, voter.id):
+            return await callback.answer("⚠️ Ты уже проголосовал!", show_alert=True)
 
-        target_name = await db.get_username(chat_id, target_id)
-        await db.add_vote(chat_id, voter.id, target_id)
-        await callback.answer("Голос принят!")
-        await bot.send_message(chat_id, f"🗳 <b>{html.escape(voter.first_name)}</b> проголосовал против <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
+        if target_id == 0:
+            skip_count = await db.get_skip_count(chat_id)
+            if skip_count >= 3:
+                return await callback.answer("⛔ Лимит скипов (3) уже исчерпан.", show_alert=True)
+            await db.add_vote(chat_id, voter.id, 0)
+            await callback.answer("⏭️ Скип принят!")
+            # Не раскрываем в группе, кто именно выбрал скип.
+            await bot.send_message(chat_id, f"⏭️ <b>{html.escape(voter.first_name)}</b> выбрал СКИП.", parse_mode="HTML")
+        else:
+            target_name = await db.get_username(chat_id, target_id)
+            await db.add_vote(chat_id, voter.id, target_id)
+            await callback.answer("Голос принят!")
+            await bot.send_message(chat_id, f"🗳 <b>{html.escape(voter.first_name)}</b> проголосовал против <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
 
         if await db.get_voters_count(chat_id) >= len(alive_players):
             await finish_voting_flow(chat_id)
@@ -904,6 +966,24 @@ async def finish_voting_flow(chat_id: int):
             await db.redirect_votes(chat_id, owner_id, target_id)
             votes_data = await db.get_votes_detailed(chat_id)
         await db.clear_vote_redirect(chat_id, lobby[4])
+
+    # СКИП — отдельный результат голосования. Если он набрал максимум
+    # (в том числе вровень с игроком), никто не выбывает и пенальти не запускается.
+    skip_votes = await db.get_skip_votes_count(chat_id)
+    max_votes = votes_data[0][2] if votes_data else 0
+    if skip_votes > 0 and skip_votes >= max_votes:
+        await db.increment_skip_count(chat_id)
+        await db.reset_tie_count(chat_id)
+        used_skips = await db.get_skip_count(chat_id)
+        await db.clear_votes(chat_id)
+        await bot.send_message(
+            chat_id,
+            f"⏭️ <b>СКИП!</b> Голосование пропущено — никто не выбывает.\n"
+            f"Использовано скипов: <b>{used_skips}/3</b>.",
+            parse_mode="HTML"
+        )
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        return
 
     max_votes = votes_data[0][2]
     top_candidates = [v for v in votes_data if v[2] == max_votes]
