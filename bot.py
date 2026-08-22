@@ -45,7 +45,10 @@ SPECIAL_CARD_NAMES = {
     "yellow_card": "🟨 Желтая карточка",
     "flash": "📸 Вспышка (Публичность)",
     "mirror": "🪞 Зеркальный щит",
-    "chaos": "🎲 Трансферный хаос"
+    "chaos": "🎲 Трансферный хаос",
+    "vote_redirect": "🃏 Подмена голосов",
+    "mute": "🤫 Тихий трибунал",
+    "captain": "©️ Скрытый капитан"
 }
 
 SPECIAL_CARD_DESCRIPTIONS = {
@@ -60,7 +63,10 @@ SPECIAL_CARD_DESCRIPTIONS = {
     "yellow_card": "Блокирует использование спец-карты выбранному игроку до конца игры.",
     "flash": "Принудительно вскрывает любую выбранную тобой закрытую карту соперника в общий чат.",
     "mirror": "Защита: отражает действие следующей примененной против тебя спец-карты обратно.",
-    "chaos": "Случайно меняет одну твою закрытую карту с закрытой картой соперника."
+    "chaos": "Случайно меняет одну твою закрытую карту с закрытой картой соперника.",
+    "vote_redirect": "Используется ДО голосования. Если в конце голосования ты набрал больше всех голосов единолично, все голоса против тебя тайно переводятся на выбранного тобой игрока. Если ты не лидер голосования — карта сгорает.",
+    "mute": "Используется во время обсуждения перед голосованием. Тайно лишает выбранного игрока возможности писать сообщения в группе до конца текущего раунда. Его голоса при этом сохраняются.",
+    "captain": "Тайно назначает одного другого игрока капитаном. В текущем голосовании его голос считается за два. Сам капитан не получает уведомления о назначении."
 }
 
 TRAIT_LABELS = {
@@ -325,6 +331,37 @@ async def handle_use_special_init(callback: types.CallbackQuery):
 
     card_code = spec_info[0]
     other_players = [p for p in alive_players if p[1] != user_id]
+    lobby = await db.get_lobby(target_chat_id)
+    phase = lobby[0] if lobby else ""
+
+    # Эти карты должны применяться до/во время голосования, но не раскрывают факт использования в группе.
+    if card_code in ("vote_redirect", "mute", "captain") and phase != "discussion":
+        return await callback.answer("⏳ Эту спец-карту можно использовать только во время обсуждения перед голосованием.", show_alert=True)
+
+    if card_code == "vote_redirect":
+        builder = InlineKeyboardBuilder()
+        for p_name, p_id in other_players:
+            builder.button(text=f"👤 {p_name}", callback_data=f"secret_target:vote_redirect:{p_id}:{target_chat_id}")
+        builder.adjust(2)
+        await callback.message.answer("🃏 <b>Подмена голосов</b>\nВыбери игрока, на которого тайно будут перенаправлены голоса против тебя, если ты станешь единоличным лидером голосования.", reply_markup=builder.as_markup(), parse_mode="HTML")
+        return await callback.answer()
+
+    if card_code == "mute":
+        builder = InlineKeyboardBuilder()
+        for p_name, p_id in other_players:
+            builder.button(text=f"👤 {p_name}", callback_data=f"secret_target:mute:{p_id}:{target_chat_id}")
+        builder.adjust(2)
+        await callback.message.answer("🤫 <b>Тихий трибунал</b>\nВыбери игрока. Он не получит уведомление, а его сообщения в группе будут молча удаляться до конца текущего раунда.", reply_markup=builder.as_markup(), parse_mode="HTML")
+        return await callback.answer()
+
+    if card_code == "captain":
+        choices = other_players
+        target = random.choice(choices) if choices else None
+        if target:
+            await db.set_captain(target_chat_id, target[1], lobby[4])
+            await db.update_player_special_status(target_chat_id, user_id, special_used=1)
+        await callback.answer("©️ Капитан назначен тайно.", show_alert=True)
+        return
 
     if card_code == "mirror":
         await db.update_player_special_status(target_chat_id, user_id, special_used=1, shield_active=1)
@@ -345,6 +382,36 @@ async def handle_use_special_init(callback: types.CallbackQuery):
         f"✨ <b>Применение: {SPECIAL_CARD_NAMES.get(card_code, card_code)}</b>\nВыбери игрока-цель:",
         reply_markup=builder.as_markup(), parse_mode="HTML"
     )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("secret_target:"))
+async def process_secret_target(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    card_code = parts[1]
+    target_user_id = int(parts[2])
+    chat_id = int(parts[3])
+    actor_id = callback.from_user.id
+
+    alive = await db.get_alive_players(chat_id)
+    alive_ids = {p[1] for p in alive}
+    if actor_id not in alive_ids or target_user_id not in alive_ids or actor_id == target_user_id:
+        return await callback.answer("❌ Некорректная цель.", show_alert=True)
+    spec_info = await db.get_player_special_info(chat_id, actor_id)
+    if not spec_info or spec_info[1] or spec_info[0] != card_code:
+        return await callback.answer("❌ Эта спец-карта уже недоступна.", show_alert=True)
+    lobby = await db.get_lobby(chat_id)
+    if not lobby or lobby[0] not in ("discussion", "voting"):
+        return await callback.answer("⏳ Сейчас эту карту использовать нельзя.", show_alert=True)
+
+    if card_code == "vote_redirect":
+        await db.set_vote_redirect(chat_id, actor_id, target_user_id, lobby[4])
+    elif card_code == "mute":
+        await db.set_muted_round(chat_id, target_user_id, lobby[4])
+    else:
+        return await callback.answer("❌ Неизвестная карта.", show_alert=True)
+
+    await db.update_player_special_status(chat_id, actor_id, special_used=1)
+    await callback.message.edit_text("✅ Спец-карта активирована тайно.")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("target_spec:"))
@@ -587,40 +654,41 @@ async def start_game(callback: types.CallbackQuery):
 
 # --- КОМАНДЫ БОТА ---
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nДобавь бота в групповой чат и введи <code>/game</code>, чтобы начать.", parse_mode="HTML")
+def get_rank(wins: int) -> str:
+    if wins >= 50:
+        return "🐐 Икона Бункера"
+    if wins >= 35:
+        return "💎 Легенда"
+    if wins >= 20:
+        return "🏆 Мастер Бункера"
+    if wins >= 10:
+        return "👑 Ветеран Бункера"
+    if wins >= 6:
+        return "🔥 Опасный соперник"
+    if wins >= 3:
+        return "🏃 Опытный игрок"
+    if wins >= 1:
+        return "⚽ Любитель"
+    return "🥾 Новичок"
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: types.Message):
     user = message.from_user
-    games_played, wins = await db.get_user_profile(user.id, user.first_name)
-    winrate = (wins / games_played * 100) if games_played else 0.0
-
-    # Звания зависят от количества побед. Границы можно изменить позже,
-    # не затрагивая саму систему статистики.
-    ranks = [
-        (50, "🐐 Икона Бункера"),
-        (35, "💎 Легенда"),
-        (20, "🏆 Мастер Бункера"),
-        (10, "👑 Ветеран Бункера"),
-        (6, "🔥 Опасный соперник"),
-        (3, "🏃 Опытный игрок"),
-        (1, "⚽ Любитель"),
-        (0, "🥾 Новичок"),
-    ]
-    rank = next(title for min_wins, title in ranks if wins >= min_wins)
-
-    await message.answer(
-        f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n"
-        f"───────────────────\n"
+    games, wins = await db.get_user_profile(user.id, user.first_name)
+    winrate = (wins / games * 100) if games else 0.0
+    text = (
+        f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n───────────────────\n"
         f"⚽ <b>{html.escape(user.first_name)}</b>\n\n"
-        f"🎮 <b>Сыграно матчей:</b> {games_played}\n"
-        f"🏆 <b>Побед:</b> {wins}\n"
-        f"📊 <b>Винрейт:</b> {winrate:.1f}%\n"
-        f"🎖 <b>Звание:</b> {rank}",
-        parse_mode="HTML"
+        f"🎮 Сыграно: <b>{games}</b>\n"
+        f"🏆 Побед: <b>{wins}</b>\n"
+        f"📊 Винрейт: <b>{winrate:.1f}%</b>\n"
+        f"🎖 Звание: <b>{get_rank(wins)}</b>"
     )
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nДобавь бота в групповой чат и введи <code>/game</code>, чтобы начать.", parse_mode="HTML")
 
 @dp.message(Command("rules"))
 async def cmd_rules(message: types.Message):
@@ -789,9 +857,10 @@ async def process_vote(callback: types.CallbackQuery):
 
 async def finish_voting_flow(chat_id: int):
     lobby = await db.get_lobby(chat_id)
-    if not lobby or lobby[0] not in ("voting", "discussion"): return
+    if not lobby or lobby[0] not in ("voting", "discussion"):
+        return
     await db.set_lobby_status(chat_id, "finishing")
-    
+
     votes_data = await db.get_votes_detailed(chat_id)
     alive = await db.get_alive_players(chat_id)
 
@@ -806,48 +875,67 @@ async def finish_voting_flow(chat_id: int):
     max_votes = votes_data[0][2]
     top_candidates = [v for v in votes_data if v[2] == max_votes]
 
-    if len(top_candidates) > 1:
-        tie_count = await db.get_tie_count(chat_id)
+    # «Подмена голосов» проверяется только после полного голосования.
+    # Никто в группе не узнает, что карта вообще была активирована.
+    redirect = await db.get_vote_redirect(chat_id, lobby[4])
+    if redirect:
+        owner_id, target_id = redirect
+        owner_row = next((v for v in votes_data if v[0] == owner_id), None)
+        if owner_row and owner_row[2] == max_votes and len(top_candidates) == 1:
+            await db.redirect_votes(chat_id, owner_id, target_id)
+            votes_data = await db.get_votes_detailed(chat_id)
+        await db.clear_vote_redirect(chat_id, lobby[4])
 
-        # Первая ничья — даём игрокам ещё один раунд.
-        # Вторая ничья подряд — пенальти: случайно выбывает один из лидеров.
-        if tie_count == 0:
-            await db.set_tie_count(chat_id, 1)
-            await db.clear_votes(chat_id)
+    max_votes = votes_data[0][2]
+    top_candidates = [v for v in votes_data if v[2] == max_votes]
+
+    if len(top_candidates) > 1:
+        await db.clear_votes(chat_id)
+        await db.increment_tie_count(chat_id)
+        tie_count = await db.get_tie_count(chat_id)
+        if tie_count >= 2:
+            # Две ничьи подряд — пенальти. Выбираем одного из лидеров.
+            chosen = random.choice(top_candidates)
+            kicked_id, kicked_name = chosen[0], chosen[1]
+            await db.eliminate_player(chat_id, kicked_id)
+            await db.reset_tie_count(chat_id)
             await bot.send_message(
                 chat_id,
-                f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Это первая ничья подряд.\n"
-                f"🔄 Получаете ещё один раунд, чтобы решить судьбу кандидатов.",
+                f"⚽ <b>ПЕНАЛЬТИ!</b> Две ничьи подряд. По пенальти из игры выбыл: <b>{html.escape(kicked_name)}</b>",
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(
+                chat_id,
+                f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Переходим к Раунду {lobby[4] + 1}.",
                 parse_mode="HTML"
             )
             asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
             return
-
-        # Вторая ничья подряд — бесконечного цикла больше не будет.
-        kicked = random.choice(top_candidates)
-        kicked_id, kicked_name = kicked[0], kicked[1]
-        await db.eliminate_player(chat_id, kicked_id)
-        await db.set_tie_count(chat_id, 0)
-        await db.clear_votes(chat_id)
-        await bot.send_message(
-            chat_id,
-            f"⚽ <b>ПЕНАЛЬТИ!</b> Вторая ничья подряд.\n"
-            f"❌ Случайным выбором из лидеров выбывает: <b>{html.escape(kicked_name)}</b>",
-            parse_mode="HTML"
-        )
     else:
-        kicked_id, kicked_name = votes_data[0][0], votes_data[0][1]
+        kicked_id, kicked_name = top_candidates[0][0], top_candidates[0][1]
+        await db.reset_tie_count(chat_id)
         await db.eliminate_player(chat_id, kicked_id)
-        await db.set_tie_count(chat_id, 0)
         await db.clear_votes(chat_id)
-    
-    alive_after = await db.get_alive_players(chat_id)
-    await bot.send_message(chat_id, f"❌ Из команды изгнан: <b>{html.escape(kicked_name)}</b>", parse_mode="HTML")
+        await bot.send_message(chat_id, f"❌ Из команды изгнан: <b>{html.escape(kicked_name)}</b>", parse_mode="HTML")
 
-    if len(alive_after) <= 2:
-        await announce_winners_and_end(chat_id, alive_after)
+    if len(await db.get_alive_players(chat_id)) <= 2:
+        await announce_winners_and_end(chat_id, await db.get_alive_players(chat_id))
     else:
         asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_silent_mute(message: types.Message):
+    # Молчаливое подавление сообщений только в фазах обсуждения/голосования.
+    lobby = await db.get_lobby(message.chat.id)
+    if not lobby or lobby[0] not in ("discussion", "voting"):
+        return
+    if await db.is_muted_for_round(message.chat.id, message.from_user.id, lobby[4]):
+        try:
+            await message.delete()
+        except Exception:
+            # Если бот не администратор с правом удаления сообщений, скрытое молчание невозможно.
+            pass
 
 async def handle_ping(request):
     return web.Response(text="Bot Alive")
