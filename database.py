@@ -42,7 +42,10 @@ async def init_db():
                 scenario TEXT,
                 current_round INTEGER DEFAULT 1,
                 current_turn_user_id INTEGER DEFAULT 0,
-                tie_count INTEGER DEFAULT 0
+                tie_count INTEGER DEFAULT 0,
+                skip_count INTEGER DEFAULT 0,
+                total_ties INTEGER DEFAULT 0,
+                total_votes INTEGER DEFAULT 0
             )
         """)
         
@@ -60,6 +63,7 @@ async def init_db():
                 muted_round INTEGER DEFAULT 0,
                 vote_redirect_target INTEGER DEFAULT 0,
                 vote_redirect_round INTEGER DEFAULT 0,
+                private_card_message_id INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
@@ -72,7 +76,8 @@ async def init_db():
             ("shield_active", "INTEGER DEFAULT 0"),
             ("muted_round", "INTEGER DEFAULT 0"),
             ("vote_redirect_target", "INTEGER DEFAULT 0"),
-            ("vote_redirect_round", "INTEGER DEFAULT 0")
+            ("vote_redirect_round", "INTEGER DEFAULT 0"),
+            ("private_card_message_id", "INTEGER DEFAULT 0")
         ]:
             try:
                 await db.execute(f"ALTER TABLE players ADD COLUMN {col} {col_type}")
@@ -81,6 +86,18 @@ async def init_db():
 
         try:
             await db.execute("ALTER TABLE lobbies ADD COLUMN tie_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE lobbies ADD COLUMN skip_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE lobbies ADD COLUMN total_ties INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE lobbies ADD COLUMN total_votes INTEGER DEFAULT 0")
         except Exception:
             pass
 
@@ -216,13 +233,39 @@ async def get_tie_count(chat_id: int) -> int:
 
 async def increment_tie_count(chat_id: int):
     async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET tie_count = COALESCE(tie_count, 0) + 1 WHERE chat_id = ?", (chat_id,))
+        await db.execute("UPDATE lobbies SET tie_count = COALESCE(tie_count, 0) + 1, total_ties = COALESCE(total_ties, 0) + 1 WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
 async def reset_tie_count(chat_id: int):
     async with connect_db() as db:
         await db.execute("UPDATE lobbies SET tie_count = 0 WHERE chat_id = ?", (chat_id,))
         await db.commit()
+
+async def get_skip_count(chat_id: int) -> int:
+    async with connect_db() as db:
+        async with db.execute("SELECT COALESCE(skip_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def increment_skip_count(chat_id: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE lobbies SET skip_count = COALESCE(skip_count, 0) + 1 WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+
+
+async def get_game_stats(chat_id: int):
+    async with connect_db() as db:
+        async with db.execute("SELECT current_round, COALESCE(total_votes, 0), COALESCE(total_ties, 0), COALESCE(skip_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            lobby_row = await cursor.fetchone()
+        async with db.execute("SELECT COUNT(*) FROM players WHERE chat_id = ? AND special_used = 1", (chat_id,)) as cursor:
+            special_used = (await cursor.fetchone())[0]
+        return {
+            "rounds": lobby_row[0] if lobby_row else 0,
+            "votes": lobby_row[1] if lobby_row else 0,
+            "ties": lobby_row[2] if lobby_row else 0,
+            "skips": lobby_row[3] if lobby_row else 0,
+            "special_cards": special_used,
+        }
 
 # --- ИГРОКИ И ПАКЕТЫ ХАРАКТЕРИСТИК ---
 
@@ -258,6 +301,17 @@ async def update_player_pack(chat_id: int, user_id: int, pack: dict):
         pack_json = json.dumps(pack, ensure_ascii=False)
         await db.execute("UPDATE players SET pack_json = ? WHERE chat_id = ? AND user_id = ?", (pack_json, chat_id, user_id))
         await db.commit()
+
+async def set_private_card_message_id(chat_id: int, user_id: int, message_id: int):
+    async with connect_db() as db:
+        await db.execute("UPDATE players SET private_card_message_id = ? WHERE chat_id = ? AND user_id = ?", (message_id, chat_id, user_id))
+        await db.commit()
+
+async def get_private_card_message_id(chat_id: int, user_id: int) -> int:
+    async with connect_db() as db:
+        async with db.execute("SELECT private_card_message_id FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
 # --- СПЕЦ-КАРТЫ (МЕТОДЫ) ---
 
@@ -388,6 +442,7 @@ async def get_non_voted_alive_players(chat_id: int):
 async def add_vote(chat_id: int, voter_id: int, target_id: int):
     async with connect_db() as db:
         await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
+        await db.execute("UPDATE lobbies SET total_votes = COALESCE(total_votes, 0) + 1 WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
 async def get_username(chat_id: int, user_id: int) -> str:
@@ -402,6 +457,12 @@ async def get_voters_count(chat_id: int) -> int:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
+async def get_skip_votes_count(chat_id: int) -> int:
+    async with connect_db() as db:
+        async with db.execute("SELECT COUNT(*) FROM votes WHERE chat_id = ? AND target_id = 0", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
 async def get_votes_detailed(chat_id: int):
     async with connect_db() as db:
         query = """
@@ -412,7 +473,7 @@ async def get_votes_detailed(chat_id: int):
             LEFT JOIN hidden_captains hc
               ON hc.chat_id = v.chat_id
              AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
-            WHERE v.chat_id = ?
+            WHERE v.chat_id = ? AND v.target_id != 0
             GROUP BY v.target_id, p.user_name
             ORDER BY cnt DESC
         """
