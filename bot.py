@@ -248,38 +248,63 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
     game_stats = await db.get_game_stats(chat_id)
     await db.set_lobby_status(chat_id, "ended")
-    
+
     all_players = await db.get_players(chat_id)
     alive_ids = {p[1] for p in alive_players}
-    
+
     for p_name, p_id, _ in all_players:
         is_win = (p_id in alive_ids) and (len(alive_players) > 0)
         await db.update_user_stats(p_id, p_name, is_win)
 
+    # После завершения показываем всем полные карточки всех участников.
+    # Это происходит только после окончания игры, поэтому скрытая информация
+    # больше не влияет на игровой процесс.
+    all_cards_blocks = []
+    for idx, (p_name, p_id, _) in enumerate(all_players, 1):
+        pack = await db.get_player_pack(chat_id, p_id) or {}
+        spec_info = await db.get_player_special_info(chat_id, p_id)
+        spec_code = spec_info[0] if spec_info else ""
+        spec_used = bool(spec_info[1]) if spec_info else False
+        spec_title = SPECIAL_CARD_NAMES.get(spec_code, "—")
+        if spec_used and spec_title != "—":
+            spec_title += " (использована)"
+        alive_mark = "🏆" if p_id in alive_ids else "❌"
+        age = pack.get("age", "-")
+        age_text = f"{age} лет" if age != "-" else "-"
+        all_cards_blocks.append(
+            f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b>\n"
+            f"├ 💼 Позиция: <b>{html.escape(str(pack.get('position', '-')))}</b>\n"
+            f"├ 👤 Возраст: <b>{html.escape(str(age_text))}</b>\n"
+            f"├ 💰 Цена: <b>{html.escape(str(pack.get('price', '-')))}</b>\n"
+            f"├ ❤️ Здоровье: <b>{html.escape(str(pack.get('health', '-')))}</b>\n"
+            f"├ 🎯 Навык: <b>{html.escape(str(pack.get('skill', '-')))}</b>\n"
+            f"├ 🎒 Багаж: <b>{html.escape(str(pack.get('inventory', '-')))}</b>\n"
+            f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret', '-')))}</b>\n"
+            f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
+        )
+
     if not alive_players:
         await bot.send_message(chat_id, "❌ <b>ИГРА ОКОНЧЕНА</b>\n───────────────────\nВсе претенденты выбыли! Победителей нет.", parse_mode="HTML")
-        return
-
-    winners_str = "\n".join([f"├ 🏆 <b>{html.escape(p[0])}</b>" for p in alive_players[:-1]] + [f"└ 🏆 <b>{html.escape(alive_players[-1][0])}</b>"])
-    
-    await bot.send_message(
-        chat_id,
-        f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nОставшиеся игроки претендуют на контракт:\n{winners_str}\n\n🤖 <i>ИИ-эксперт изучает все карточки и формирует вердикт...</i>",
-        parse_mode="HTML"
-    )
+    else:
+        winners_str = "\n".join([f"├ 🏆 <b>{html.escape(p[0])}</b>" for p in alive_players[:-1]] + [f"└ 🏆 <b>{html.escape(alive_players[-1][0])}</b>"])
+        await bot.send_message(
+            chat_id,
+            f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nОставшиеся игроки претендуют на контракт:\n{winners_str}\n\n🤖 <i>ИИ-эксперт изучает все карточки и формирует вердикт...</i>",
+            parse_mode="HTML"
+        )
 
     await bot.send_chat_action(chat_id, action="typing")
 
     lobby = await db.get_lobby(chat_id)
     scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
-    
+
     winners_data = []
     for p_name, p_id in alive_players:
         pack = await db.get_player_pack(chat_id, p_id) or {}
         winners_data.append((p_name, pack))
 
     ai_verdict = await evaluate_game_outcome(scenario_text, winners_data)
-    
+
     await bot.send_message(
         chat_id,
         f"📊 <b>ИТОГИ СЦЕНАРИЯ</b>\n───────────────────\n{ai_verdict}\n\n"
@@ -289,6 +314,14 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
         f"🤝 Ничьих: <b>{game_stats['ties']}</b>\n"
         f"⏭️ Скипов: <b>{game_stats['skips']}/3</b>\n"
         f"🃏 Спецкарт использовано: <b>{game_stats['special_cards']}</b>",
+        parse_mode="HTML"
+    )
+
+    await bot.send_message(
+        chat_id,
+        "🔓 <b>КАРТЫ РАСКРЫТЫ</b>\n───────────────────\n"
+        "Теперь можно узнать, что на самом деле скрывал каждый игрок:\n\n"
+        + "\n\n".join(all_cards_blocks),
         parse_mode="HTML"
     )
 
@@ -658,10 +691,21 @@ async def process_flash_reveal(callback: types.CallbackQuery):
 async def start_game(callback: types.CallbackQuery):
     try:
         chat_id = callback.message.chat.id
+        lobby = await db.get_lobby(chat_id)
+        if not lobby:
+            return await callback.answer("❌ Это лобби уже не существует.", show_alert=True)
+        if lobby[0] != "lobby":
+            return await callback.answer("⚠️ Игра уже запущена или завершена.", show_alert=True)
+
+        # Атомарный lock: два быстрых нажатия «Старт» не смогут создать две игры.
+        if not await db.try_start_lobby(chat_id):
+            return await callback.answer("⚠️ Игра уже запускается.", show_alert=True)
+
         players = await db.get_players(chat_id)
         num_players = len(players)
         
         if num_players < 3:
+            await db.set_lobby_status(chat_id, "lobby")
             return await callback.answer(f"⚠️ Сейчас участников: {num_players}. Нужно минимум 3 человека!", show_alert=True)
 
         await callback.answer("Игра начинается!")
@@ -731,6 +775,12 @@ async def start_game(callback: types.CallbackQuery):
         asyncio.create_task(start_round_flow(chat_id, 1))
 
     except Exception as e:
+        try:
+            lobby = await db.get_lobby(chat_id)
+            if lobby and lobby[0] == "starting":
+                await db.set_lobby_status(chat_id, "cancelled")
+        except Exception:
+            pass
         await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
 
 # --- КОМАНДЫ БОТА ---
@@ -774,17 +824,50 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("rules"))
 async def cmd_rules(message: types.Message):
     rules_text = (
-        "📜 <b>ПРАВИЛА ИГРЫ «ФУТБОЛЬНЫЙ БУНКЕР»</b>\n───────────────────\n"
-        "⚽ <b>Цель игры:</b> Доказать, что твои характеристики подходят под цель футбольного сценария, и избежать выбывания.\n\n"
-        "🔹 <b>Игровой процесс:</b>\n"
-        "1. В начале игры каждому участнику выдается набор из 7 характеристик и 1 разовой спец-карты в ЛС бота.\n"
-        "2. В каждом раунде игроки по очереди раскрывают по 1 характеристике.\n"
-        "3. После вскрытия карт проходит фаза обсуждения.\n"
-        "4. В конце раунда проводится голосование — участник с наибольшим количеством голосов выбывает из игры.\n"
-        "5. Игра продолжается до тех пор, пока не останется 2 победных претендента.\n\n"
-        "🤖 <b>Вердикт ИИ:</b> В финале ИИ-эксперт анализирует оставшихся игроков и выносит окончательный вердикт: справилась ли команда с поставленной целью сценария!"
+        "📜 <b>ПРАВИЛА «ФУТБОЛЬНОГО БУНКЕРА»</b>\n"
+        "───────────────────\n"
+        "🎯 <b>Цель</b>\n"
+        "Остаться в игре до финала и доказать, что твой футболист подходит под сценарий. В финале остаются 2 игрока, после чего ИИ оценивает их как команду.\n\n"
+        "🎮 <b>Как начинается игра</b>\n"
+        "• В группе вводится /game.\n"
+        "• Игроки вступают через кнопку.\n"
+        "• Нужно минимум 3 участника.\n"
+        "• После старта каждому игроку в ЛС выдаётся 7 характеристик и 1 одноразовая спецкарта.\n\n"
+        "📋 <b>Характеристики</b>\n"
+        "💼 Позиция • 👤 Возраст • 💰 Цена • ❤️ Здоровье • 🎯 Навык • 🎒 Багаж • 🔍 Секрет.\n"
+        "В начале они скрыты. Каждый раунд игроки по очереди раскрывают одну ещё не раскрытую характеристику.\n\n"
+        "🗣 <b>Обсуждение</b>\n"
+        "После раскрытия начинается обсуждение. Здесь можно убеждать других игроков, объяснять свои карты и использовать подходящие спецкарты. Некоторые спецкарты работают только в этот момент и применяются тайно.\n\n"
+        "🗳 <b>Голосование</b>\n"
+        "Игроки голосуют за одного живого соперника или за ⏭️ СКИП. Игрок с наибольшим количеством голосов выбывает. Если СКИП набрал максимум или сравнялся с лидером — никто не выбывает.\n"
+        "Скип можно использовать максимум 3 раза за игру.\n\n"
+        "🤝 <b>Ничья</b>\n"
+        "Если несколько игроков набрали одинаковое максимальное количество голосов, это считается ничьёй. Никто не выбывает. После двух ничьих подряд запускается пенальти.\n\n"
+        "🎴 <b>Спецкарты</b>\n"
+        "У каждого игрока только одна разовая карта. Среди карт есть обмен характеристиками, шпионаж, жёлтая карточка, вспышка, зеркальный щит, трансферный хаос, подмена голосов, тихий трибунал и скрытый капитан.\n"
+        "Карта обмена характеристикой существует только у одного игрока за матч.\n\n"
+        "🏆 <b>Финал</b>\n"
+        "Когда остаются 2 игрока, игра заканчивается. ИИ анализирует сценарий и актуальные карточки финалистов и выносит вердикт: УСПЕХ или ПРОВАЛ. После этого бот раскрывает карточки всех участников, чтобы стало видно, кто что скрывал.\n\n"
+        "🛑 <b>/stop</b> — принудительно остановить текущую игру.\n"
+        "👤 <b>/profile</b> — твоя общая статистика.\n"
+        "🃏 <b>/card</b> — твоя актуальная карточка (работает только в личных сообщениях)."
     )
     await message.answer(rules_text, parse_mode="HTML")
+
+@dp.message(Command("card"))
+async def cmd_card(message: types.Message):
+    if message.chat.type != "private":
+        return await message.reply("🃏 Карточку можно запросить только в личных сообщениях с ботом.")
+
+    # В ЛС один и тот же пользователь может играть в разных группах, поэтому
+    # сначала ищем активную игру, в которой он сейчас участвует.
+    active_chat = await db.find_active_player_chat(message.from_user.id)
+    if not active_chat:
+        return await message.answer("🃏 Сейчас я не нашёл тебя среди участников активной игры.\n\nСначала вступи в игру в группе, а затем напиши /card здесь.")
+
+    text = await build_private_card_text(active_chat, message.from_user.id)
+    markup = await build_reveal_keyboard(active_chat, message.from_user.id)
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
@@ -802,6 +885,16 @@ async def cmd_stop(message: types.Message):
 async def cmd_game(message: types.Message):
     if message.chat.type == "private":
         return await message.answer("Играть можно только в групповых чатах!")
+
+    if await is_game_active(message.chat.id):
+        lobby = await db.get_lobby(message.chat.id)
+        status = lobby[0] if lobby else "active"
+        return await message.answer(
+            "⚠️ <b>В этом чате уже есть активная игра.</b>\n"
+            f"Текущий статус: <code>{html.escape(str(status))}</code>\n\n"
+            "Сначала завершите её или используйте /stop.",
+            parse_mode="HTML"
+        )
 
     await db.create_lobby(message.chat.id, message.from_user.id)
     builder = InlineKeyboardBuilder()
@@ -966,7 +1059,23 @@ async def finish_voting_flow(chat_id: int):
         await announce_winners_and_end(chat_id, alive)
         return
 
+    # Если все голоса отданы за СКИП, votes_data пустой — этот случай тоже должен считаться скипом.
+    skip_votes = await db.get_skip_votes_count(chat_id)
+    if not votes_data and skip_votes > 0:
+        await db.increment_skip_count(chat_id)
+        await db.reset_tie_count(chat_id)
+        used_skips = await db.get_skip_count(chat_id)
+        await db.clear_votes(chat_id)
+        await bot.send_message(
+            chat_id,
+            f"⏭️ <b>СКИП!</b> Все голоса — за пропуск. Никто не выбывает.\nИспользовано скипов: <b>{used_skips}/3</b>.",
+            parse_mode="HTML"
+        )
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        return
+
     if not votes_data:
+        await db.clear_votes(chat_id)
         asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
         return
 
