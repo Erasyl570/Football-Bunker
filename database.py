@@ -187,11 +187,23 @@ async def create_lobby(chat_id: int, host_id: int):
         await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM hidden_captains WHERE chat_id = ?", (chat_id,))
         await db.execute(
             "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
             (chat_id, host_id, "lobby")
         )
         await db.commit()
+
+async def try_start_lobby(chat_id: int) -> bool:
+    """Атомарно переводит лобби из lobby в starting. Защищает от двойного старта."""
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "UPDATE lobbies SET status = 'starting' WHERE chat_id = ? AND status = 'lobby'",
+            (chat_id,)
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
 
 async def get_lobby(chat_id: int):
     async with connect_db() as db:
@@ -306,6 +318,23 @@ async def set_private_card_message_id(chat_id: int, user_id: int, message_id: in
     async with connect_db() as db:
         await db.execute("UPDATE players SET private_card_message_id = ? WHERE chat_id = ? AND user_id = ?", (message_id, chat_id, user_id))
         await db.commit()
+
+async def find_active_player_chat(user_id: int):
+    """Возвращает чат активной игры, в которой участвует пользователь."""
+    async with connect_db() as db:
+        async with db.execute(
+            """SELECT p.chat_id
+               FROM players p
+               JOIN lobbies l ON l.chat_id = p.chat_id
+              WHERE p.user_id = ?
+                AND l.status NOT IN ('ended', 'cancelled')
+              ORDER BY CASE WHEN l.status = 'lobby' THEN 0 ELSE 1 END, l.current_round DESC
+              LIMIT 1""",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
 
 async def get_private_card_message_id(chat_id: int, user_id: int) -> int:
     async with connect_db() as db:
@@ -459,9 +488,17 @@ async def get_voters_count(chat_id: int) -> int:
 
 async def get_skip_votes_count(chat_id: int) -> int:
     async with connect_db() as db:
-        async with db.execute("SELECT COUNT(*) FROM votes WHERE chat_id = ? AND target_id = 0", (chat_id,)) as cursor:
+        query = """
+            SELECT COALESCE(SUM(CASE WHEN hc.user_id = v.voter_id THEN 2 ELSE 1 END), 0)
+            FROM votes v
+            LEFT JOIN hidden_captains hc
+              ON hc.chat_id = v.chat_id
+             AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
+            WHERE v.chat_id = ? AND v.target_id = 0
+        """
+        async with db.execute(query, (chat_id,)) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row else 0
+            return int(row[0] or 0)
 
 async def get_votes_detailed(chat_id: int):
     async with connect_db() as db:
