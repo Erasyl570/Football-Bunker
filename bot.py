@@ -3,9 +3,12 @@ import html
 import json
 import os
 import random
+import time
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import LinkPreviewOptions
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 import google.generativeai as genai
@@ -22,6 +25,39 @@ if GEMINI_API_KEY:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# --- ЗАЩИТА ОТ СПАМА / АВТОКЛИКЕРОВ ---
+class CallbackRateLimitMiddleware(BaseMiddleware):
+    def __init__(self, interval: float = 0.65):
+        self.interval = interval
+        self.last_seen = {}
+
+    async def __call__(self, handler, event, data):
+        user_id = getattr(event.from_user, "id", None)
+        if user_id is not None:
+            now = time.monotonic()
+            key = (user_id, getattr(event.message, "chat", None).id if getattr(event, "message", None) else 0)
+            previous = self.last_seen.get(key, 0.0)
+            if now - previous < self.interval:
+                try:
+                    await event.answer("⏳ Слишком быстро. Подожди немного.")
+                except Exception:
+                    pass
+                return
+            self.last_seen[key] = now
+            # Не даём словарю расти бесконечно.
+            if len(self.last_seen) > 10000:
+                cutoff = now - 60
+                self.last_seen = {k: v for k, v in self.last_seen.items() if v >= cutoff}
+        return await handler(event, data)
+
+dp.callback_query.outer_middleware(CallbackRateLimitMiddleware())
+
+# Один запрос Gemini одновременно. При 429/503/временных сбоях — повтор с backoff.
+GEMINI_SEMAPHORE = asyncio.Semaphore(1)
+GEMINI_CACHE = {}
+FINALIZING_GAMES = set()
+
 
 CARD_IMAGES = {
     "position": "https://i.ibb.co/rRQQn3Jk/E17684-E2-56-F4-4-D66-8727-A0411741-F102.png", 
@@ -81,47 +117,52 @@ async def is_game_active(chat_id: int) -> bool:
 # --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK С ТАЙМАУТОМ) ---
 async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
     if not GEMINI_API_KEY:
-        return "⚠️ <i>GEMINI_API_KEY не задан в переменных окружения. Оценка сценария недоступна.</i>"
+        return "⚠️ <i>GEMINI_API_KEY не задан. Оценка сценария недоступна.</i>"
 
-    players_summary = ""
-    for name, pack in winners_data:
-        players_summary += (
-            f"- Игрок {name}: Позиция={pack.get('position')}, Возраст={pack.get('age')}, "
-            f"Цена={pack.get('price')}, Здоровье={pack.get('health')}, Навык={pack.get('skill')}, "
-            f"Багаж={pack.get('inventory')}, Секрет={pack.get('secret')}\n"
-        )
-
-    prompt = (
-        f"Ты — футбольный спортивный директор и эксперт по составу. Твоя задача — честно, но НЕ душнить: оцени, способны ли два оставшихся игрока разумно выполнить цель сценария как команда.\n\n"
-        f"СЦЕНАРИЙ И ЦЕЛЬ:\n{scenario_text}\n\n"
-        f"СОСТАВ ПОБЕДИТЕЛЕЙ И ИХ АКТУАЛЬНЫЕ КАРТОЧКИ:\n{players_summary}\n\n"
-        f"СТРОГИЕ ПРАВИЛА ОЦЕНКИ:\n"
-        f"1. Сначала определи 2-3 ГЛАВНЫХ требования сценария. Не превращай второстепенные детали в обязательные условия.\n"
-        f"2. Если сценарий прямо требует определенную позицию (например, 2 форварда), это ключевое условие.\n"
-        f"3. Если в сценарии есть конкретный порог трансферной цены, он обязателен. Проверяй цену каждого игрока, если написано «каждого», и не придумывай другие пороги.\n"
-        f"4. Не требуй идеального соответствия всем характеристикам. Один слабый или неудобный параметр НЕ означает автоматически ПРОВАЛ.\n"
-        f"5. Если характеристика скрыта или неизвестна — считай её НЕИЗВЕСТНОЙ, а не плохой. Не додумывай негатив.\n"
-        f"6. Положительные характеристики могут компенсировать второстепенные недостатки. Если оба игрока в целом подходят и у команды есть реалистичный способ выполнить задачу — выбирай УСПЕХ.\n"
-        f"7. ПРОВАЛ ставь только при явном противоречии ключевым условиям сценария или если состав очевидно не способен выполнить цель. Не ищи повод придраться.\n"
-        f"8. Не учитывай, что игроки уже пережили предыдущие раунды: оцени только финальную пару и сам сценарий.\n"
-        f"9. Не выдумывай характеристики, которых нет в карточках.\n\n"
-        f"Формат ответа:\n"
-        f"📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
-        f"📝 <b>Причина:</b> [2-4 коротких предложения: что решило исход и какие характеристики были ключевыми]"
+    players_summary = "".join(
+        f"- Игрок {name}: Позиция={pack.get('position')}, Возраст={pack.get('age')}, "
+        f"Цена={pack.get('price')}, Здоровье={pack.get('health')}, Навык={pack.get('skill')}, "
+        f"Багаж={pack.get('inventory')}, Секрет={pack.get('secret')}\n"
+        for name, pack in winners_data
     )
+    prompt = (
+        "Ты — футбольный спортивный директор. Оцени финальную пару честно, но без душнилова.\n\n"
+        f"СЦЕНАРИЙ И ЦЕЛЬ:\n{scenario_text}\n\n"
+        f"ФИНАЛЬНАЯ ПАРА И АКТУАЛЬНЫЕ КАРТОЧКИ:\n{players_summary}\n"
+        "ПРАВИЛА: 1) Определи 2-3 главных требования сценария. "
+        "2) Прямой ценовой/позиционный порог обязателен, если он указан. "
+        "3) Не требуй идеального совпадения всех характеристик. "
+        "4) Неизвестная характеристика не считается плохой. "
+        "5) Положительные качества могут компенсировать второстепенные недостатки. "
+        "6) ПРОВАЛ только при явном противоречии ключевым условиям или очевидной неспособности выполнить цель. "
+        "7) Не выдумывай характеристики.\n\n"
+        "Формат: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
+        "📝 <b>Причина:</b> [2-4 коротких предложения]"
+    )
+    cache_key = str(hash(prompt))
+    if cache_key in GEMINI_CACHE:
+        return GEMINI_CACHE[cache_key]
 
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        # Вызов с таймаутом в 120 секунд для долгой генерации
-        response = await model.generate_content_async(
-            prompt,
-            request_options={"timeout": 20}
-        )
-        if response and response.text:
-            return response.text.strip()
-        return "⚠️ <i>Не удалось получить вердикт от ИИ.</i>"
-    except Exception as e:
-        return f"⚠️ <i>Ошибка вызова AI: {e}</i>"
+    async with GEMINI_SEMAPHORE:
+        last_error = None
+        for attempt in range(3):
+            try:
+                model = genai.GenerativeModel(GEMINI_MODEL)
+                response = await model.generate_content_async(
+                    prompt, request_options={"timeout": 25}
+                )
+                if response and getattr(response, "text", None):
+                    result = response.text.strip()
+                    GEMINI_CACHE[cache_key] = result
+                    return result
+                last_error = "Пустой ответ"
+            except Exception as e:
+                last_error = str(e)
+                # 1s, 2s перед повтором; не спамим Gemini при временной ошибке.
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+        print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
+        return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена, но вердикт можно получить повторно позже.</i>"
 
 async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
@@ -708,6 +749,8 @@ async def start_game(callback: types.CallbackQuery):
             await db.set_lobby_status(chat_id, "lobby")
             return await callback.answer(f"⚠️ Сейчас участников: {num_players}. Нужно минимум 3 человека!", show_alert=True)
 
+        if not await db.try_start_lobby(chat_id):
+            return await callback.answer("⚠️ Игра уже запускается или уже началась.", show_alert=True)
         await callback.answer("Игра начинается!")
         
         scen = cards.generate_scenario(num_players)
@@ -817,57 +860,109 @@ async def cmd_profile(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
+async def private_menu_markup():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Профиль", callback_data="menu:profile")
+    builder.button(text="🃏 Моя карточка", callback_data="menu:card")
+    builder.button(text="📜 Правила", callback_data="menu:rules")
+    try:
+        me = await bot.get_me()
+        builder.button(text="➕ Добавить в группу", url=f"https://t.me/{me.username}?startgroup=true")
+    except Exception:
+        pass
+    builder.adjust(2, 1, 1)
+    return builder.as_markup()
+
+async def private_welcome_text():
+    return (
+        "⚽️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b>\n"
+        "───────────────────\n"
+        "Социальная футбольная игра на блеф, обсуждение и голосование.\n\n"
+        "👇 Выбери нужный раздел:"
+    )
+
+@dp.callback_query(F.data == "menu:profile")
+async def menu_profile(callback: types.CallbackQuery):
+    user = callback.from_user
+    games, wins = await db.get_user_profile(user.id, user.first_name)
+    rate = (wins / games * 100) if games else 0
+    await callback.message.edit_text(
+        f"👤 <b>ТВОЙ ПРОФИЛЬ</b>\n───────────────────\n"
+        f"Игрок: <b>{html.escape(user.first_name)}</b>\n"
+        f"🎮 Игр: <b>{games}</b>\n🏆 Побед: <b>{wins}</b>\n📈 Винрейт: <b>{rate:.0f}%</b>",
+        reply_markup=await private_menu_markup(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu:card")
+async def menu_card(callback: types.CallbackQuery):
+    if callback.message.chat.type != "private":
+        return await callback.answer("🃏 Карточка доступна только в личке бота.", show_alert=True)
+    active = await db.find_active_player_chat(callback.from_user.id)
+    if not active:
+        return await callback.answer("ℹ️ Сейчас ты не участвуешь в активной игре.", show_alert=True)
+    chat_id = active[0]
+    await callback.message.edit_text(
+        await build_private_card_text(chat_id, callback.from_user.id),
+        reply_markup=await build_reveal_keyboard(chat_id, callback.from_user.id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu:rules")
+async def menu_rules(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        await get_rules_text(), reply_markup=await private_menu_markup(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu:home")
+async def menu_home(callback: types.CallbackQuery):
+    await callback.message.edit_text(await private_welcome_text(), reply_markup=await private_menu_markup(), parse_mode="HTML")
+    await callback.answer()
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nДобавь бота в групповой чат и введи <code>/game</code>, чтобы начать.", parse_mode="HTML")
+    if message.chat.type == "private":
+        await message.answer(await private_welcome_text(), reply_markup=await private_menu_markup(), parse_mode="HTML")
+    else:
+        await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nВведи <code>/game</code>, чтобы создать игру.", parse_mode="HTML")
+
+async def get_rules_text():
+    return (
+        "📜 <b>ПРАВИЛА «ФУТБОЛЬНОГО БУНКЕРА»</b>\n───────────────────\n"
+        "⚽ <b>Цель:</b> остаться в финальной паре и доказать ИИ, что команда подходит под сценарий.\n\n"
+        "🃏 <b>Карточки:</b> позиция, возраст, цена, здоровье, навык, багаж и секрет. В каждом раунде по очереди раскрывается одна карта.\n\n"
+        "💬 <b>Обсуждение:</b> после вскрытия игроки обсуждают состав. Некоторые спецкарты можно использовать скрытно именно здесь.\n\n"
+        "🗳 <b>Голосование:</b> нельзя голосовать за себя. Игрок с наибольшим числом голосов выбывает.\n\n"
+        "⏭️ <b>СКИП:</b> можно выбрать максимум 3 раза за игру. Если скип набирает максимум или сравнивается с лидером, никто не выбывает. Пенальти за скип не запускается.\n\n"
+        "🤝 <b>Ничья:</b> при равенстве лидеров никто не выбывает. Две ничьи подряд запускают пенальти.\n\n"
+        "🎴 <b>Спецкарты:</b> одноразовые и могут менять ход игры. Некоторые действия скрыты от группы. Карты обмена характеристиками получает только один игрок за матч.\n\n"
+        "🏆 <b>Финал:</b> оставшиеся игроки проходят проверку ИИ-судьи. После окончания бот раскрывает карточки всех участников.\n\n"
+        "📋 <b>Команды:</b> /game — игра в группе, /profile — статистика, /card — актуальная карточка в ЛС, /stop — остановить игру."
+    )
 
 @dp.message(Command("rules"))
 async def cmd_rules(message: types.Message):
-    rules_text = (
-        "📜 <b>ПРАВИЛА «ФУТБОЛЬНОГО БУНКЕРА»</b>\n"
-        "───────────────────\n"
-        "🎯 <b>Цель</b>\n"
-        "Остаться в игре до финала и доказать, что твой футболист подходит под сценарий. В финале остаются 2 игрока, после чего ИИ оценивает их как команду.\n\n"
-        "🎮 <b>Как начинается игра</b>\n"
-        "• В группе вводится /game.\n"
-        "• Игроки вступают через кнопку.\n"
-        "• Нужно минимум 3 участника.\n"
-        "• После старта каждому игроку в ЛС выдаётся 7 характеристик и 1 одноразовая спецкарта.\n\n"
-        "📋 <b>Характеристики</b>\n"
-        "💼 Позиция • 👤 Возраст • 💰 Цена • ❤️ Здоровье • 🎯 Навык • 🎒 Багаж • 🔍 Секрет.\n"
-        "В начале они скрыты. Каждый раунд игроки по очереди раскрывают одну ещё не раскрытую характеристику.\n\n"
-        "🗣 <b>Обсуждение</b>\n"
-        "После раскрытия начинается обсуждение. Здесь можно убеждать других игроков, объяснять свои карты и использовать подходящие спецкарты. Некоторые спецкарты работают только в этот момент и применяются тайно.\n\n"
-        "🗳 <b>Голосование</b>\n"
-        "Игроки голосуют за одного живого соперника или за ⏭️ СКИП. Игрок с наибольшим количеством голосов выбывает. Если СКИП набрал максимум или сравнялся с лидером — никто не выбывает.\n"
-        "Скип можно использовать максимум 3 раза за игру.\n\n"
-        "🤝 <b>Ничья</b>\n"
-        "Если несколько игроков набрали одинаковое максимальное количество голосов, это считается ничьёй. Никто не выбывает. После двух ничьих подряд запускается пенальти.\n\n"
-        "🎴 <b>Спецкарты</b>\n"
-        "У каждого игрока только одна разовая карта. Среди карт есть обмен характеристиками, шпионаж, жёлтая карточка, вспышка, зеркальный щит, трансферный хаос, подмена голосов, тихий трибунал и скрытый капитан.\n"
-        "Карта обмена характеристикой существует только у одного игрока за матч.\n\n"
-        "🏆 <b>Финал</b>\n"
-        "Когда остаются 2 игрока, игра заканчивается. ИИ анализирует сценарий и актуальные карточки финалистов и выносит вердикт: УСПЕХ или ПРОВАЛ. После этого бот раскрывает карточки всех участников, чтобы стало видно, кто что скрывал.\n\n"
-        "🛑 <b>/stop</b> — принудительно остановить текущую игру.\n"
-        "👤 <b>/profile</b> — твоя общая статистика.\n"
-        "🃏 <b>/card</b> — твоя актуальная карточка (работает только в личных сообщениях)."
-    )
-    await message.answer(rules_text, parse_mode="HTML")
+    text = await get_rules_text()
+    if message.chat.type == "private":
+        await message.answer(text, reply_markup=await private_menu_markup(), parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("card"))
 async def cmd_card(message: types.Message):
     if message.chat.type != "private":
-        return await message.reply("🃏 Карточку можно запросить только в личных сообщениях с ботом.")
-
-    # В ЛС один и тот же пользователь может играть в разных группах, поэтому
-    # сначала ищем активную игру, в которой он сейчас участвует.
-    active_chat = await db.find_active_player_chat(message.from_user.id)
-    if not active_chat:
-        return await message.answer("🃏 Сейчас я не нашёл тебя среди участников активной игры.\n\nСначала вступи в игру в группе, а затем напиши /card здесь.")
-
-    text = await build_private_card_text(active_chat, message.from_user.id)
-    markup = await build_reveal_keyboard(active_chat, message.from_user.id)
-    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+        return await message.answer("🃏 <b>/card</b> работает только в личных сообщениях с ботом.", parse_mode="HTML")
+    active = await db.find_active_player_chat(message.from_user.id)
+    if not active:
+        return await message.answer("ℹ️ Сейчас ты не участвуешь в активной игре.")
+    chat_id = active[0]
+    await message.answer(
+        await build_private_card_text(chat_id, message.from_user.id),
+        reply_markup=await build_reveal_keyboard(chat_id, message.from_user.id),
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
@@ -896,7 +991,9 @@ async def cmd_game(message: types.Message):
             parse_mode="HTML"
         )
 
-    await db.create_lobby(message.chat.id, message.from_user.id)
+    created = await db.create_lobby(message.chat.id, message.from_user.id)
+    if not created:
+        return await message.answer("⚠️ В этой группе уже идёт игра или идёт набор. Дождитесь её окончания.")
     builder = InlineKeyboardBuilder()
     builder.button(text="⚽️ Вступить в игру", callback_data="join_game")
     builder.button(text="🚀 Начать игру (от 3 игроков)", callback_data="start_game")
@@ -1168,10 +1265,14 @@ async def handle_silent_mute(message: types.Message):
 async def handle_ping(request):
     return web.Response(text="Bot Alive")
 
+async def handle_health(request):
+    return web.json_response({"status": "ok", "service": "football-bunker"})
+
 async def main():
     await db.init_db()
     app = web.Application()
     app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
