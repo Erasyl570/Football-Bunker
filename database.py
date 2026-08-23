@@ -23,6 +23,25 @@ async def _init_stats_db():
                     username TEXT,
                     games_played INTEGER NOT NULL DEFAULT 0,
                     wins INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS bunker_economy (
+                    user_id BIGINT PRIMARY KEY,
+                    coins INTEGER NOT NULL DEFAULT 0,
+                    daily_date TEXT NOT NULL DEFAULT '',
+                    daily_games INTEGER NOT NULL DEFAULT 0,
+                    daily_wins INTEGER NOT NULL DEFAULT 0,
+                    daily_reveals INTEGER NOT NULL DEFAULT 0,
+                    daily_votes INTEGER NOT NULL DEFAULT 0,
+                    equipped_title TEXT NOT NULL DEFAULT '',
+                    equipped_frame TEXT NOT NULL DEFAULT '',
+                    equipped_card_theme TEXT NOT NULL DEFAULT 'classic',
+                    equipped_victory TEXT NOT NULL DEFAULT 'classic',
+                    owner_granted INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS bunker_purchases (
+                    user_id BIGINT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    PRIMARY KEY (user_id, item_id)
                 )
             """)
     except Exception as e:
@@ -179,10 +198,203 @@ async def update_user_stats(user_id: int, username: str, won: bool):
         """, (user_id, username, inc_win))
         await db.commit()
 
+
+# --- ЭКОНОМИКА / МАГАЗИН ---
+
+def _economy_date():
+    from datetime import datetime, timedelta, timezone
+    # Казахстанский часовой пояс по умолчанию; можно изменить через ECONOMY_TZ_OFFSET.
+    offset = int(os.getenv("ECONOMY_TZ_OFFSET", "5"))
+    return (datetime.now(timezone.utc) + timedelta(hours=offset)).date().isoformat()
+
+async def _ensure_economy_user_sqlite(db, user_id: int):
+    await db.execute("INSERT OR IGNORE INTO users (user_id, username, games_played, wins) VALUES (?, '', 0, 0)", (user_id,))
+
+async def get_coins(user_id: int) -> int:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT coins FROM bunker_economy WHERE user_id = $1", user_id)
+            if not row:
+                await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+                return 0
+            return int(row["coins"])
+    async with connect_db() as db:
+        await _ensure_economy_user_sqlite(db, user_id)
+        # SQLite fallback stores economy in a dedicated table.
+        await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', owner_granted INTEGER NOT NULL DEFAULT 0)")
+        await db.execute("INSERT OR IGNORE INTO bunker_economy (user_id) VALUES (?)", (user_id,))
+        async with db.execute("SELECT coins FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        await db.commit()
+        return int(row[0]) if row else 0
+
+async def add_coins(user_id: int, amount: int):
+    if amount <= 0:
+        return await get_coins(user_id)
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            await conn.execute("INSERT INTO bunker_economy (user_id, coins) VALUES ($1, $2) ON CONFLICT(user_id) DO UPDATE SET coins = bunker_economy.coins + $2", user_id, amount)
+            row = await conn.fetchrow("SELECT coins FROM bunker_economy WHERE user_id = $1", user_id)
+            return int(row["coins"])
+    async with connect_db() as db:
+        await get_coins(user_id)
+        await db.execute("UPDATE bunker_economy SET coins = coins + ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
+        return await get_coins(user_id)
+
+async def spend_coins(user_id: int, amount: int) -> bool:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            result = await conn.execute("UPDATE bunker_economy SET coins = coins - $2 WHERE user_id = $1 AND coins >= $2", user_id, amount)
+            return result.endswith("1")
+    async with connect_db() as db:
+        await get_coins(user_id)
+        cur = await db.execute("UPDATE bunker_economy SET coins = coins - ? WHERE user_id = ? AND coins >= ?", (amount, user_id, amount))
+        await db.commit()
+        return cur.rowcount == 1
+
+async def has_purchase(user_id: int, item_id: str) -> bool:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT 1 FROM bunker_purchases WHERE user_id = $1 AND item_id = $2", user_id, item_id)
+            return row is not None
+    async with connect_db() as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS bunker_purchases (user_id INTEGER NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(user_id,item_id))")
+        async with db.execute("SELECT 1 FROM bunker_purchases WHERE user_id = ? AND item_id = ?", (user_id, item_id)) as cur:
+            return await cur.fetchone() is not None
+
+async def purchase_item(user_id: int, item_id: str, price: int) -> bool:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            async with conn.transaction():
+                exists = await conn.fetchrow("SELECT 1 FROM bunker_purchases WHERE user_id = $1 AND item_id = $2", user_id, item_id)
+                if exists:
+                    return True
+                updated = await conn.execute("UPDATE bunker_economy SET coins = coins - $2 WHERE user_id = $1 AND coins >= $2", user_id, price)
+                if not updated.endswith("1"):
+                    return False
+                await conn.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES ($1, $2)", user_id, item_id)
+                return True
+    async with connect_db() as db:
+        await get_coins(user_id)
+        async with db.execute("SELECT 1 FROM bunker_purchases WHERE user_id = ? AND item_id = ?", (user_id, item_id)) as cur:
+            if await cur.fetchone():
+                return True
+        cur = await db.execute("UPDATE bunker_economy SET coins = coins - ? WHERE user_id = ? AND coins >= ?", (price, user_id, price))
+        if cur.rowcount != 1:
+            await db.rollback()
+            return False
+        await db.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES (?, ?)", (user_id, item_id))
+        await db.commit()
+        return True
+
+async def equip_item(user_id: int, item_type: str, item_id: str):
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            await conn.execute(f"UPDATE bunker_economy SET equipped_{item_type} = $2 WHERE user_id = $1", user_id, item_id)
+        return
+    async with connect_db() as db:
+        await get_coins(user_id)
+        await db.execute(f"UPDATE bunker_economy SET equipped_{item_type} = ? WHERE user_id = ?", (item_id, user_id))
+        await db.commit()
+
+async def get_equipped(user_id: int):
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory FROM bunker_economy WHERE user_id = $1", user_id)
+            if not row:
+                await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+                return {"title":"", "frame":"", "card_theme":"classic", "victory":"classic"}
+            return {"title":row["equipped_title"], "frame":row["equipped_frame"], "card_theme":row["equipped_card_theme"], "victory":row["equipped_victory"]}
+    async with connect_db() as db:
+        await get_coins(user_id)
+        async with db.execute("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        return {"title":row[0], "frame":row[1], "card_theme":row[2], "victory":row[3]}
+
+async def record_daily_event(user_id: int, event: str, amount: int = 1):
+    rewards = {"game": 30, "win": 55, "reveal": 15, "vote": 10}
+    limits = {"game": 1, "win": 1, "reveal": 3, "vote": 5}
+    if event not in rewards:
+        return 0
+    today = _economy_date()
+    col = {"game":"daily_games", "win":"daily_wins", "reveal":"daily_reveals", "vote":"daily_votes"}[event]
+    reward = 0
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT daily_date, daily_games, daily_wins, daily_reveals, daily_votes FROM bunker_economy WHERE user_id = $1", user_id)
+            if not row:
+                await conn.execute("INSERT INTO bunker_economy (user_id, daily_date) VALUES ($1, $2)", user_id, today)
+                row = {"daily_date": today, "daily_games":0, "daily_wins":0, "daily_reveals":0, "daily_votes":0}
+            if row["daily_date"] != today:
+                await conn.execute("UPDATE bunker_economy SET daily_date=$2, daily_games=0, daily_wins=0, daily_reveals=0, daily_votes=0 WHERE user_id=$1", user_id, today)
+                current = 0
+            else:
+                current = int(row[col])
+            new_value = min(limits[event], current + amount)
+            delta = new_value - current
+            if delta > 0:
+                await conn.execute(f"UPDATE bunker_economy SET {col}=$2, coins=coins+$3 WHERE user_id=$1", user_id, new_value, rewards[event] * delta)
+                reward = rewards[event] * delta
+            return reward
+    async with connect_db() as db:
+        await get_coins(user_id)
+        async with db.execute("SELECT daily_date, %s FROM bunker_economy WHERE user_id = ?" % col, (user_id,)) as cur:
+            row = await cur.fetchone()
+        current = int(row[1] or 0) if row and row[0] == today else 0
+        if not row or row[0] != today:
+            await db.execute("UPDATE bunker_economy SET daily_date=?, daily_games=0, daily_wins=0, daily_reveals=0, daily_votes=0 WHERE user_id=?", (today, user_id))
+        new_value = min(limits[event], current + amount)
+        delta = new_value - current
+        if delta > 0:
+            await db.execute(f"UPDATE bunker_economy SET {col}=?, coins=coins+? WHERE user_id=?", (new_value, rewards[event]*delta, user_id))
+            reward = rewards[event]*delta
+        await db.commit()
+        return reward
+
+async def get_daily_progress(user_id: int):
+    today = _economy_date()
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT daily_date,daily_games,daily_wins,daily_reveals,daily_votes FROM bunker_economy WHERE user_id=$1", user_id)
+            if not row or row["daily_date"] != today:
+                return {"game":0,"win":0,"reveal":0,"vote":0}
+            return {"game":row["daily_games"],"win":row["daily_wins"],"reveal":row["daily_reveals"],"vote":row["daily_votes"]}
+    async with connect_db() as db:
+        await get_coins(user_id)
+        async with db.execute("SELECT daily_date,daily_games,daily_wins,daily_reveals,daily_votes FROM bunker_economy WHERE user_id=?", (user_id,)) as cur:
+            row=await cur.fetchone()
+        if not row or row[0] != today:
+            return {"game":0,"win":0,"reveal":0,"vote":0}
+        return {"game":row[1],"win":row[2],"reveal":row[3],"vote":row[4]}
+
+async def owner_grant_if_needed(user_id: int, amount: int) -> bool:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT owner_granted FROM bunker_economy WHERE user_id=$1", user_id)
+            if row and row["owner_granted"]:
+                return False
+            await conn.execute("INSERT INTO bunker_economy(user_id,coins,owner_granted) VALUES($1,$2,1) ON CONFLICT(user_id) DO UPDATE SET coins=bunker_economy.coins+$2, owner_granted=1", user_id, amount)
+            return True
+    async with connect_db() as db:
+        await get_coins(user_id)
+        async with db.execute("SELECT owner_granted FROM bunker_economy WHERE user_id=?", (user_id,)) as cur:
+            row=await cur.fetchone()
+        if row and row[0]: return False
+        await db.execute("UPDATE bunker_economy SET coins=coins+?, owner_granted=1 WHERE user_id=?", (amount,user_id))
+        await db.commit()
+        return True
+
 # --- ЛОГИКА ЛОББИ ---
 
-async def create_lobby(chat_id: int, host_id: int):
+async def create_lobby(chat_id: int, host_id: int) -> bool:
+    """Создаёт лобби только если в чате нет активной игры. Возвращает True/False."""
     async with connect_db() as db:
+        async with db.execute("SELECT status FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row and row[0] not in ("ended", "cancelled"):
+            return False
+
         await db.execute("DELETE FROM lobbies WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
@@ -193,6 +405,7 @@ async def create_lobby(chat_id: int, host_id: int):
             (chat_id, host_id, "lobby")
         )
         await db.commit()
+        return True
 
 async def try_start_lobby(chat_id: int) -> bool:
     """Атомарно переводит лобби из lobby в starting. Защищает от двойного старта."""
@@ -212,6 +425,22 @@ async def get_lobby(chat_id: int):
             if row:
                 return (row[0], row[1], row[2], 0, row[3])
             return None
+
+async def transition_lobby_status(chat_id: int, new_status: str, expected_statuses, current_round: int = None) -> bool:
+    placeholders = ",".join("?" for _ in expected_statuses)
+    async with connect_db() as db:
+        if current_round is None:
+            cur = await db.execute(f"UPDATE lobbies SET status = ? WHERE chat_id = ? AND status IN ({placeholders})", (new_status, chat_id, *expected_statuses))
+        else:
+            cur = await db.execute(f"UPDATE lobbies SET status = ?, current_round = ? WHERE chat_id = ? AND status IN ({placeholders})", (new_status, current_round, chat_id, *expected_statuses))
+        await db.commit()
+        return cur.rowcount == 1
+
+async def cancel_lobby(chat_id: int) -> bool:
+    return await transition_lobby_status(chat_id, "cancelled", ["lobby", "starting", "reveal_phase", "discussion", "voting", "finishing"])
+
+async def try_end_game(chat_id: int) -> bool:
+    return await transition_lobby_status(chat_id, "ended", ["reveal_phase", "discussion", "voting", "finishing"])
 
 async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
     async with connect_db() as db:
