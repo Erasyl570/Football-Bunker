@@ -57,6 +57,30 @@ dp.callback_query.outer_middleware(CallbackRateLimitMiddleware())
 GEMINI_SEMAPHORE = asyncio.Semaphore(1)
 GEMINI_CACHE = {}
 FINALIZING_GAMES = set()
+# Один управляемый игровой task на чат. Не даём старым раундам накапливаться.
+GAME_TASKS = {}
+
+
+def schedule_game_task(chat_id: int, coro):
+    old = GAME_TASKS.get(chat_id)
+    current = asyncio.current_task()
+    # Если текущий игровой task сам планирует следующий раунд, его нельзя отменять.
+    if old and old is not current and not old.done():
+        old.cancel()
+    task = asyncio.create_task(coro)
+    GAME_TASKS[chat_id] = task
+
+    def _cleanup(done_task):
+        if GAME_TASKS.get(chat_id) is done_task:
+            GAME_TASKS.pop(chat_id, None)
+    task.add_done_callback(_cleanup)
+    return task
+
+
+def cancel_game_task(chat_id: int):
+    task = GAME_TASKS.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
 
 
 CARD_IMAGES = {
@@ -113,55 +137,102 @@ TRAIT_LABELS = {
 ECONOMY_OWNER_ID = int(os.getenv("ECONOMY_OWNER_ID", "1624967415"))
 OWNER_STARTING_COINS = 10000
 SHOP_ITEMS = {
-    "title_tactician": {"type": "title", "name": "🧠 Тактик", "price": 450},
-    "title_legend": {"type": "title", "name": "👑 Легенда Бункера", "price": 1200},
-    "title_director": {"type": "title", "name": "💼 Спортивный директор", "price": 2200},
-    "frame_gold": {"type": "frame", "name": "🥇 Золотая рамка", "price": 700},
-    "frame_dark": {"type": "frame", "name": "🌑 Тёмная рамка", "price": 900},
-    "frame_champ": {"type": "frame", "name": "🏆 Чемпионская рамка", "price": 1800},
-    "theme_gold": {"type": "card_theme", "name": "✨ Золотая карточка", "price": 1000},
-    "theme_pitch": {"type": "card_theme", "name": "🌿 Футбольное поле", "price": 1400},
-    "theme_night": {"type": "card_theme", "name": "🌌 Ночной Бункер", "price": 1800},
-    "victory_fire": {"type": "victory", "name": "🎆 Фейерверк победы", "price": 1300},
-    "victory_gold": {"type": "victory", "name": "🏆 Золотой финал", "price": 2500},
-}
-CARD_THEME_STYLE = {
-    "classic": ("⚽", "───────────────────"),
-    "theme_gold": ("✨", "═══════════════════"),
-    "theme_pitch": ("🌿", "━━━━━━━━━━━━━━━━━━━"),
-    "theme_night": ("🌌", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"),
+    "title_legend": {"type": "title", "name": "👑 Легенда Бункера", "price": 1200, "desc": "Престижный титул. Отображается рядом с твоим именем в профиле и на карточке."},
+    "title_tactician": {"type": "title", "name": "🧠 Тактик", "price": 450, "desc": "Для игроков, которые любят продумывать каждый голос."},
+    "title_strategist": {"type": "title", "name": "🎯 Стратег", "price": 650, "desc": "Подчёркивает расчётливый стиль игры. Только косметика."},
+    "title_diplomat": {"type": "title", "name": "🕴️ Дипломат", "price": 700, "desc": "Статус переговорщика Бункера. Не даёт игровых преимуществ."},
+    "title_authority": {"type": "title", "name": "👑 Авторитет", "price": 900, "desc": "Престижный титул для профиля."},
+    "title_coldblooded": {"type": "title", "name": "🧊 Хладнокровный", "price": 1000, "desc": "Для тех, кто не паникует под давлением голосования."},
+    "title_fox": {"type": "title", "name": "🦊 Лис", "price": 1050, "desc": "Короткий титул для хитрого игрока."},
+    "title_combinator": {"type": "title", "name": "🧩 Комбинатор", "price": 1150, "desc": "Для любителей собирать комбинации из голосов и карт."},
+    "title_winner": {"type": "title", "name": "🏆 Победитель", "price": 1250, "desc": "Простой престижный титул без влияния на игру."},
+    "title_veteran": {"type": "title", "name": "💎 Ветеран", "price": 1400, "desc": "Статус опытного игрока Бункера."},
+    "title_phenomenon": {"type": "title", "name": "⚡ Феномен", "price": 1700, "desc": "Редкий престижный титул."},
+    "title_maestro": {"type": "title", "name": "🐐 Маэстро", "price": 2000, "desc": "Один из самых дорогих престижных титулов."},
+    "title_manipulator": {"type": "title", "name": "🧠 Манипулятор", "price": 1800, "desc": "Для тех, кто умеет направить голосование в нужную сторону."},
+    "victory_fire": {"type": "victory", "name": "🎆 Фейерверк победы", "price": 1300, "desc": "После твоей победы бот покажет яркий эффект в общем чате."},
+    "victory_gold": {"type": "victory", "name": "🏆 Золотой финал", "price": 2500, "desc": "Редкий золотой эффект, который появляется после твоей победы."},
+    "victory_toxic": {"type": "victory", "name": "😈 Ну и кто тут лишний?", "price": 1900, "desc": "Токсичный победный эффект. Появляется только после твоей победы."},
+    "victory_cold": {"type": "victory", "name": "🗿 Я просто делал свою работу", "price": 1600, "desc": "Спокойный победный эффект для холоднокровного финала."},
+    "victory_destroy": {"type": "victory", "name": "💀 До свидания", "price": 2200, "desc": "Токсичный победный эффект после победы."},
 }
 
 async def economy_owner_grant():
     if await db.owner_grant_if_needed(ECONOMY_OWNER_ID, OWNER_STARTING_COINS):
         print(f"[ECONOMY] Owner {ECONOMY_OWNER_ID} received {OWNER_STARTING_COINS} coins")
+    # Единственный экземпляр титула «Создатель игры».
+    await db.owner_grant_item(ECONOMY_OWNER_ID, "creator_title", "title_creator")
 
 async def economy_profile_text(user_id: int, username: str) -> str:
     games, wins = await db.get_user_profile(user_id, username)
     coins = await db.get_coins(user_id)
     eq = await db.get_equipped(user_id)
-    title = SHOP_ITEMS.get(eq["title"], {}).get("name", "") if eq["title"] else ""
-    frame = SHOP_ITEMS.get(eq["frame"], {}).get("name", "") if eq["frame"] else ""
+    title_id = eq.get("title") or ""
+    if user_id == ECONOMY_OWNER_ID:
+        title_name = "👑 Создатель игры"
+    else:
+        title_name = SHOP_ITEMS.get(title_id, {}).get("name", "") if title_id else ""
+    victory = SHOP_ITEMS.get(eq.get("victory"), {}).get("name", "Классика") if eq.get("victory") else "Классика"
     rate = wins / games * 100 if games else 0
-    return (f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n───────────────────\n⚽ <b>{html.escape(username)}</b>"
-            f"{f'\n🏷 Титул: <b>{html.escape(title)}</b>' if title else ''}"
-            f"{f'\n🖼 Рамка: <b>{html.escape(frame)}</b>' if frame else ''}\n\n"
-            f"🎮 Игр: <b>{games}</b>\n🏆 Побед: <b>{wins}</b>\n📈 Винрейт: <b>{rate:.1f}%</b>\n🪙 Монеты: <b>{coins}</b>")
+    return (
+        f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n───────────────────\n"
+        f"👤 <b>{html.escape(username)}</b>\n"
+        f"🏷 <b>{html.escape(title_name or 'Без титула')}</b>\n"
+        f"───────────────────\n"
+        f"🎮 Игр: <b>{games}</b>\n🏆 Побед: <b>{wins}</b>\n📈 Винрейт: <b>{rate:.1f}%</b>\n🪙 Монеты: <b>{coins}</b>\n\n"
+        f"🏆 Эффект победы: <b>{html.escape(victory)}</b>"
+    )
 
 async def economy_shop_text(user_id: int) -> str:
     coins = await db.get_coins(user_id)
-    lines = ["🛍 <b>МАГАЗИН БУНКЕРА</b>", "───────────────────", f"🪙 Баланс: <b>{coins}</b>", ""]
+    eq = await db.get_equipped(user_id)
+    lines = [
+        "🛍 <b>МАГАЗИН БУНКЕРА</b>",
+        "───────────────────",
+        f"🪙 Баланс: <b>{coins}</b>",
+        "",
+        "🏷 <b>ТИТУЛЫ</b>",
+        "<i>Титул отображается рядом с твоим именем. Никаких игровых преимуществ.</i>",
+        "",
+    ]
     for item_id, item in SHOP_ITEMS.items():
+        if item["type"] != "title":
+            continue
         owned = await db.has_purchase(user_id, item_id)
-        lines.append(f"{'✅' if owned else '▫️'} {item['name']} — <b>{item['price']} 🪙</b>")
+        equipped = eq.get("title") == item_id
+        status = "⚙️ Надет" if equipped else ("✅ Куплен" if owned else f"🪙 {item['price']}")
+        lines.append(f"<b>{item['name']}</b> — {status}\n<i>{html.escape(item['desc'])}</i>\n")
+    lines += [
+        "🏆 <b>ЭФФЕКТЫ ПОБЕДЫ</b>",
+        "<i>Показываются в общем чате только после твоей победы.</i>",
+        "",
+    ]
+    for item_id, item in SHOP_ITEMS.items():
+        if item["type"] != "victory":
+            continue
+        owned = await db.has_purchase(user_id, item_id)
+        equipped = eq.get("victory") == item_id
+        status = "⚙️ Надет" if equipped else ("✅ Куплен" if owned else f"🪙 {item['price']}")
+        lines.append(f"<b>{item['name']}</b> — {status}\n<i>{html.escape(item['desc'])}</i>\n")
+    lines.append("👇 Нажми на товар: купить или экипировать уже купленный.")
     return "\n".join(lines)
 
 async def shop_keyboard(user_id: int):
     builder = InlineKeyboardBuilder()
+    eq = await db.get_equipped(user_id)
     for item_id, item in SHOP_ITEMS.items():
         owned = await db.has_purchase(user_id, item_id)
-        builder.button(text=(f"⚙️ {item['name']}" if owned else f"🛒 {item['name']} · {item['price']}"), callback_data=f"shop:{'equip' if owned else 'buy'}:{item_id}")
+        equipped = eq.get(item["type"]) == item_id
+        if equipped:
+            text = f"✅ {item['name']}"
+        elif owned:
+            text = f"⚙️ Надеть: {item['name']}"
+        else:
+            text = f"🛒 {item['name']} · {item['price']}"
+        builder.button(text=text, callback_data=f"shop:{'equip' if owned else 'buy'}:{item_id}")
     builder.button(text="🪙 Кошелёк / квесты", callback_data="menu:wallet")
+    builder.button(text="👤 Профиль", callback_data="menu:profile")
+    builder.button(text="🎒 Мои покупки", callback_data="menu:inventory")
     builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
     return builder.as_markup()
@@ -178,6 +249,9 @@ async def victory_effect(user_id: int, name: str) -> str:
     effect = (await db.get_equipped(user_id))["victory"]
     if effect == "victory_fire": return f"🎆✨ {html.escape(name)} — ПОБЕДИТЕЛЬ! ✨🎆"
     if effect == "victory_gold": return f"🏆💛 {html.escape(name)} — ЗОЛОТОЙ ФИНАЛ! 💛🏆"
+    if effect == "victory_toxic": return f"😈 {html.escape(name)} — НУ И КТО ТУТ ЛИШНИЙ?"
+    if effect == "victory_cold": return f"🗿 {html.escape(name)} — Я ПРОСТО ДЕЛАЛ СВОЮ РАБОТУ."
+    if effect == "victory_destroy": return f"💀 {html.escape(name)} — ДО СВИДАНИЯ."
     return f"🏆 {html.escape(name)} — победитель!"
 
 async def is_game_active(chat_id: int) -> bool:
@@ -196,18 +270,21 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         for name, pack in winners_data
     )
     prompt = (
-        "Ты — футбольный спортивный директор. Оцени финальную пару честно, но без душнилова.\n\n"
-        f"СЦЕНАРИЙ И ЦЕЛЬ:\n{scenario_text}\n\n"
+        "Ты — футбольный спортивный директор в игре Football Bunker. Твоя задача — принять ЖИВОЙ, "
+        "разумный и благожелательный вердикт по финальной ПАРЕ, а не искать повод для провала.\n\n"
+        f"СЦЕНАРИЙ:\n{scenario_text}\n\n"
         f"ФИНАЛЬНАЯ ПАРА И АКТУАЛЬНЫЕ КАРТОЧКИ:\n{players_summary}\n"
-        "ПРАВИЛА: 1) Определи 2-3 главных требования сценария. "
-        "2) Прямой ценовой/позиционный порог обязателен, если он указан. "
-        "3) Не требуй идеального совпадения всех характеристик. "
-        "4) Неизвестная характеристика не считается плохой. "
-        "5) Положительные качества могут компенсировать второстепенные недостатки. "
-        "6) ПРОВАЛ только при явном противоречии ключевым условиям или очевидной неспособности выполнить цель. "
-        "7) Не выдумывай характеристики.\n\n"
-        "Формат: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
-        "📝 <b>Причина:</b> [2-4 коротких предложения]"
+        "КРИТИЧЕСКИЕ ПРАВИЛА ОЦЕНКИ:\n"
+        "1) Контракт всегда оценивает РОВНО ДВУХ финалистов КАК ПАРУ.\n"
+        "2) Общий бюджет пары — жесткое условие: сложи цены обоих игроков. Если сумма не превышает указанный бюджет, ценовое условие выполнено.\n"
+        "3) Второе требование сценария оценивай по смыслу карточек. Достаточно, чтобы хотя бы один игрок явно закрывал ключевую задачу ИЛИ чтобы сильные стороны пары вместе ее закрывали.\n"
+        "4) НЕ требуй точного совпадения слов. Например, требование о завершении могут закрывать сильный удар, хладнокровие, игра первым касанием, тайминг открываний и другие очевидно подходящие навыки.\n"
+        "5) НЕ превращай второстепенные минусы в автоматический провал. Неизвестная характеристика нейтральна.\n"
+        "6) УСПЕХ — нормальный результат, если бюджет соблюден и дополнительное требование разумно закрыто. ПРОВАЛ ставь только при явном превышении бюджета ИЛИ когда пара очевидно вообще не подходит под дополнительную задачу.\n"
+        "7) Не выдумывай факты и не требуй третьего игрока.\n\n"
+        "Формат строго:\n"
+        "📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
+        "📝 <b>Причина:</b> [2-4 коротких конкретных предложения]"
     )
     cache_key = str(hash(prompt))
     if cache_key in GEMINI_CACHE:
@@ -218,9 +295,7 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
         for attempt in range(3):
             try:
                 model = genai.GenerativeModel(GEMINI_MODEL)
-                response = await model.generate_content_async(
-                    prompt, request_options={"timeout": 25}
-                )
+                response = await model.generate_content_async(prompt, request_options={"timeout": 25})
                 if response and getattr(response, "text", None):
                     result = response.text.strip()
                     GEMINI_CACHE[cache_key] = result
@@ -228,7 +303,6 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
                 last_error = "Пустой ответ"
             except Exception as e:
                 last_error = str(e)
-                # 1s, 2s перед повтором; не спамим Gemini при временной ошибке.
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
         print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
@@ -263,11 +337,17 @@ async def build_private_card_text(chat_id: int, user_id: int) -> str:
     spec_desc = SPECIAL_CARD_DESCRIPTIONS.get(spec_code, "Описание отсутствует.")
     if spec_used:
         spec_title = f"{spec_title} (уже использована)"
-
     eq = await db.get_equipped(user_id)
-    theme_emoji, theme_line = CARD_THEME_STYLE.get(eq["card_theme"], CARD_THEME_STYLE["classic"])
+    if user_id == ECONOMY_OWNER_ID:
+        title_name = "👑 Создатель игры"
+    else:
+        title_name = SHOP_ITEMS.get(eq.get("title"), {}).get("name", "") if eq.get("title") else ""
     return (
-        f"{theme_emoji} <b>ТВОЯ АКТУАЛЬНАЯ КАРТОЧКА ИГРОКА</b>\n{theme_line}\n"
+        f"⚽ <b>ТВОЯ АКТУАЛЬНАЯ КАРТОЧКА ИГРОКА</b>\n"
+        f"───────────────────\n"
+        f"👤 <b>{html.escape(username)}</b>\n"
+        f"🏷 <b>{html.escape(title_name or 'Без титула')}</b>\n"
+        f"───────────────────\n"
         f"💼 <b>Позиция:</b> <code>{html.escape(str(pack.get('position', '-')))}</code>\n"
         f"👤 <b>Возраст:</b> <code>{pack.get('age', '-')} лет</code>\n"
         f"💰 <b>Цена:</b> <code>{html.escape(str(pack.get('price', '-')))}</code>\n"
@@ -512,16 +592,21 @@ async def start_round_flow(chat_id: int, current_round: int):
         check_lobby = await db.get_lobby(chat_id)
         if check_lobby and check_lobby[0] == "discussion":
             if not has_voting:
-                asyncio.create_task(start_round_flow(chat_id, current_round + 1))
+                schedule_game_task(chat_id, start_round_flow(chat_id, current_round + 1))
             else:
-                asyncio.create_task(start_voting_flow(chat_id, current_round))
+                schedule_game_task(chat_id, start_voting_flow(chat_id, current_round))
 
+    except asyncio.CancelledError:
+        print(f"[GAME] Игровая задача чата {chat_id} отменена (раунд {current_round}).")
+        raise
     except Exception as e:
-        print(f"[ERROR] Сбой в Раунде {current_round}: {e}")
-        await bot.send_message(chat_id, f"⚠️ Произошел сбой при переходе в Раунд {current_round + 1}. Возобновляем поток...", parse_mode="HTML")
-        await asyncio.sleep(2)
-        if await is_game_active(chat_id):
-            asyncio.create_task(start_round_flow(chat_id, current_round + 1))
+        print(f"[ERROR] Сбой в Раунде {current_round} чата {chat_id}: {type(e).__name__}: {e}")
+        try:
+            if await is_game_active(chat_id):
+                await db.cancel_lobby(chat_id)
+                await bot.send_message(chat_id, "⚠️ <b>Игровой поток остановлен из-за технической ошибки.</b>\nИгра не будет запускать бесконечные фоновые задачи. Администратор может запустить новую игру после остановки текущей.", parse_mode="HTML")
+        except Exception as notify_error:
+            print(f"[ERROR] Не удалось уведомить чат {chat_id}: {notify_error}")
 
 # --- СПЕЦ-КАРТЫ ---
 
@@ -897,7 +982,7 @@ async def start_game(callback: types.CallbackQuery):
         await bot.send_message(chat_id, scenario_msg, parse_mode="HTML")
 
         await asyncio.sleep(10)
-        asyncio.create_task(start_round_flow(chat_id, 1))
+        schedule_game_task(chat_id, start_round_flow(chat_id, 1))
 
     except Exception as e:
         try:
@@ -964,12 +1049,12 @@ async def menu_shop(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "menu:inventory")
 async def menu_inventory(callback: types.CallbackQuery):
     eq = await db.get_equipped(callback.from_user.id)
-    owned = [item["name"] for item_id,item in SHOP_ITEMS.items() if await db.has_purchase(callback.from_user.id,item_id)]
+    owned = [item["name"] for item_id, item in SHOP_ITEMS.items() if await db.has_purchase(callback.from_user.id, item_id)]
+    title = "👑 Создатель игры" if callback.from_user.id == ECONOMY_OWNER_ID else SHOP_ITEMS.get(eq.get("title"), {}).get("name", "Без титула")
+    victory = SHOP_ITEMS.get(eq.get("victory"), {}).get("name", "Классика") if eq.get("victory") else "Классика"
     text = "🎒 <b>МОИ ПОКУПКИ</b>\n───────────────────\n" + ("\n".join(f"• {html.escape(x)}" for x in owned) if owned else "Пока ничего нет.")
-    text += f"\n\n🏷 Титул: {html.escape(SHOP_ITEMS.get(eq['title'],{}).get('name','по умолчанию'))}"
-    text += f"\n🖼 Рамка: {html.escape(SHOP_ITEMS.get(eq['frame'],{}).get('name','по умолчанию'))}"
-    text += f"\n🎴 Тема карточки: {html.escape(SHOP_ITEMS.get(eq['card_theme'],{}).get('name','Классика'))}"
-    text += f"\n🏆 Эффект победы: {html.escape(SHOP_ITEMS.get(eq['victory'],{}).get('name','Классика'))}"
+    text += f"\n\n🏷 Титул: <b>{html.escape(title)}</b>"
+    text += f"\n🏆 Эффект победы: <b>{html.escape(victory)}</b>"
     await callback.message.edit_text(text, reply_markup=await private_menu_markup(), parse_mode="HTML"); await callback.answer()
 
 @dp.callback_query(F.data.startswith("shop:"))
@@ -1072,6 +1157,8 @@ async def cmd_stop(message: types.Message):
     participant_ids={p[1] for p in await db.get_players(chat_id)}
     if message.from_user.id not in participant_ids: return await message.answer("⛔ Остановить игру может только участник текущей игры.")
     if not await db.cancel_lobby(chat_id): return await message.answer("⚠️ Игра уже остановлена или завершена.")
+    cancel_game_task(chat_id)
+    FINALIZING_GAMES.discard(chat_id)
     await message.answer("🛑 <b>ИГРА ПРИНУДИТЕЛЬНО ОСТАНОВЛЕНА!</b>\n───────────────────\nУчастник остановил текущую сессию.", parse_mode="HTML")
 @dp.message(Command("game"))
 async def cmd_game(message: types.Message):
@@ -1270,12 +1357,12 @@ async def finish_voting_flow(chat_id: int):
             f"⏭️ <b>СКИП!</b> Все голоса — за пропуск. Никто не выбывает.\nИспользовано скипов: <b>{used_skips}/3</b>.",
             parse_mode="HTML"
         )
-        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        schedule_game_task(chat_id, start_round_flow(chat_id, lobby[4] + 1))
         return
 
     if not votes_data:
         await db.clear_votes(chat_id)
-        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        schedule_game_task(chat_id, start_round_flow(chat_id, lobby[4] + 1))
         return
 
     max_votes = votes_data[0][2]
@@ -1310,7 +1397,7 @@ async def finish_voting_flow(chat_id: int):
             f"Использовано скипов: <b>{used_skips}/3</b>.",
             parse_mode="HTML"
         )
-        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        schedule_game_task(chat_id, start_round_flow(chat_id, lobby[4] + 1))
         return
 
     max_votes = votes_data[0][2]
@@ -1337,7 +1424,7 @@ async def finish_voting_flow(chat_id: int):
                 f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Переходим к Раунду {lobby[4] + 1}.",
                 parse_mode="HTML"
             )
-            asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+            schedule_game_task(chat_id, start_round_flow(chat_id, lobby[4] + 1))
             return
     else:
         kicked_id, kicked_name = top_candidates[0][0], top_candidates[0][1]
@@ -1349,7 +1436,7 @@ async def finish_voting_flow(chat_id: int):
     if len(await db.get_alive_players(chat_id)) <= 2:
         await announce_winners_and_end(chat_id, await db.get_alive_players(chat_id))
     else:
-        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        schedule_game_task(chat_id, start_round_flow(chat_id, lobby[4] + 1))
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_silent_mute(message: types.Message):
@@ -1368,7 +1455,12 @@ async def handle_ping(request):
     return web.Response(text="Bot Alive")
 
 async def handle_health(request):
-    return web.json_response({"status": "ok", "service": "football-bunker"})
+    try:
+        await db.health_check()
+        return web.json_response({"status": "ok", "service": "football-bunker", "db": "ok"})
+    except Exception as e:
+        print(f"[HEALTH] DB error: {type(e).__name__}: {e}")
+        return web.json_response({"status": "degraded", "service": "football-bunker", "db": "error"}, status=503)
 
 async def main():
     await db.init_db()
