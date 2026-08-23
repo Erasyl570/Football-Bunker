@@ -36,6 +36,7 @@ async def _init_stats_db():
                     equipped_frame TEXT NOT NULL DEFAULT '',
                     equipped_card_theme TEXT NOT NULL DEFAULT 'classic',
                     equipped_victory TEXT NOT NULL DEFAULT 'classic',
+                    equipped_badge TEXT NOT NULL DEFAULT '',
                     owner_granted INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS bunker_purchases (
@@ -44,6 +45,8 @@ async def _init_stats_db():
                     PRIMARY KEY (user_id, item_id)
                 )
             """)
+            # Мягкая миграция для экономики v9 → v10.
+            await conn.execute("ALTER TABLE bunker_economy ADD COLUMN IF NOT EXISTS equipped_badge TEXT NOT NULL DEFAULT ''")
     except Exception as e:
         print(f"[STATS DB] Не удалось подключить внешнюю БД: {e}")
         _stats_pool = None
@@ -117,6 +120,13 @@ async def init_db():
             pass
         try:
             await db.execute("ALTER TABLE lobbies ADD COLUMN total_votes INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+        # Экономика: мягкая миграция для уже существующих SQLite-инсталляций.
+        try:
+            await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0)")
+            await db.execute("ALTER TABLE bunker_economy ADD COLUMN equipped_badge TEXT NOT NULL DEFAULT ''")
         except Exception:
             pass
 
@@ -221,7 +231,7 @@ async def get_coins(user_id: int) -> int:
     async with connect_db() as db:
         await _ensure_economy_user_sqlite(db, user_id)
         # SQLite fallback stores economy in a dedicated table.
-        await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', owner_granted INTEGER NOT NULL DEFAULT 0)")
+        await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0)")
         await db.execute("INSERT OR IGNORE INTO bunker_economy (user_id) VALUES (?)", (user_id,))
         async with db.execute("SELECT coins FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
@@ -288,6 +298,23 @@ async def purchase_item(user_id: int, item_id: str, price: int) -> bool:
         await db.commit()
         return True
 
+async def owner_grant_item(user_id: int, purchase_id: str, item_id: str):
+    """Безвозмездно выдаёт уникальный предмет владельцу и экипирует его.
+    Не списывает монеты и безопасно повторяется при каждом запуске.
+    """
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+                await conn.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, purchase_id)
+                await conn.execute("UPDATE bunker_economy SET equipped_title=$2 WHERE user_id=$1", user_id, item_id)
+        return
+    async with connect_db() as db:
+        await get_coins(user_id)
+        await db.execute("INSERT OR IGNORE INTO bunker_purchases (user_id, item_id) VALUES (?, ?)", (user_id, purchase_id))
+        await db.execute("UPDATE bunker_economy SET equipped_title=? WHERE user_id=?", (item_id, user_id))
+        await db.commit()
+
 async def equip_item(user_id: int, item_type: str, item_id: str):
     if _stats_pool:
         async with _stats_pool.acquire() as conn:
@@ -301,16 +328,16 @@ async def equip_item(user_id: int, item_type: str, item_id: str):
 async def get_equipped(user_id: int):
     if _stats_pool:
         async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory FROM bunker_economy WHERE user_id = $1", user_id)
+            row = await conn.fetchrow("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory, equipped_badge FROM bunker_economy WHERE user_id = $1", user_id)
             if not row:
                 await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-                return {"title":"", "frame":"", "card_theme":"classic", "victory":"classic"}
-            return {"title":row["equipped_title"], "frame":row["equipped_frame"], "card_theme":row["equipped_card_theme"], "victory":row["equipped_victory"]}
+                return {"title":"", "frame":"", "card_theme":"classic", "victory":"classic", "badge":""}
+            return {"title":row["equipped_title"], "frame":row["equipped_frame"], "card_theme":row["equipped_card_theme"], "victory":row["equipped_victory"], "badge":row["equipped_badge"]}
     async with connect_db() as db:
         await get_coins(user_id)
-        async with db.execute("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
+        async with db.execute("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory, equipped_badge FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
-        return {"title":row[0], "frame":row[1], "card_theme":row[2], "victory":row[3]}
+        return {"title":row[0], "frame":row[1], "card_theme":row[2], "victory":row[3], "badge":row[4]}
 
 async def record_daily_event(user_id: int, event: str, amount: int = 1):
     rewards = {"game": 30, "win": 55, "reveal": 15, "vote": 10}
@@ -384,6 +411,13 @@ async def owner_grant_if_needed(user_id: int, amount: int) -> bool:
         await db.execute("UPDATE bunker_economy SET coins=coins+?, owner_granted=1 WHERE user_id=?", (amount,user_id))
         await db.commit()
         return True
+
+async def health_check():
+    async with connect_db() as db:
+        await db.execute("SELECT 1")
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
 
 # --- ЛОГИКА ЛОББИ ---
 
