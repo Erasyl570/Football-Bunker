@@ -1,530 +1,1388 @@
-import aiosqlite
+import asyncio
+import html
 import json
 import os
+import random
+import time
+from collections import defaultdict
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import LinkPreviewOptions
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiohttp import web
+import google.generativeai as genai
 
-DB_NAME = os.getenv("SQLITE_DB_PATH", "bunker.db")
-STATS_DATABASE_URL = os.getenv("STATS_DATABASE_URL") or os.getenv("DATABASE_URL")
-_stats_pool = None
+import database as db
+import cards
 
-def connect_db():
-    return aiosqlite.connect(DB_NAME, timeout=10.0)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-async def _init_stats_db():
-    global _stats_pool
-    if not STATS_DATABASE_URL:
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- ЗАЩИТА ОТ СПАМА / АВТОКЛИКЕРОВ ---
+class CallbackRateLimitMiddleware(BaseMiddleware):
+    def __init__(self, interval: float = 0.65):
+        self.interval = interval
+        self.last_seen = {}
+
+    async def __call__(self, handler, event, data):
+        user_id = getattr(event.from_user, "id", None)
+        if user_id is not None:
+            now = time.monotonic()
+            key = (user_id, getattr(event.message, "chat", None).id if getattr(event, "message", None) else 0)
+            previous = self.last_seen.get(key, 0.0)
+            if now - previous < self.interval:
+                try:
+                    await event.answer("⏳ Слишком быстро. Подожди немного.")
+                except Exception:
+                    pass
+                return
+            self.last_seen[key] = now
+            # Не даём словарю расти бесконечно.
+            if len(self.last_seen) > 10000:
+                cutoff = now - 60
+                self.last_seen = {k: v for k, v in self.last_seen.items() if v >= cutoff}
+        return await handler(event, data)
+
+dp.callback_query.outer_middleware(CallbackRateLimitMiddleware())
+
+# Один запрос Gemini одновременно. При 429/503/временных сбоях — повтор с backoff.
+GEMINI_SEMAPHORE = asyncio.Semaphore(1)
+GEMINI_CACHE = {}
+FINALIZING_GAMES = set()
+
+
+CARD_IMAGES = {
+    "position": "https://i.ibb.co/rRQQn3Jk/E17684-E2-56-F4-4-D66-8727-A0411741-F102.png", 
+    "age": "https://i.ibb.co/SXVZG1m8/E13-D392-F-B727-4782-BE64-4-B3-FF6460-AE0.png",
+    "price": "https://i.ibb.co/gbtmrfbt/2-E013-C9-A-F562-435-D-8445-057199144-D69.png",
+    "health": "https://i.ibb.co/RktLxj4k/BE52-B7-D1-DE73-4-E85-9641-0242-E4-FA816-F.png",
+    "skill": "https://i.ibb.co/jPN42k2b/0-F0274-A2-6320-4-EE8-9-F2-F-9-CB9-E2-C35209.png",
+    "inventory": "https://i.ibb.co/qL8JH60p/5-A3-AD710-D4-C9-443-B-AD86-14029-ED7-D237.png",
+    "secret": "https://i.ibb.co/LzJ1zstj/7-DC7-EFD5-B294-4-EC8-BE3-D-EDF77-BFD93-DF.png"
+}
+
+SPECIAL_CARD_NAMES = {
+    "swap_position": "🔄 Фиксированный обмен [Позиция]",
+    "swap_age": "🔄 Фиксированный обмен [Возраст]",
+    "swap_price": "🔄 Фиксированный обмен [Цена]",
+    "swap_health": "🔄 Фиксированный обмен [Здоровье]",
+    "swap_skill": "🔄 Фиксированный обмен [Навык]",
+    "swap_inventory": "🔄 Фиксированный обмен [Багаж]",
+    "swap_secret": "🔄 Фиксированный обмен [Секрет]",
+    "spy": "👁 Шпионаж",
+    "yellow_card": "🟨 Желтая карточка",
+    "flash": "📸 Вспышка (Публичность)",
+    "mirror": "🪞 Зеркальный щит",
+    "chaos": "🎲 Трансферный хаос",
+    "vote_redirect": "🃏 Подмена голосов",
+    "mute": "🤫 Тихий трибунал",
+    "captain": "©️ Скрытый капитан"
+}
+
+SPECIAL_CARD_DESCRIPTIONS = {
+    "swap_position": "Обменивает твою карту «Позиция» на позицию любого игрока.",
+    "swap_age": "Обменивает твою карту «Возраст» на возраст любого игрока.",
+    "swap_price": "Обменивает твою карту «Цена» на цену любого игрока.",
+    "swap_health": "Обменивает твою карту «Здоровье» на здоровье любого игрока.",
+    "swap_skill": "Обменивает твою карту «Навык» на навык любого игрока.",
+    "swap_inventory": "Обменивает твой «Багаж» на багаж любого игрока.",
+    "swap_secret": "Обменивает твой «Секрет» на секрет любого игрока.",
+    "spy": "Позволяет скрыто подсмотреть 1 закрытую карту любого соперника.",
+    "yellow_card": "Блокирует использование спец-карты выбранному игроку до конца игры.",
+    "flash": "Принудительно вскрывает любую выбранную тобой закрытую карту соперника в общий чат.",
+    "mirror": "Защита: отражает действие следующей примененной против тебя спец-карты обратно.",
+    "chaos": "Случайно меняет одну твою закрытую карту с закрытой картой соперника.",
+    "vote_redirect": "Используется ДО голосования. Если в конце голосования ты набрал больше всех голосов единолично, все голоса против тебя тайно переводятся на выбранного тобой игрока. Если ты не лидер голосования — карта сгорает.",
+    "mute": "Используется во время обсуждения перед голосованием. Тайно лишает выбранного игрока возможности писать сообщения в группе до конца текущего раунда. Его голоса при этом сохраняются.",
+    "captain": "Тайно назначает одного другого игрока капитаном. В текущем голосовании его голос считается за два. Сам капитан не получает уведомления о назначении."
+}
+
+TRAIT_LABELS = {
+    "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
+    "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет"
+}
+
+ECONOMY_OWNER_ID = int(os.getenv("ECONOMY_OWNER_ID", "1624967415"))
+OWNER_STARTING_COINS = 10000
+SHOP_ITEMS = {
+    "title_tactician": {"type": "title", "name": "🧠 Тактик", "price": 450},
+    "title_legend": {"type": "title", "name": "👑 Легенда Бункера", "price": 1200},
+    "title_director": {"type": "title", "name": "💼 Спортивный директор", "price": 2200},
+    "frame_gold": {"type": "frame", "name": "🥇 Золотая рамка", "price": 700},
+    "frame_dark": {"type": "frame", "name": "🌑 Тёмная рамка", "price": 900},
+    "frame_champ": {"type": "frame", "name": "🏆 Чемпионская рамка", "price": 1800},
+    "theme_gold": {"type": "card_theme", "name": "✨ Золотая карточка", "price": 1000},
+    "theme_pitch": {"type": "card_theme", "name": "🌿 Футбольное поле", "price": 1400},
+    "theme_night": {"type": "card_theme", "name": "🌌 Ночной Бункер", "price": 1800},
+    "victory_fire": {"type": "victory", "name": "🎆 Фейерверк победы", "price": 1300},
+    "victory_gold": {"type": "victory", "name": "🏆 Золотой финал", "price": 2500},
+}
+CARD_THEME_STYLE = {
+    "classic": ("⚽", "───────────────────"),
+    "theme_gold": ("✨", "═══════════════════"),
+    "theme_pitch": ("🌿", "━━━━━━━━━━━━━━━━━━━"),
+    "theme_night": ("🌌", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"),
+}
+
+async def economy_owner_grant():
+    if await db.owner_grant_if_needed(ECONOMY_OWNER_ID, OWNER_STARTING_COINS):
+        print(f"[ECONOMY] Owner {ECONOMY_OWNER_ID} received {OWNER_STARTING_COINS} coins")
+
+async def economy_profile_text(user_id: int, username: str) -> str:
+    games, wins = await db.get_user_profile(user_id, username)
+    coins = await db.get_coins(user_id)
+    eq = await db.get_equipped(user_id)
+    title = SHOP_ITEMS.get(eq["title"], {}).get("name", "") if eq["title"] else ""
+    frame = SHOP_ITEMS.get(eq["frame"], {}).get("name", "") if eq["frame"] else ""
+    rate = wins / games * 100 if games else 0
+    return (f"👤 <b>ПРОФИЛЬ ИГРОКА</b>\n───────────────────\n⚽ <b>{html.escape(username)}</b>"
+            f"{f'\n🏷 Титул: <b>{html.escape(title)}</b>' if title else ''}"
+            f"{f'\n🖼 Рамка: <b>{html.escape(frame)}</b>' if frame else ''}\n\n"
+            f"🎮 Игр: <b>{games}</b>\n🏆 Побед: <b>{wins}</b>\n📈 Винрейт: <b>{rate:.1f}%</b>\n🪙 Монеты: <b>{coins}</b>")
+
+async def economy_shop_text(user_id: int) -> str:
+    coins = await db.get_coins(user_id)
+    lines = ["🛍 <b>МАГАЗИН БУНКЕРА</b>", "───────────────────", f"🪙 Баланс: <b>{coins}</b>", ""]
+    for item_id, item in SHOP_ITEMS.items():
+        owned = await db.has_purchase(user_id, item_id)
+        lines.append(f"{'✅' if owned else '▫️'} {item['name']} — <b>{item['price']} 🪙</b>")
+    return "\n".join(lines)
+
+async def shop_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    for item_id, item in SHOP_ITEMS.items():
+        owned = await db.has_purchase(user_id, item_id)
+        builder.button(text=(f"⚙️ {item['name']}" if owned else f"🛒 {item['name']} · {item['price']}"), callback_data=f"shop:{'equip' if owned else 'buy'}:{item_id}")
+    builder.button(text="🪙 Кошелёк / квесты", callback_data="menu:wallet")
+    builder.button(text="🏠 Главное меню", callback_data="menu:home")
+    builder.adjust(1)
+    return builder.as_markup()
+
+async def wallet_text(user_id: int) -> str:
+    coins = await db.get_coins(user_id); p = await db.get_daily_progress(user_id)
+    return (f"🪙 <b>КОШЕЛЁК</b>\n───────────────────\nБаланс: <b>{coins} 🪙</b>\n\n"
+            f"📅 <b>Ежедневные задания</b>\n🎮 Сыграть 1 игру: <b>{min(p['game'],1)}/1</b> · +30 🪙\n"
+            f"🏆 Победить 1 раз: <b>{min(p['win'],1)}/1</b> · +55 🪙\n"
+            f"🃏 Вскрыть 3 карты: <b>{min(p['reveal'],3)}/3</b> · +15 🪙\n"
+            f"🗳 Отдать 5 голосов: <b>{min(p['vote'],5)}/5</b> · +10 🪙\n\nНаграды начисляются автоматически. P2W-механик нет.")
+
+async def victory_effect(user_id: int, name: str) -> str:
+    effect = (await db.get_equipped(user_id))["victory"]
+    if effect == "victory_fire": return f"🎆✨ {html.escape(name)} — ПОБЕДИТЕЛЬ! ✨🎆"
+    if effect == "victory_gold": return f"🏆💛 {html.escape(name)} — ЗОЛОТОЙ ФИНАЛ! 💛🏆"
+    return f"🏆 {html.escape(name)} — победитель!"
+
+async def is_game_active(chat_id: int) -> bool:
+    lobby = await db.get_lobby(chat_id)
+    return lobby is not None and lobby[0] not in ("ended", "cancelled")
+
+# --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK С ТАЙМАУТОМ) ---
+async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
+    if not GEMINI_API_KEY:
+        return "⚠️ <i>GEMINI_API_KEY не задан. Оценка сценария недоступна.</i>"
+
+    players_summary = "".join(
+        f"- Игрок {name}: Позиция={pack.get('position')}, Возраст={pack.get('age')}, "
+        f"Цена={pack.get('price')}, Здоровье={pack.get('health')}, Навык={pack.get('skill')}, "
+        f"Багаж={pack.get('inventory')}, Секрет={pack.get('secret')}\n"
+        for name, pack in winners_data
+    )
+    prompt = (
+        "Ты — футбольный спортивный директор. Оцени финальную пару честно, но без душнилова.\n\n"
+        f"СЦЕНАРИЙ И ЦЕЛЬ:\n{scenario_text}\n\n"
+        f"ФИНАЛЬНАЯ ПАРА И АКТУАЛЬНЫЕ КАРТОЧКИ:\n{players_summary}\n"
+        "ПРАВИЛА: 1) Определи 2-3 главных требования сценария. "
+        "2) Прямой ценовой/позиционный порог обязателен, если он указан. "
+        "3) Не требуй идеального совпадения всех характеристик. "
+        "4) Неизвестная характеристика не считается плохой. "
+        "5) Положительные качества могут компенсировать второстепенные недостатки. "
+        "6) ПРОВАЛ только при явном противоречии ключевым условиям или очевидной неспособности выполнить цель. "
+        "7) Не выдумывай характеристики.\n\n"
+        "Формат: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
+        "📝 <b>Причина:</b> [2-4 коротких предложения]"
+    )
+    cache_key = str(hash(prompt))
+    if cache_key in GEMINI_CACHE:
+        return GEMINI_CACHE[cache_key]
+
+    async with GEMINI_SEMAPHORE:
+        last_error = None
+        for attempt in range(3):
+            try:
+                model = genai.GenerativeModel(GEMINI_MODEL)
+                response = await model.generate_content_async(
+                    prompt, request_options={"timeout": 25}
+                )
+                if response and getattr(response, "text", None):
+                    result = response.text.strip()
+                    GEMINI_CACHE[cache_key] = result
+                    return result
+                last_error = "Пустой ответ"
+            except Exception as e:
+                last_error = str(e)
+                # 1s, 2s перед повтором; не спамим Gemini при временной ошибке.
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+        print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
+        return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена, но вердикт можно получить повторно позже.</i>"
+
+async def build_reveal_keyboard(chat_id: int, user_id: int):
+    builder = InlineKeyboardBuilder()
+    traits = [
+        ("position", "💼 Позицию"), ("age", "👤 Возраст"),
+        ("price", "💰 Цену"), ("health", "❤️ Здоровье"),
+        ("skill", "🎯 Навык"), ("inventory", "🎒 Багаж"), ("secret", "🔍 Секрет")
+    ]
+    
+    for trait_key, trait_label in traits:
+        if not await db.is_trait_revealed(chat_id, user_id, trait_key):
+            builder.button(text=trait_label, callback_data=f"reveal:{trait_key}:{chat_id}")
+            
+    spec_info = await db.get_player_special_info(chat_id, user_id)
+    if spec_info and not spec_info[1]:
+        builder.button(text="✨ Спецкарта", callback_data=f"use_spec:{chat_id}")
+
+    builder.adjust(2)
+    return builder.as_markup()
+
+async def build_private_card_text(chat_id: int, user_id: int) -> str:
+    pack = await db.get_player_pack(chat_id, user_id) or {}
+    username = await db.get_username(chat_id, user_id)
+    spec_info = await db.get_player_special_info(chat_id, user_id)
+    spec_code = spec_info[0] if spec_info else ""
+    spec_used = bool(spec_info[1]) if spec_info else False
+    spec_title = SPECIAL_CARD_NAMES.get(spec_code, "Спецкарта")
+    spec_desc = SPECIAL_CARD_DESCRIPTIONS.get(spec_code, "Описание отсутствует.")
+    if spec_used:
+        spec_title = f"{spec_title} (уже использована)"
+
+    eq = await db.get_equipped(user_id)
+    theme_emoji, theme_line = CARD_THEME_STYLE.get(eq["card_theme"], CARD_THEME_STYLE["classic"])
+    return (
+        f"{theme_emoji} <b>ТВОЯ АКТУАЛЬНАЯ КАРТОЧКА ИГРОКА</b>\n{theme_line}\n"
+        f"💼 <b>Позиция:</b> <code>{html.escape(str(pack.get('position', '-')))}</code>\n"
+        f"👤 <b>Возраст:</b> <code>{pack.get('age', '-')} лет</code>\n"
+        f"💰 <b>Цена:</b> <code>{html.escape(str(pack.get('price', '-')))}</code>\n"
+        f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack.get('health', '-')))}</code>\n"
+        f"🎯 <b>Навык:</b> <code>{html.escape(str(pack.get('skill', '-')))}</code>\n"
+        f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack.get('inventory', '-')))}</code>\n"
+        f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret', '-')))}</i>\n"
+        f"───────────────────\n"
+        f"✨ <b>Спец-карта:</b> <b>{html.escape(spec_title)}</b>\n"
+        f"ℹ️ <b>Что делает:</b> <i>{html.escape(spec_desc)}</i>\n"
+        f"───────────────────\n"
+        f"👇 <i>Используй кнопки ниже во время своего хода.</i>"
+    )
+
+async def refresh_private_card(chat_id: int, user_id: int):
+    message_id = await db.get_private_card_message_id(chat_id, user_id)
+    if not message_id:
         return
     try:
-        import asyncpg
-        _stats_pool = await asyncpg.create_pool(STATS_DATABASE_URL, min_size=1, max_size=3, command_timeout=10)
-        async with _stats_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS bunker_users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    games_played INTEGER NOT NULL DEFAULT 0,
-                    wins INTEGER NOT NULL DEFAULT 0
-                )
-            """)
+        text = await build_private_card_text(chat_id, user_id)
+        markup = await build_reveal_keyboard(chat_id, user_id)
+        await bot.edit_message_text(
+            chat_id=user_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
     except Exception as e:
-        print(f"[STATS DB] Не удалось подключить внешнюю БД: {e}")
-        _stats_pool = None
+        # Старое сообщение может быть удалено/недоступно. Это не должно ломать игру.
+        print(f"[CARD REFRESH] Не удалось обновить ЛС игрока {user_id}: {e}")
 
-async def init_db():
-    await _init_stats_db()
-    async with connect_db() as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
+async def build_players_summary(chat_id: int) -> str:
+    alive_players = await db.get_alive_players(chat_id)
+    if not alive_players:
+        return ""
+
+    trait_structure = [
+        ("position", "💼", "Позиция"), ("age", "👤", "Возраст"),
+        ("price", "💰", "Цена"), ("health", "❤️", "Здоровье"),
+        ("skill", "🎯", "Навык"), ("inventory", "🎒", "Багаж"), ("secret", "🔍", "Секрет")
+    ]
+
+    players_blocks = []
+    for idx, (p_name, p_id) in enumerate(alive_players, 1):
+        pack = await db.get_player_pack(chat_id, p_id) or {}
+        player_lines = [f"👤 <b>{idx}. {html.escape(p_name)}</b>"]
+
+        total_traits = len(trait_structure)
+        for t_idx, (trait_key, emoji, title) in enumerate(trait_structure):
+            is_last = (t_idx == total_traits - 1)
+            prefix = "└" if is_last else "├"
+            
+            is_revealed = await db.is_trait_revealed(chat_id, p_id, trait_key)
+            if is_revealed:
+                val = pack.get(trait_key, "-")
+                if trait_key == "age" and val != "-":
+                    val = f"{val} лет"
+                player_lines.append(f"{prefix} {emoji} {title}: <b>{html.escape(str(val))}</b>")
+            else:
+                player_lines.append(f"{prefix} {emoji} {title}: <i>🔒 Скрыто</i>")
+
+        players_blocks.append("\n\n".join(player_lines))
+
+    return "\n\n".join(players_blocks)
+
+async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, current_round: int):
+    unrevealed = await db.get_unrevealed_traits(chat_id, user_id)
+    if unrevealed:
+        chosen_trait = random.choice(unrevealed)
+        pack = await db.get_player_pack(chat_id, user_id)
         
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS lobbies (
-                chat_id INTEGER PRIMARY KEY,
-                host_id INTEGER,
-                status TEXT,
-                scenario TEXT,
-                current_round INTEGER DEFAULT 1,
-                current_turn_user_id INTEGER DEFAULT 0,
-                tie_count INTEGER DEFAULT 0,
-                skip_count INTEGER DEFAULT 0,
-                total_ties INTEGER DEFAULT 0,
-                total_votes INTEGER DEFAULT 0
-            )
-        """)
+        val = pack.get(chosen_trait, "-")
+        if chosen_trait == "age" and val != "-":
+            val = f"{val} лет"
         
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                chat_id INTEGER,
-                user_id INTEGER,
-                user_name TEXT,
-                pack_json TEXT,
-                is_alive INTEGER DEFAULT 1,
-                special_card TEXT DEFAULT '',
-                special_used INTEGER DEFAULT 0,
-                is_blocked INTEGER DEFAULT 0,
-                shield_active INTEGER DEFAULT 0,
-                muted_round INTEGER DEFAULT 0,
-                vote_redirect_target INTEGER DEFAULT 0,
-                vote_redirect_round INTEGER DEFAULT 0,
-                private_card_message_id INTEGER DEFAULT 0,
-                PRIMARY KEY (chat_id, user_id)
-            )
-        """)
+        await db.record_reveal(chat_id, user_id, chosen_trait, current_round)
+        await db.record_daily_event(user_id, "reveal")
         
-        # Миграция колонок для спец-карт, если таблица уже существовала
-        for col, col_type in [
-            ("special_card", "TEXT DEFAULT ''"),
-            ("special_used", "INTEGER DEFAULT 0"),
-            ("is_blocked", "INTEGER DEFAULT 0"),
-            ("shield_active", "INTEGER DEFAULT 0"),
-            ("muted_round", "INTEGER DEFAULT 0"),
-            ("vote_redirect_target", "INTEGER DEFAULT 0"),
-            ("vote_redirect_round", "INTEGER DEFAULT 0"),
-            ("private_card_message_id", "INTEGER DEFAULT 0")
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE players ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass
+        safe_name = html.escape(user_name)
+        safe_val = html.escape(str(val))
+        trait_title = TRAIT_LABELS.get(chosen_trait, chosen_trait)
+        image_url = CARD_IMAGES.get(chosen_trait, "")
+        
+        msg_text = (
+            f'<a href="{image_url}">&#8203;</a>⏱ <b>{safe_name}</b> не успел открыть карту!\n'
+            f'└ 🎲 Бот автоматически вскрыл <b>[{trait_title}]</b>: <b>{safe_val}</b>'
+        )
+        preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
+        await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
 
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN tie_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN skip_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN total_ties INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN total_votes INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS votes (
-                chat_id INTEGER,
-                voter_id INTEGER,
-                target_id INTEGER,
-                PRIMARY KEY (chat_id, voter_id)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS reveals (
-                chat_id INTEGER,
-                user_id INTEGER,
-                trait TEXT,
-                round_num INTEGER,
-                PRIMARY KEY (chat_id, user_id, trait)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS hidden_captains (
-                chat_id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                round_num INTEGER
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                games_played INTEGER DEFAULT 0,
-                wins INTEGER DEFAULT 0
-            )
-        """)
-        await db.commit()
-
-# --- СТАТИСТИКА ---
-
-async def get_user_profile(user_id: int, username: str):
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT games_played, wins FROM bunker_users WHERE user_id = $1", user_id)
-            if not row:
-                await conn.execute("INSERT INTO bunker_users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", user_id, username)
-                return (0, 0)
-            await conn.execute("UPDATE bunker_users SET username = $2 WHERE user_id = $1", user_id, username)
-            return (row["games_played"], row["wins"])
-    async with connect_db() as db:
-        async with db.execute("SELECT games_played, wins FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                await db.execute("INSERT INTO users (user_id, username, games_played, wins) VALUES (?, ?, 0, 0)", (user_id, username))
-                await db.commit()
-                return (0, 0)
-            return (row[0], row[1])
-
-async def update_user_stats(user_id: int, username: str, won: bool):
-    inc_win = 1 if won else 0
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO bunker_users (user_id, username, games_played, wins)
-                VALUES ($1, $2, 1, $3)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    games_played = bunker_users.games_played + 1,
-                    wins = bunker_users.wins + EXCLUDED.wins
-            """, user_id, username, inc_win)
+async def announce_winners_and_end(chat_id: int, alive_players: list):
+    if not await db.try_end_game(chat_id):
         return
-    async with connect_db() as db:
-        await db.execute("""
-            INSERT INTO users (user_id, username, games_played, wins)
-            VALUES (?, ?, 1, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                games_played = games_played + 1,
-                wins = wins + excluded.wins
-        """, (user_id, username, inc_win))
-        await db.commit()
+    game_stats = await db.get_game_stats(chat_id)
 
-# --- ЛОГИКА ЛОББИ ---
+    all_players = await db.get_players(chat_id)
+    alive_ids = {p[1] for p in alive_players}
 
-async def create_lobby(chat_id: int, host_id: int) -> bool:
-    """Создаёт лобби только если в чате нет активной игры. Возвращает True/False."""
-    async with connect_db() as db:
-        async with db.execute("SELECT status FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-        if row and row[0] not in ("ended", "cancelled"):
-            return False
+    for p_name, p_id, _ in all_players:
+        is_win = (p_id in alive_ids) and (len(alive_players) > 0)
+        await db.update_user_stats(p_id, p_name, is_win)
+        await db.record_daily_event(p_id, "game")
+        if is_win:
+            await db.record_daily_event(p_id, "win")
 
-        await db.execute("DELETE FROM lobbies WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM hidden_captains WHERE chat_id = ?", (chat_id,))
-        await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
-            (chat_id, host_id, "lobby")
+    # После завершения показываем всем полные карточки всех участников.
+    # Это происходит только после окончания игры, поэтому скрытая информация
+    # больше не влияет на игровой процесс.
+    all_cards_blocks = []
+    for idx, (p_name, p_id, _) in enumerate(all_players, 1):
+        pack = await db.get_player_pack(chat_id, p_id) or {}
+        spec_info = await db.get_player_special_info(chat_id, p_id)
+        spec_code = spec_info[0] if spec_info else ""
+        spec_used = bool(spec_info[1]) if spec_info else False
+        spec_title = SPECIAL_CARD_NAMES.get(spec_code, "—")
+        if spec_used and spec_title != "—":
+            spec_title += " (использована)"
+        alive_mark = "🏆" if p_id in alive_ids else "❌"
+        age = pack.get("age", "-")
+        age_text = f"{age} лет" if age != "-" else "-"
+        all_cards_blocks.append(
+            f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b>\n"
+            f"├ 💼 Позиция: <b>{html.escape(str(pack.get('position', '-')))}</b>\n"
+            f"├ 👤 Возраст: <b>{html.escape(str(age_text))}</b>\n"
+            f"├ 💰 Цена: <b>{html.escape(str(pack.get('price', '-')))}</b>\n"
+            f"├ ❤️ Здоровье: <b>{html.escape(str(pack.get('health', '-')))}</b>\n"
+            f"├ 🎯 Навык: <b>{html.escape(str(pack.get('skill', '-')))}</b>\n"
+            f"├ 🎒 Багаж: <b>{html.escape(str(pack.get('inventory', '-')))}</b>\n"
+            f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret', '-')))}</b>\n"
+            f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
         )
-        await db.commit()
-        return True
 
-async def try_start_lobby(chat_id: int) -> bool:
-    """Атомарно переводит лобби из lobby в starting. Защищает от двойного старта."""
-    async with connect_db() as db:
-        cursor = await db.execute(
-            "UPDATE lobbies SET status = 'starting' WHERE chat_id = ? AND status = 'lobby'",
-            (chat_id,)
+    if not alive_players:
+        await bot.send_message(chat_id, "❌ <b>ИГРА ОКОНЧЕНА</b>\n───────────────────\nВсе претенденты выбыли! Победителей нет.", parse_mode="HTML")
+    else:
+        winners_str = "\n".join([f"├ 🏆 <b>{html.escape(p[0])}</b>" for p in alive_players[:-1]] + [f"└ 🏆 <b>{html.escape(alive_players[-1][0])}</b>"])
+        await bot.send_message(
+            chat_id,
+            f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nОставшиеся игроки претендуют на контракт:\n{winners_str}\n\n🤖 <i>ИИ-эксперт изучает все карточки и формирует вердикт...</i>",
+            parse_mode="HTML"
         )
-        await db.commit()
-        return cursor.rowcount == 1
 
+    await bot.send_chat_action(chat_id, action="typing")
 
-async def get_lobby(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT status, host_id, scenario, current_round FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return (row[0], row[1], row[2], 0, row[3])
-            return None
+    lobby = await db.get_lobby(chat_id)
+    scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
 
-async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
-    async with connect_db() as db:
-        if current_round is not None:
-            await db.execute("UPDATE lobbies SET status = ?, current_round = ? WHERE chat_id = ?", (status, current_round, chat_id))
+    winners_data = []
+    for p_name, p_id in alive_players:
+        pack = await db.get_player_pack(chat_id, p_id) or {}
+        winners_data.append((p_name, pack))
+
+    ai_verdict = await evaluate_game_outcome(scenario_text, winners_data)
+
+    await bot.send_message(
+        chat_id,
+        f"📊 <b>ИТОГИ СЦЕНАРИЯ</b>\n───────────────────\n{ai_verdict}\n\n"
+        f"📈 <b>СТАТИСТИКА ИГРЫ</b>\n"
+        f"🎮 Раундов: <b>{game_stats['rounds']}</b>\n"
+        f"🗳 Голосов: <b>{game_stats['votes']}</b>\n"
+        f"🤝 Ничьих: <b>{game_stats['ties']}</b>\n"
+        f"⏭️ Скипов: <b>{game_stats['skips']}/3</b>\n"
+        f"🃏 Спецкарт использовано: <b>{game_stats['special_cards']}</b>",
+        parse_mode="HTML"
+    )
+
+    if alive_players:
+        effects = "\n".join([await victory_effect(p_id, p_name) for p_name,p_id in alive_players])
+        await bot.send_message(chat_id, f"✨ <b>ПОБЕДНЫЕ ЭФФЕКТЫ</b>\n{effects}", parse_mode="HTML")
+
+    await bot.send_message(
+        chat_id,
+        "🔓 <b>КАРТЫ РАСКРЫТЫ</b>\n───────────────────\n"
+        "Теперь можно узнать, что на самом деле скрывал каждый игрок:\n\n"
+        + "\n\n".join(all_cards_blocks),
+        parse_mode="HTML"
+    )
+
+async def start_round_flow(chat_id: int, current_round: int):
+    try:
+        if not await is_game_active(chat_id): return
+
+        alive_players = await db.get_alive_players(chat_id)
+        if len(alive_players) <= 2:
+            await announce_winners_and_end(chat_id, alive_players)
+            return
+
+        all_players = await db.get_players(chat_id)
+        total_count = len(all_players)
+        bot_info = await bot.get_me()
+
+        if not await db.transition_lobby_status(chat_id, "reveal_phase", ["starting", "discussion", "voting", "finishing"], current_round):
+            return
+        await bot.send_message(
+            chat_id,
+            f"📢 <b>РАУНД {current_round} | ВСКРЫТИЕ КАРТ</b>\n───────────────────\nИгроки вытягивают по 1 карте строго по очереди.",
+            parse_mode="HTML"
+        )
+
+        for p_name, p_id in alive_players:
+            if not await is_game_active(chat_id): return
+            await db.set_current_turn(chat_id, p_id)
+            
+            builder = InlineKeyboardBuilder()
+            builder.button(text="📩 Открыть карту / Спец-карту", url=f"https://t.me/{bot_info.username}")
+            
+            safe_p_name = html.escape(p_name)
+            await bot.send_message(
+                chat_id,
+                f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n───────────────────\n👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n⏳ <i>У тебя 40 секунд...</i>",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+
+            for _ in range(40):
+                if not await is_game_active(chat_id): return
+                if await db.has_revealed_in_round(chat_id, p_id, current_round): break
+                await asyncio.sleep(1)
+
+            if not await is_game_active(chat_id): return
+            if not await db.has_revealed_in_round(chat_id, p_id, current_round):
+                await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
+
+            await asyncio.sleep(2)
+
+        if not await is_game_active(chat_id): return
+        await db.set_current_turn(chat_id, 0)
+
+        if not await db.transition_lobby_status(chat_id, "discussion", ["reveal_phase"], current_round):
+            return
+        has_voting = not (total_count in (3, 4) and current_round < 3)
+        discussion_time = 60 if has_voting else 30
+
+        discussion_msg = f"💬 <b>РАУНД {current_round} | ОБСУЖДЕНИЕ ({discussion_time} СЕКУНД)</b>\n───────────────────\n"
+        discussion_msg += "Обсуждайте открытые карты и готовьтесь к голосованию!" if has_voting else "Первое голосование откроется в Раунде 3."
+        
+        await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
+        await asyncio.sleep(discussion_time)
+
+        if not await is_game_active(chat_id): return
+        check_lobby = await db.get_lobby(chat_id)
+        if check_lobby and check_lobby[0] == "discussion":
+            if not has_voting:
+                asyncio.create_task(start_round_flow(chat_id, current_round + 1))
+            else:
+                asyncio.create_task(start_voting_flow(chat_id, current_round))
+
+    except Exception as e:
+        print(f"[ERROR] Сбой в Раунде {current_round}: {e}")
+        await bot.send_message(chat_id, f"⚠️ Произошел сбой при переходе в Раунд {current_round + 1}. Возобновляем поток...", parse_mode="HTML")
+        await asyncio.sleep(2)
+        if await is_game_active(chat_id):
+            asyncio.create_task(start_round_flow(chat_id, current_round + 1))
+
+# --- СПЕЦ-КАРТЫ ---
+
+@dp.callback_query(F.data.startswith("use_spec:"))
+async def handle_use_special_init(callback: types.CallbackQuery):
+    target_chat_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+
+    if not await is_game_active(target_chat_id):
+        return await callback.answer("❌ Игра не активна!", show_alert=True)
+
+    alive_players = await db.get_alive_players(target_chat_id)
+    alive_ids = {p[1] for p in alive_players}
+    if user_id not in alive_ids:
+        return await callback.answer("❌ Выбывшие участники не могут использовать спец-карты!", show_alert=True)
+
+    spec_info = await db.get_player_special_info(target_chat_id, user_id)
+    if not spec_info or spec_info[1]:
+        return await callback.answer("❌ Ты уже использовал свою спец-карту!", show_alert=True)
+
+    if spec_info[2]:
+        return await callback.answer("🟨 На тебя наложена Желтая карточка! Спец-карта заблокирована.", show_alert=True)
+
+    card_code = spec_info[0]
+    other_players = [p for p in alive_players if p[1] != user_id]
+    lobby = await db.get_lobby(target_chat_id)
+    phase = lobby[0] if lobby else ""
+
+    # Эти карты активируются только в фазе обсуждения, непосредственно перед РЕАЛЬНЫМ голосованием.
+    # Для 3-4 игроков в раундах 1-2 голосования ещё нет, поэтому карту там использовать нельзя.
+    total_players = len(await db.get_players(target_chat_id))
+    has_voting_this_round = not (total_players in (3, 4) and lobby[4] < 3)
+    if card_code in ("vote_redirect", "mute", "captain"):
+        if phase != "discussion" or not has_voting_this_round:
+            if phase == "discussion" and not has_voting_this_round:
+                return await callback.answer("⏳ В этом раунде голосования ещё не будет. Карта доступна перед голосованием.", show_alert=True)
+            return await callback.answer("⏳ Эту спец-карту можно использовать только во время обсуждения перед голосованием.", show_alert=True)
+
+    if card_code == "vote_redirect":
+        builder = InlineKeyboardBuilder()
+        for p_name, p_id in other_players:
+            builder.button(text=f"👤 {p_name}", callback_data=f"secret_target:vote_redirect:{p_id}:{target_chat_id}")
+        builder.adjust(2)
+        await callback.message.answer("🃏 <b>Подмена голосов</b>\nВыбери игрока, на которого тайно будут перенаправлены голоса против тебя, если ты станешь единоличным лидером голосования.", reply_markup=builder.as_markup(), parse_mode="HTML")
+        return await callback.answer()
+
+    if card_code == "mute":
+        builder = InlineKeyboardBuilder()
+        for p_name, p_id in other_players:
+            builder.button(text=f"👤 {p_name}", callback_data=f"secret_target:mute:{p_id}:{target_chat_id}")
+        builder.adjust(2)
+        await callback.message.answer("🤫 <b>Тихий трибунал</b>\nВыбери игрока. Он не получит уведомление, а его сообщения в группе будут молча удаляться до конца текущего раунда.", reply_markup=builder.as_markup(), parse_mode="HTML")
+        return await callback.answer()
+
+    if card_code == "captain":
+        # Владелец карты сам выбирает капитана, но выбранный игрок ничего не узнаёт.
+        builder = InlineKeyboardBuilder()
+        for p_name, p_id in other_players:
+            builder.button(text=f"👤 {p_name}", callback_data=f"secret_target:captain:{p_id}:{target_chat_id}")
+        builder.adjust(2)
+        await callback.message.answer(
+            "©️ <b>Скрытый капитан</b>\nВыбери игрока, который тайно получит двойной вес голоса.",
+            reply_markup=builder.as_markup(), parse_mode="HTML"
+        )
+        return await callback.answer()
+
+    if card_code == "mirror":
+        await db.update_player_special_status(target_chat_id, user_id, special_used=1, shield_active=1)
+        await callback.answer("🪞 Зеркальный щит активирован!", show_alert=True)
+        await bot.send_message(
+            target_chat_id,
+            f"🪞 <b>{html.escape(callback.from_user.first_name)}</b> активировал <b>«Зеркальный щит»</b>! Вражеский эффект отразится обратно.",
+            parse_mode="HTML"
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    for p_name, p_id in other_players:
+        builder.button(text=f"👤 {p_name}", callback_data=f"target_spec:{card_code}:{p_id}:{target_chat_id}")
+    builder.adjust(2)
+
+    await callback.message.answer(
+        f"✨ <b>Применение: {SPECIAL_CARD_NAMES.get(card_code, card_code)}</b>\nВыбери игрока-цель:",
+        reply_markup=builder.as_markup(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("secret_target:"))
+async def process_secret_target(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    card_code = parts[1]
+    target_user_id = int(parts[2])
+    chat_id = int(parts[3])
+    actor_id = callback.from_user.id
+
+    alive = await db.get_alive_players(chat_id)
+    alive_ids = {p[1] for p in alive}
+    if actor_id not in alive_ids or target_user_id not in alive_ids or actor_id == target_user_id:
+        return await callback.answer("❌ Некорректная цель.", show_alert=True)
+    spec_info = await db.get_player_special_info(chat_id, actor_id)
+    if not spec_info or spec_info[1] or spec_info[0] != card_code:
+        return await callback.answer("❌ Эта спец-карта уже недоступна.", show_alert=True)
+    lobby = await db.get_lobby(chat_id)
+    if not lobby or lobby[0] != "discussion":
+        return await callback.answer("⏳ Эту карту можно активировать только во время обсуждения.", show_alert=True)
+
+    total_players = len(await db.get_players(chat_id))
+    has_voting_this_round = not (total_players in (3, 4) and lobby[4] < 3)
+    if not has_voting_this_round:
+        return await callback.answer("⏳ В этом раунде голосования ещё не будет. Карта не потрачена.", show_alert=True)
+
+    if card_code == "vote_redirect":
+        await db.set_vote_redirect(chat_id, actor_id, target_user_id, lobby[4])
+    elif card_code == "mute":
+        await db.set_muted_round(chat_id, target_user_id, lobby[4])
+    elif card_code == "captain":
+        await db.set_captain(chat_id, target_user_id, lobby[4])
+    else:
+        return await callback.answer("❌ Неизвестная карта.", show_alert=True)
+
+    await db.update_player_special_status(chat_id, actor_id, special_used=1)
+    await callback.message.edit_text("✅ Спец-карта активирована тайно.")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("target_spec:"))
+async def process_special_target(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    card_code = parts[1]
+    target_user_id = int(parts[2])
+    chat_id = int(parts[3])
+    actor = callback.from_user
+
+    alive_players = await db.get_alive_players(chat_id)
+    if actor.id not in {p[1] for p in alive_players}:
+        return await callback.answer("❌ Выбывшие игроки не могут использовать спец-карты!", show_alert=True)
+
+    target_info = await db.get_player_special_info(chat_id, target_user_id)
+    if target_info and target_info[3] == 1:
+        await db.update_player_special_status(chat_id, target_user_id, shield_active=0)
+        await bot.send_message(
+            chat_id,
+            f"🪞 <b>ЗЕРКАЛЬНЫЙ ЩИТ!</b> Игрок <a href='tg://user?id={target_user_id}'>цель</a> отразил спец-карту <b>{SPECIAL_CARD_NAMES.get(card_code, card_code)}</b> обратно в <b>{html.escape(actor.first_name)}</b>!",
+            parse_mode="HTML"
+        )
+        target_user_id = actor.id
+
+    target_name = await db.get_username(chat_id, target_user_id)
+    await db.update_player_special_status(chat_id, actor.id, special_used=1)
+
+    if card_code.startswith("swap_"):
+        category = card_code.replace("swap_", "")
+        actor_pack = await db.get_player_pack(chat_id, actor.id)
+        target_pack = await db.get_player_pack(chat_id, target_user_id)
+
+        actor_val = actor_pack.get(category, "-")
+        target_val = target_pack.get(category, "-")
+
+        actor_pack[category] = target_val
+        target_pack[category] = actor_val
+
+        await db.update_player_pack(chat_id, actor.id, actor_pack)
+        await db.update_player_pack(chat_id, target_user_id, target_pack)
+        await refresh_private_card(chat_id, actor.id)
+        await refresh_private_card(chat_id, target_user_id)
+
+        actor_revealed = await db.is_trait_revealed(chat_id, actor.id, category)
+        target_revealed = await db.is_trait_revealed(chat_id, target_user_id, category)
+
+        cat_title = TRAIT_LABELS.get(category, category)
+
+        if actor_revealed or target_revealed:
+            await bot.send_message(
+                chat_id,
+                f"🔄 <b>ОБМЕН ХАРАКТЕРИСТИКАМИ!</b>\n"
+                f"<b>{html.escape(actor.first_name)}</b> применил спец-карту «Обмен [{cat_title}]» на <b>{html.escape(target_name)}</b>!\n"
+                f"Их карты <b>[{cat_title}]</b> официально поменялись местами.",
+                parse_mode="HTML"
+            )
         else:
-            await db.execute("UPDATE lobbies SET status = ? WHERE chat_id = ?", (status, chat_id))
-        await db.commit()
+            await bot.send_message(
+                actor.id,
+                f"🔄 <b>Анонимный обмен выполнен!</b>\nТы поменялся картами [{cat_title}] с игроком <b>{html.escape(target_name)}</b>.\n"
+                f"Твое новое значение: <b>{target_val}</b>", parse_mode="HTML"
+            )
+            await bot.send_message(
+                target_user_id,
+                f"⚠️ <b>Внимание!</b> Кто-то анонимно применил на тебя «Обмен [{cat_title}]»!\n"
+                f"Твое новое скрытое значение: <b>{actor_val}</b>", parse_mode="HTML"
+            )
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-async def set_current_turn(chat_id: int, user_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET current_turn_user_id = ? WHERE chat_id = ?", (user_id, chat_id))
-        await db.commit()
+    elif card_code == "spy":
+        target_pack = await db.get_player_pack(chat_id, target_user_id)
+        unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
+        if not unrevealed:
+            await callback.message.answer("👁 Все карты этого игрока уже открыты!")
+        else:
+            chosen = random.choice(unrevealed)
+            val = target_pack.get(chosen, "-")
+            await callback.message.answer(
+                f"👁 <b>ШПИОНАЖ:</b> У игрока <b>{html.escape(target_name)}</b> карта <b>[{TRAIT_LABELS.get(chosen, chosen)}]</b>: <code>{val}</code>",
+                parse_mode="HTML"
+            )
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-async def get_current_turn(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT current_turn_user_id FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET scenario = ?, current_round = ? WHERE chat_id = ?", (scenario_text, current_round, chat_id))
-        await db.commit()
-
-async def get_tie_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT COALESCE(tie_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def increment_tie_count(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET tie_count = COALESCE(tie_count, 0) + 1, total_ties = COALESCE(total_ties, 0) + 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-async def reset_tie_count(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET tie_count = 0 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-async def get_skip_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT COALESCE(skip_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def increment_skip_count(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET skip_count = COALESCE(skip_count, 0) + 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-
-async def get_game_stats(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT current_round, COALESCE(total_votes, 0), COALESCE(total_ties, 0), COALESCE(skip_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            lobby_row = await cursor.fetchone()
-        async with db.execute("SELECT COUNT(*) FROM players WHERE chat_id = ? AND special_used = 1", (chat_id,)) as cursor:
-            special_used = (await cursor.fetchone())[0]
-        return {
-            "rounds": lobby_row[0] if lobby_row else 0,
-            "votes": lobby_row[1] if lobby_row else 0,
-            "ties": lobby_row[2] if lobby_row else 0,
-            "skips": lobby_row[3] if lobby_row else 0,
-            "special_cards": special_used,
-        }
-
-# --- ИГРОКИ И ПАКЕТЫ ХАРАКТЕРИСТИК ---
-
-async def add_player(chat_id: int, user_id: int, user_name: str, pack: dict):
-    async with connect_db() as db:
-        pack_json = json.dumps(pack, ensure_ascii=False)
-        await db.execute("""
-            INSERT OR REPLACE INTO players (chat_id, user_id, user_name, pack_json, is_alive)
-            VALUES (?, ?, ?, ?, 1)
-        """, (chat_id, user_id, user_name, pack_json))
-        await db.commit()
-
-async def get_players(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT user_name, user_id, pack_json FROM players WHERE chat_id = ?", (chat_id,)) as cursor:
-            return await cursor.fetchall()
-
-async def get_alive_players(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT user_name, user_id FROM players WHERE chat_id = ? AND is_alive = 1", (chat_id,)) as cursor:
-            return await cursor.fetchall()
-
-async def get_player_pack(chat_id: int, user_id: int) -> dict:
-    async with connect_db() as db:
-        async with db.execute("SELECT pack_json FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-            return {}
-
-async def update_player_pack(chat_id: int, user_id: int, pack: dict):
-    async with connect_db() as db:
-        pack_json = json.dumps(pack, ensure_ascii=False)
-        await db.execute("UPDATE players SET pack_json = ? WHERE chat_id = ? AND user_id = ?", (pack_json, chat_id, user_id))
-        await db.commit()
-
-async def set_private_card_message_id(chat_id: int, user_id: int, message_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET private_card_message_id = ? WHERE chat_id = ? AND user_id = ?", (message_id, chat_id, user_id))
-        await db.commit()
-
-async def find_active_player_chat(user_id: int):
-    """Возвращает чат активной игры, в которой участвует пользователь."""
-    async with connect_db() as db:
-        async with db.execute(
-            """SELECT p.chat_id
-               FROM players p
-               JOIN lobbies l ON l.chat_id = p.chat_id
-              WHERE p.user_id = ?
-                AND l.status NOT IN ('ended', 'cancelled')
-              ORDER BY CASE WHEN l.status = 'lobby' THEN 0 ELSE 1 END, l.current_round DESC
-              LIMIT 1""",
-            (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
-
-
-async def get_private_card_message_id(chat_id: int, user_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT private_card_message_id FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-# --- СПЕЦ-КАРТЫ (МЕТОДЫ) ---
-
-async def set_player_special_card(chat_id: int, user_id: int, card_code: str):
-    async with connect_db() as db:
-        await db.execute("""
-            UPDATE players 
-            SET special_card = ?, special_used = 0, is_blocked = 0, shield_active = 0 
-            WHERE chat_id = ? AND user_id = ?
-        """, (card_code, chat_id, user_id))
-        await db.commit()
-
-async def get_player_special_info(chat_id: int, user_id: int):
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT special_card, special_used, is_blocked, shield_active FROM players WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id)
-        ) as cursor:
-            return await cursor.fetchone()
-
-async def update_player_special_status(chat_id: int, user_id: int, special_used: int = None, is_blocked: int = None, shield_active: int = None):
-    async with connect_db() as db:
-        if special_used is not None:
-            await db.execute("UPDATE players SET special_used = ? WHERE chat_id = ? AND user_id = ?", (special_used, chat_id, user_id))
-        if is_blocked is not None:
-            await db.execute("UPDATE players SET is_blocked = ? WHERE chat_id = ? AND user_id = ?", (is_blocked, chat_id, user_id))
-        if shield_active is not None:
-            await db.execute("UPDATE players SET shield_active = ? WHERE chat_id = ? AND user_id = ?", (shield_active, chat_id, user_id))
-        await db.commit()
-
-async def set_muted_round(chat_id: int, user_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET muted_round = ? WHERE chat_id = ? AND user_id = ?", (round_num, chat_id, user_id))
-        await db.commit()
-
-async def is_muted_for_round(chat_id: int, user_id: int, round_num: int) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT muted_round FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return bool(row and row[0] == round_num)
-
-async def set_captain(chat_id: int, user_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET current_turn_user_id = current_turn_user_id WHERE chat_id = ?", (chat_id,))
-        # Храним скрытого капитана в отдельной таблице.
-        await db.execute("CREATE TABLE IF NOT EXISTS hidden_captains (chat_id INTEGER PRIMARY KEY, user_id INTEGER, round_num INTEGER)")
-        await db.execute("INSERT OR REPLACE INTO hidden_captains (chat_id, user_id, round_num) VALUES (?, ?, ?)", (chat_id, user_id, round_num))
-        await db.commit()
-
-async def get_captain(chat_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS hidden_captains (chat_id INTEGER PRIMARY KEY, user_id INTEGER, round_num INTEGER)")
-        async with db.execute("SELECT user_id FROM hidden_captains WHERE chat_id = ? AND round_num = ?", (chat_id, round_num)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
-
-async def set_vote_redirect(chat_id: int, user_id: int, target_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET vote_redirect_target = ?, vote_redirect_round = ? WHERE chat_id = ? AND user_id = ?", (target_id, round_num, chat_id, user_id))
-        await db.commit()
-
-async def get_vote_redirect(chat_id: int, round_num: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT user_id, vote_redirect_target FROM players WHERE chat_id = ? AND vote_redirect_round = ? AND vote_redirect_target != 0", (chat_id, round_num)) as cursor:
-            row = await cursor.fetchone()
-            return (row[0], row[1]) if row else None
-
-async def clear_vote_redirect(chat_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET vote_redirect_target = 0, vote_redirect_round = 0 WHERE chat_id = ? AND vote_redirect_round = ?", (chat_id, round_num))
-        await db.commit()
-
-async def redirect_votes(chat_id: int, owner_id: int, target_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE votes SET target_id = ? WHERE chat_id = ? AND target_id = ?", (target_id, chat_id, owner_id))
-        await db.commit()
-
-# --- ВСКРЫТИЕ ХАРАКТЕРИСТИК ---
-
-async def record_reveal(chat_id: int, user_id: int, trait: str, round_num: int):
-    async with connect_db() as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO reveals (chat_id, user_id, trait, round_num) VALUES (?, ?, ?, ?)",
-            (chat_id, user_id, trait, round_num)
+    elif card_code == "yellow_card":
+        await db.update_player_special_status(chat_id, target_user_id, is_blocked=1)
+        await bot.send_message(
+            chat_id,
+            f"🟨 <b>ЖЕЛТАЯ КАРТОЧКА!</b> <b>{html.escape(actor.first_name)}</b> заблокировал спец-карту игрока <b>{html.escape(target_name)}</b> до конца игры!",
+            parse_mode="HTML"
         )
-        await db.commit()
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-async def is_trait_revealed(chat_id: int, user_id: int, trait: str) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND trait = ?", (chat_id, user_id, trait)) as cursor:
-            return await cursor.fetchone() is not None
+    elif card_code == "flash":
+        unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
+        if not unrevealed:
+            await callback.message.edit_text(f"📸 У игрока {html.escape(target_name)} нет закрытых карт!")
+        else:
+            builder = InlineKeyboardBuilder()
+            for u_trait in unrevealed:
+                builder.button(
+                    text=f"📸 {TRAIT_LABELS.get(u_trait, u_trait)}", 
+                    callback_data=f"act_flash:{u_trait}:{target_user_id}:{chat_id}"
+                )
+            builder.adjust(2)
+            await callback.message.edit_text(
+                f"📸 <b>ВСПЫШКА:</b> Выбери, какую закрытую карту игрока <b>{html.escape(target_name)}</b> принудительно вскрыть в общий чат:",
+                reply_markup=builder.as_markup(), parse_mode="HTML"
+            )
 
-async def has_revealed_in_round(chat_id: int, user_id: int, round_num: int) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND round_num = ?", (chat_id, user_id, round_num)) as cursor:
-            return await cursor.fetchone() is not None
+    elif card_code == "chaos":
+        actor_unrevealed = await db.get_unrevealed_traits(chat_id, actor.id)
+        target_unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
 
-async def get_unrevealed_traits(chat_id: int, user_id: int):
-    all_traits = ["position", "age", "price", "health", "skill", "inventory", "secret"]
-    async with connect_db() as db:
-        async with db.execute("SELECT trait FROM reveals WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            revealed = [row[0] for row in await cursor.fetchall()]
-    return [t for t in all_traits if t not in revealed]
+        if actor_unrevealed and target_unrevealed:
+            a_trait = random.choice(actor_unrevealed)
+            t_trait = random.choice(target_unrevealed)
 
-# --- ГОЛОСОВАНИЕ И ИСКЛЮЧЕНИЕ ---
+            actor_pack = await db.get_player_pack(chat_id, actor.id)
+            target_pack = await db.get_player_pack(chat_id, target_user_id)
 
-async def clear_votes(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-        await db.commit()
+            actor_pack[a_trait], target_pack[t_trait] = target_pack[t_trait], actor_pack[a_trait]
 
-async def has_user_voted(chat_id: int, voter_id: int) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT 1 FROM votes WHERE chat_id = ? AND voter_id = ?", (chat_id, voter_id)) as cursor:
-            return await cursor.fetchone() is not None
+            await db.update_player_pack(chat_id, actor.id, actor_pack)
+            await db.update_player_pack(chat_id, target_user_id, target_pack)
+            await refresh_private_card(chat_id, actor.id)
+            await refresh_private_card(chat_id, target_user_id)
 
-async def get_non_voted_alive_players(chat_id: int):
-    async with connect_db() as db:
-        query = """
-            SELECT p.user_id, p.user_name 
-            FROM players p
-            WHERE p.chat_id = ? AND p.is_alive = 1
-            AND p.user_id NOT IN (SELECT voter_id FROM votes WHERE chat_id = ?)
-        """
-        async with db.execute(query, (chat_id, chat_id)) as cursor:
-            return await cursor.fetchall()
+            await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(a_trait, a_trait)}] случайно поменялась с закрытой картой {target_name}!", parse_mode="HTML")
+            await bot.send_message(target_user_id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(t_trait, t_trait)}] случайно поменялась с чужой закрытой картой!", parse_mode="HTML")
+        await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
-async def add_vote(chat_id: int, voter_id: int, target_id: int):
-    async with connect_db() as db:
-        await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
-        await db.execute("UPDATE lobbies SET total_votes = COALESCE(total_votes, 0) + 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
+    await callback.answer()
 
-async def get_username(chat_id: int, user_id: int) -> str:
-    async with connect_db() as db:
-        async with db.execute("SELECT user_name FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else "Игрок"
+@dp.callback_query(F.data.startswith("act_flash:"))
+async def process_flash_reveal(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    trait = parts[1]
+    target_user_id = int(parts[2])
+    chat_id = int(parts[3])
+    actor = callback.from_user
 
-async def get_voters_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT COUNT(*) FROM votes WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+    alive_players = await db.get_alive_players(chat_id)
+    if actor.id not in {p[1] for p in alive_players}:
+        return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
 
-async def get_skip_votes_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        query = """
-            SELECT COALESCE(SUM(CASE WHEN hc.user_id = v.voter_id THEN 2 ELSE 1 END), 0)
-            FROM votes v
-            LEFT JOIN hidden_captains hc
-              ON hc.chat_id = v.chat_id
-             AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
-            WHERE v.chat_id = ? AND v.target_id = 0
-        """
-        async with db.execute(query, (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return int(row[0] or 0)
+    target_name = await db.get_username(chat_id, target_user_id)
+    pack = await db.get_player_pack(chat_id, target_user_id)
+    val = pack.get(trait, "-")
+    if trait == "age" and val != "-":
+        val = f"{val} лет"
 
-async def get_votes_detailed(chat_id: int):
-    async with connect_db() as db:
-        query = """
-            SELECT v.target_id, p.user_name,
-                   SUM(CASE WHEN hc.user_id = v.voter_id THEN 2 ELSE 1 END) as cnt
-            FROM votes v
-            JOIN players p ON v.chat_id = p.chat_id AND v.target_id = p.user_id
-            LEFT JOIN hidden_captains hc
-              ON hc.chat_id = v.chat_id
-             AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
-            WHERE v.chat_id = ? AND v.target_id != 0
-            GROUP BY v.target_id, p.user_name
-            ORDER BY cnt DESC
-        """
-        async with db.execute(query, (chat_id,)) as cursor:
-            return await cursor.fetchall()
+    await db.record_reveal(chat_id, target_user_id, trait, 0)
 
-async def eliminate_player(chat_id: int, user_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET is_alive = 0 WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-        await db.commit()
+    image_url = CARD_IMAGES.get(trait, "")
+    msg_text = (
+        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> '
+        f'<b>{html.escape(actor.first_name)}</b> принудительно вскрывает у '
+        f'<b>{html.escape(target_name)}</b> карту <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n'
+        f'└ 👉 <b>{html.escape(str(val))}</b>'
+    )
+    preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
+
+    await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
+    await callback.message.edit_text(f"✅ Ты успешно вскрыл карту [{TRAIT_LABELS.get(trait, trait)}] игрока {html.escape(target_name)}!")
+    await callback.answer()
+
+# --- СТАРТ ИГРЫ И ВЫДАЧА СПЕЦ-КАРТ ---
+
+@dp.callback_query(F.data == "start_game")
+async def start_game(callback: types.CallbackQuery):
+    try:
+        chat_id = callback.message.chat.id
+        lobby = await db.get_lobby(chat_id)
+        if not lobby:
+            return await callback.answer("❌ Это лобби уже не существует.", show_alert=True)
+        if lobby[0] != "lobby":
+            return await callback.answer("⚠️ Игра уже запущена или завершена.", show_alert=True)
+
+        # Атомарный lock: два быстрых нажатия «Старт» не смогут создать две игры.
+        if not await db.try_start_lobby(chat_id):
+            return await callback.answer("⚠️ Игра уже запускается.", show_alert=True)
+
+        players = await db.get_players(chat_id)
+        num_players = len(players)
+        
+        if num_players < 3:
+            await db.set_lobby_status(chat_id, "lobby")
+            return await callback.answer(f"⚠️ Сейчас участников: {num_players}. Нужно минимум 3 человека!", show_alert=True)
+
+        await callback.answer("Игра начинается!")
+        
+        scen = cards.generate_scenario(num_players)
+        await db.update_lobby_scenario(chat_id, scen["text"], 1)
+
+        packs = cards.generate_game_packs(num_players, scen["line"])
+        # Баланс спец-карт: карта обмена характеристикой (swap_*)
+        # может достаться только ОДНОМУ игроку за матч.
+        # Остальные игроки получают карты из пула без обменов.
+        swap_cards = [code for code in SPECIAL_CARD_NAMES if code.startswith("swap_")]
+        non_swap_cards = [code for code in SPECIAL_CARD_NAMES if not code.startswith("swap_")]
+
+        if num_players >= 1:
+            # Ровно один случайный игрок получает один из 7 видов обмена.
+            exchange_card = random.choice(swap_cards)
+            assigned_cards = [None] * num_players
+            exchange_idx = random.randrange(num_players)
+            assigned_cards[exchange_idx] = exchange_card
+
+            remaining = num_players - 1
+            if remaining <= len(non_swap_cards):
+                other_cards = random.sample(non_swap_cards, remaining)
+            else:
+                other_cards = random.sample(non_swap_cards, len(non_swap_cards))
+                other_cards += random.choices(non_swap_cards, k=remaining - len(non_swap_cards))
+
+            random.shuffle(other_cards)
+            other_idx = 0
+            for i in range(num_players):
+                if assigned_cards[i] is None:
+                    assigned_cards[i] = other_cards[other_idx]
+                    other_idx += 1
+
+        failed_pm_players = []
+
+        for idx, (p_name, p_id, _) in enumerate(players):
+            pack = packs[idx]
+            await db.add_player(chat_id, p_id, p_name, pack)
+
+            assigned_spec = assigned_cards[idx]
+            await db.set_player_special_card(chat_id, p_id, assigned_spec)
+            
+            pm_card_text = await build_private_card_text(chat_id, p_id)
+            markup = await build_reveal_keyboard(chat_id, p_id)
+            try:
+                pm_message = await bot.send_message(p_id, pm_card_text, reply_markup=markup, parse_mode="HTML")
+                await db.set_private_card_message_id(chat_id, p_id, pm_message.message_id)
+            except Exception:
+                failed_pm_players.append(f"<a href='tg://user?id={p_id}'>{html.escape(p_name)}</a>")
+
+        players_list_str = "\n".join([f"├ 👤 {html.escape(p[0])}" for p in players[:-1]] + [f"└ 👤 {html.escape(players[-1][0])}"])
+        pm_warning = f"\n\n⚠️ <b>ВНИМАНИЕ!</b> Не получили карты в ЛС:\n" + ", ".join(failed_pm_players) if failed_pm_players else ""
+
+        scenario_msg = (
+            f"🎬 <b>СЦЕНАРИЙ ИГРЫ</b>\n───────────────────\n"
+            f"{scen['text']}\n\n"
+            f"👥 <b>ПРЕТЕНДЕНТЫ НА КОНТРАКТ:</b>\n{players_list_str}\n"
+            f"───────────────────\n"
+            f"📩 <i>Карточки и спец-карты отправлены в ЛС.</i>{pm_warning}\n"
+            f"⏳ <i>Раунд 1 начнется через 10 секунд!</i>"
+        )
+        await bot.send_message(chat_id, scenario_msg, parse_mode="HTML")
+
+        await asyncio.sleep(10)
+        asyncio.create_task(start_round_flow(chat_id, 1))
+
+    except Exception as e:
+        try:
+            lobby = await db.get_lobby(chat_id)
+            if lobby and lobby[0] == "starting":
+                await db.set_lobby_status(chat_id, "cancelled")
+        except Exception:
+            pass
+        await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
+
+# --- КОМАНДЫ БОТА ---
+
+def get_rank(wins: int) -> str:
+    if wins >= 50:
+        return "🐐 Икона Бункера"
+    if wins >= 35:
+        return "💎 Легенда"
+    if wins >= 20:
+        return "🏆 Мастер Бункера"
+    if wins >= 10:
+        return "👑 Ветеран Бункера"
+    if wins >= 6:
+        return "🔥 Опасный соперник"
+    if wins >= 3:
+        return "🏃 Опытный игрок"
+    if wins >= 1:
+        return "⚽ Любитель"
+    return "🥾 Новичок"
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    await message.answer(await economy_profile_text(message.from_user.id, message.from_user.first_name), parse_mode="HTML")
+
+async def private_menu_markup():
+    builder = InlineKeyboardBuilder()
+    for text, data in [("👤 Профиль","menu:profile"),("🪙 Валюта / Квесты","menu:wallet"),("🛍 Магазин","menu:shop"),("🎒 Мои покупки","menu:inventory"),("🃏 Моя карточка","menu:card"),("📜 Правила","menu:rules")]:
+        builder.button(text=text, callback_data=data)
+    try:
+        me = await bot.get_me(); builder.button(text="➕ Добавить в группу", url=f"https://t.me/{me.username}?startgroup=true")
+    except Exception: pass
+    builder.adjust(2,2,2,1)
+    return builder.as_markup()
+
+async def private_welcome_text():
+    return (
+        "⚽️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b>\n"
+        "───────────────────\n"
+        "Социальная футбольная игра на блеф, обсуждение и голосование.\n\n"
+        "👇 Выбери нужный раздел:"
+    )
+
+@dp.callback_query(F.data == "menu:profile")
+async def menu_profile(callback: types.CallbackQuery):
+    await callback.message.edit_text(await economy_profile_text(callback.from_user.id, callback.from_user.first_name), reply_markup=await private_menu_markup(), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data == "menu:wallet")
+async def menu_wallet(callback: types.CallbackQuery):
+    await callback.message.edit_text(await wallet_text(callback.from_user.id), reply_markup=await private_menu_markup(), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data == "menu:shop")
+async def menu_shop(callback: types.CallbackQuery):
+    await callback.message.edit_text(await economy_shop_text(callback.from_user.id), reply_markup=await shop_keyboard(callback.from_user.id), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data == "menu:inventory")
+async def menu_inventory(callback: types.CallbackQuery):
+    eq = await db.get_equipped(callback.from_user.id)
+    owned = [item["name"] for item_id,item in SHOP_ITEMS.items() if await db.has_purchase(callback.from_user.id,item_id)]
+    text = "🎒 <b>МОИ ПОКУПКИ</b>\n───────────────────\n" + ("\n".join(f"• {html.escape(x)}" for x in owned) if owned else "Пока ничего нет.")
+    text += f"\n\n🏷 Титул: {html.escape(SHOP_ITEMS.get(eq['title'],{}).get('name','по умолчанию'))}"
+    text += f"\n🖼 Рамка: {html.escape(SHOP_ITEMS.get(eq['frame'],{}).get('name','по умолчанию'))}"
+    text += f"\n🎴 Тема карточки: {html.escape(SHOP_ITEMS.get(eq['card_theme'],{}).get('name','Классика'))}"
+    text += f"\n🏆 Эффект победы: {html.escape(SHOP_ITEMS.get(eq['victory'],{}).get('name','Классика'))}"
+    await callback.message.edit_text(text, reply_markup=await private_menu_markup(), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data.startswith("shop:"))
+async def shop_action(callback: types.CallbackQuery):
+    _, action, item_id = callback.data.split(":",2); item=SHOP_ITEMS.get(item_id)
+    if not item: return await callback.answer("❌ Товар не найден.", show_alert=True)
+    if action == "buy":
+        if not await db.purchase_item(callback.from_user.id,item_id,item["price"]): return await callback.answer("🪙 Не хватает монет или предмет уже куплен.", show_alert=True)
+        await db.equip_item(callback.from_user.id,item["type"],item_id); await callback.answer(f"✅ Куплено: {item['name']}")
+    else:
+        if not await db.has_purchase(callback.from_user.id,item_id): return await callback.answer("Сначала купи предмет.", show_alert=True)
+        await db.equip_item(callback.from_user.id,item["type"],item_id); await callback.answer(f"⚙️ Экипировано: {item['name']}")
+    await callback.message.edit_text(await economy_shop_text(callback.from_user.id), reply_markup=await shop_keyboard(callback.from_user.id), parse_mode="HTML")
+
+@dp.callback_query(F.data == "menu:card")
+async def menu_card(callback: types.CallbackQuery):
+    if callback.message.chat.type != "private":
+        return await callback.answer("🃏 Карточка доступна только в личке бота.", show_alert=True)
+    active = await db.find_active_player_chat(callback.from_user.id)
+    if not active:
+        return await callback.answer("ℹ️ Сейчас ты не участвуешь в активной игре.", show_alert=True)
+    chat_id = active[0]
+    await callback.message.edit_text(
+        await build_private_card_text(chat_id, callback.from_user.id),
+        reply_markup=await build_reveal_keyboard(chat_id, callback.from_user.id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu:rules")
+async def menu_rules(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        await get_rules_text(), reply_markup=await private_menu_markup(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "menu:home")
+async def menu_home(callback: types.CallbackQuery):
+    await callback.message.edit_text(await private_welcome_text(), reply_markup=await private_menu_markup(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    if message.chat.type == "private":
+        await message.answer(await private_welcome_text(), reply_markup=await private_menu_markup(), parse_mode="HTML")
+    else:
+        await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nВведи <code>/game</code>, чтобы создать игру.", parse_mode="HTML")
+
+async def get_rules_text():
+    return (
+        "📜 <b>ПРАВИЛА «ФУТБОЛЬНОГО БУНКЕРА»</b>\n───────────────────\n"
+        "⚽ <b>Цель:</b> остаться в финальной паре и доказать ИИ, что команда подходит под сценарий.\n\n"
+        "🃏 <b>Карточки:</b> позиция, возраст, цена, здоровье, навык, багаж и секрет. В каждом раунде по очереди раскрывается одна карта.\n\n"
+        "💬 <b>Обсуждение:</b> после вскрытия игроки обсуждают состав. Некоторые спецкарты можно использовать скрытно именно здесь.\n\n"
+        "🗳 <b>Голосование:</b> нельзя голосовать за себя. Игрок с наибольшим числом голосов выбывает.\n\n"
+        "⏭️ <b>СКИП:</b> можно выбрать максимум 3 раза за игру. Если скип набирает максимум или сравнивается с лидером, никто не выбывает. Пенальти за скип не запускается.\n\n"
+        "🤝 <b>Ничья:</b> при равенстве лидеров никто не выбывает. Две ничьи подряд запускают пенальти.\n\n"
+        "🎴 <b>Спецкарты:</b> одноразовые и могут менять ход игры. Некоторые действия скрыты от группы. Карты обмена характеристиками получает только один игрок за матч.\n\n"
+        "🏆 <b>Финал:</b> оставшиеся игроки проходят проверку ИИ-судьи. После окончания бот раскрывает карточки всех участников.\n\n"
+        "📋 <b>Команды:</b> /game — игра в группе, /profile — статистика, /card — актуальная карточка в ЛС, /stop — остановить игру."
+    )
+
+@dp.message(Command("rules"))
+async def cmd_rules(message: types.Message):
+    text = await get_rules_text()
+    if message.chat.type == "private":
+        await message.answer(text, reply_markup=await private_menu_markup(), parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("card"))
+async def cmd_card(message: types.Message):
+    if message.chat.type != "private":
+        return await message.answer("🃏 <b>/card</b> работает только в личных сообщениях с ботом.", parse_mode="HTML")
+    active = await db.find_active_player_chat(message.from_user.id)
+    if not active:
+        return await message.answer("ℹ️ Сейчас ты не участвуешь в активной игре.")
+    chat_id = active[0]
+    await message.answer(
+        await build_private_card_text(chat_id, message.from_user.id),
+        reply_markup=await build_reveal_keyboard(chat_id, message.from_user.id),
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("wallet"))
+async def cmd_wallet(message: types.Message):
+    if message.chat.type != "private": return await message.answer("🪙 Кошелёк доступен только в ЛС бота.")
+    await message.answer(await wallet_text(message.from_user.id), reply_markup=await private_menu_markup(), parse_mode="HTML")
+
+@dp.message(Command("shop"))
+async def cmd_shop(message: types.Message):
+    if message.chat.type != "private": return await message.answer("🛍 Магазин доступен только в ЛС бота.")
+    await message.answer(await economy_shop_text(message.from_user.id), reply_markup=await shop_keyboard(message.from_user.id), parse_mode="HTML")
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: types.Message):
+    if message.chat.type == "private": return await message.answer("Команду /stop нужно вводить в групповом чате игры!")
+    chat_id=message.chat.id
+    if not await is_game_active(chat_id): return await message.answer("⚠️ В этом чате нет активной игры.")
+    participant_ids={p[1] for p in await db.get_players(chat_id)}
+    if message.from_user.id not in participant_ids: return await message.answer("⛔ Остановить игру может только участник текущей игры.")
+    if not await db.cancel_lobby(chat_id): return await message.answer("⚠️ Игра уже остановлена или завершена.")
+    await message.answer("🛑 <b>ИГРА ПРИНУДИТЕЛЬНО ОСТАНОВЛЕНА!</b>\n───────────────────\nУчастник остановил текущую сессию.", parse_mode="HTML")
+@dp.message(Command("game"))
+async def cmd_game(message: types.Message):
+    if message.chat.type == "private":
+        return await message.answer("Играть можно только в групповых чатах!")
+
+    if await is_game_active(message.chat.id):
+        lobby = await db.get_lobby(message.chat.id)
+        status = lobby[0] if lobby else "active"
+        return await message.answer(
+            "⚠️ <b>В этом чате уже есть активная игра.</b>\n"
+            f"Текущий статус: <code>{html.escape(str(status))}</code>\n\n"
+            "Сначала завершите её или используйте /stop.",
+            parse_mode="HTML"
+        )
+
+    created = await db.create_lobby(message.chat.id, message.from_user.id)
+    if not created:
+        return await message.answer("⚠️ В этой группе уже идёт игра или идёт набор. Дождитесь её окончания.")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚽️ Вступить в игру", callback_data="join_game")
+    builder.button(text="🚀 Начать игру (от 3 игроков)", callback_data="start_game")
+    builder.adjust(1)
+
+    await message.answer(
+        f"🎮 <b>НАБОР В ФУТБОЛЬНЫЙ БУНКЕР</b>\n───────────────────\n👑 <b>Организатор:</b> {html.escape(message.from_user.first_name)}\n👥 <b>Участников:</b> 0",
+        reply_markup=builder.as_markup(), parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "join_game")
+async def join_game(callback: types.CallbackQuery):
+    try:
+        chat_id = callback.message.chat.id
+        user = callback.from_user
+        empty_pack = {"position": "-", "age": "-", "price": "-", "health": "-", "skill": "-", "inventory": "-", "secret": "-"}
+        await db.add_player(chat_id, user.id, user.first_name, empty_pack)
+        players = await db.get_players(chat_id)
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⚽️ Вступить в игру", callback_data="join_game")
+        builder.button(text="🚀 Начать игру (от 3 игроков)", callback_data="start_game")
+        builder.adjust(1)
+
+        player_list = "\n".join([f"├ 👤 {html.escape(p[0])}" for p in players[:-1]] + [f"└ 👤 {html.escape(players[-1][0])}"])
+        await callback.message.edit_text(f"🎮 <b>НАБОР В ФУТБОЛЬНЫЙ БУНКЕР</b>\n───────────────────\n👥 <b>Участники ({len(players)}):</b>\n{player_list}", reply_markup=builder.as_markup(), parse_mode="HTML")
+        await callback.answer("Ты успешно вступил в игру!")
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка входа: {e}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("reveal:"))
+async def process_reveal(callback: types.CallbackQuery):
+    try:
+        parts = callback.data.split(":")
+        trait = parts[1]
+        target_chat_id = int(parts[2])
+        user = callback.from_user
+
+        if not await is_game_active(target_chat_id): return await callback.answer("❌ Игра завершена!", show_alert=True)
+        
+        alive_players = await db.get_alive_players(target_chat_id)
+        if user.id not in {p[1] for p in alive_players}:
+            return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
+
+        lobby = await db.get_lobby(target_chat_id)
+        current_round = lobby[4]
+
+        if await db.get_current_turn(target_chat_id) != user.id:
+            return await callback.answer("⚠️ Сейчас не твой ход!", show_alert=True)
+
+        if await db.is_trait_revealed(target_chat_id, user.id, trait):
+            return await callback.answer("⚠️ Карта уже открыта!", show_alert=True)
+
+        if await db.has_revealed_in_round(target_chat_id, user.id, current_round):
+            return await callback.answer(f"⚠️ В этом раунде ты уже вскрывал карту!", show_alert=True)
+
+        pack = await db.get_player_pack(target_chat_id, user.id)
+        val = pack.get(trait, "-")
+        if trait == "age" and val != "-": val = f"{val} лет"
+
+        await db.record_reveal(target_chat_id, user.id, trait, current_round)
+        await db.record_daily_event(user.id, "reveal")
+        image_url = CARD_IMAGES.get(trait, "")
+
+        msg_text = f'<a href="{image_url}">&#8203;</a>🔓 <b>{html.escape(user.first_name)}</b> вскрывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n└ 👉 <b>{html.escape(str(val))}</b>'
+        preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
+
+        await bot.send_message(target_chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
+        new_markup = await build_reveal_keyboard(target_chat_id, user.id)
+        await callback.message.edit_reply_markup(reply_markup=new_markup)
+        await callback.answer(f"Карта {TRAIT_LABELS.get(trait, trait)} открыта!")
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+# --- ГОЛОСОВАНИЕ И ИТОГИ ---
+
+async def start_voting_flow(chat_id: int, round_num: int):
+    if not await is_game_active(chat_id): return
+    alive_players = await db.get_alive_players(chat_id)
+    if len(alive_players) <= 2:
+        await announce_winners_and_end(chat_id, alive_players)
+        return
+
+    if not await db.transition_lobby_status(chat_id, "voting", ["discussion"], round_num):
+        return
+    await db.clear_votes(chat_id)
+    summary_text = await build_players_summary(chat_id)
+
+    builder = InlineKeyboardBuilder()
+    for p_name, p_id in alive_players:
+        builder.button(text=f"❌ {p_name}", callback_data=f"vote:{p_id}")
+
+    skip_count = await db.get_skip_count(chat_id)
+    if skip_count < 3:
+        builder.button(text=f"⏭️ СКИП ({skip_count}/3)", callback_data="vote:0")
+    builder.adjust(2)
+
+    await bot.send_message(
+        chat_id,
+        f"📋 <b>ОТКРЫТЫЕ ХАРАКТЕРИСТИКИ</b>\n\n{summary_text}\n───────────────────\n🗳 <b>ГОЛОСОВАНИЕ (Раунд {round_num})</b>\n⏭️ <b>Скип:</b> можно пропустить максимум 3 голосования за игру. Скип работает как ничья — никто не выбывает, пенальти за него не будет.\n⏳ Время: 1 минута 45 секунд.",
+        reply_markup=builder.as_markup(), parse_mode="HTML"
+    )
+    await asyncio.sleep(105)
+
+    lobby = await db.get_lobby(chat_id)
+    if lobby and lobby[0] == "voting" and lobby[4] == round_num:
+        non_voters = await db.get_non_voted_alive_players(chat_id)
+        for nv_id, nv_name in non_voters:
+            await db.eliminate_player(chat_id, nv_id)
+            await bot.send_message(chat_id, f"👞 <b>{html.escape(nv_name)}</b> исключен за AFK!", parse_mode="HTML")
+        await finish_voting_flow(chat_id)
+
+@dp.callback_query(F.data.startswith("vote:"))
+async def process_vote(callback: types.CallbackQuery):
+    try:
+        chat_id = callback.message.chat.id
+        voter = callback.from_user
+        if not await is_game_active(chat_id): return await callback.answer("❌ Нет активной игры!", show_alert=True)
+        
+        alive_players = await db.get_alive_players(chat_id)
+        alive_ids = {p[1] for p in alive_players}
+        if voter.id not in alive_ids:
+            return await callback.answer("❌ Выбывшие участники и зрители не могут голосовать!", show_alert=True)
+
+        target_id = int(callback.data.split(":")[1])
+        if target_id != 0 and voter.id == target_id:
+            return await callback.answer("⚠️ За себя голосовать нельзя!", show_alert=True)
+        if target_id != 0 and target_id not in alive_ids:
+            return await callback.answer("❌ Этот игрок уже выбыл.", show_alert=True)
+        if await db.has_user_voted(chat_id, voter.id):
+            return await callback.answer("⚠️ Ты уже проголосовал!", show_alert=True)
+
+        if target_id == 0:
+            skip_count = await db.get_skip_count(chat_id)
+            if skip_count >= 3:
+                return await callback.answer("⛔ Лимит скипов (3) уже исчерпан.", show_alert=True)
+            await db.add_vote(chat_id, voter.id, 0)
+            await db.record_daily_event(voter.id, "vote")
+            await callback.answer("⏭️ Скип принят!")
+            # Не раскрываем в группе, кто именно выбрал скип.
+            await bot.send_message(chat_id, f"⏭️ <b>{html.escape(voter.first_name)}</b> выбрал СКИП.", parse_mode="HTML")
+        else:
+            target_name = await db.get_username(chat_id, target_id)
+            await db.add_vote(chat_id, voter.id, target_id)
+            await db.record_daily_event(voter.id, "vote")
+            await callback.answer("Голос принят!")
+            await bot.send_message(chat_id, f"🗳 <b>{html.escape(voter.first_name)}</b> проголосовал против <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
+
+        if await db.get_voters_count(chat_id) >= len(alive_players):
+            await finish_voting_flow(chat_id)
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка голосования: {e}", show_alert=True)
+
+async def finish_voting_flow(chat_id: int):
+    lobby = await db.get_lobby(chat_id)
+    if not lobby or lobby[0] not in ("voting", "discussion"):
+        return
+    if not await db.transition_lobby_status(chat_id, "finishing", ["voting", "discussion"]):
+        return
+
+    votes_data = await db.get_votes_detailed(chat_id)
+    alive = await db.get_alive_players(chat_id)
+
+    if len(alive) <= 2:
+        await announce_winners_and_end(chat_id, alive)
+        return
+
+    # Если все голоса отданы за СКИП, votes_data пустой — этот случай тоже должен считаться скипом.
+    skip_votes = await db.get_skip_votes_count(chat_id)
+    if not votes_data and skip_votes > 0:
+        await db.increment_skip_count(chat_id)
+        await db.reset_tie_count(chat_id)
+        used_skips = await db.get_skip_count(chat_id)
+        await db.clear_votes(chat_id)
+        await bot.send_message(
+            chat_id,
+            f"⏭️ <b>СКИП!</b> Все голоса — за пропуск. Никто не выбывает.\nИспользовано скипов: <b>{used_skips}/3</b>.",
+            parse_mode="HTML"
+        )
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        return
+
+    if not votes_data:
+        await db.clear_votes(chat_id)
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        return
+
+    max_votes = votes_data[0][2]
+    top_candidates = [v for v in votes_data if v[2] == max_votes]
+
+    # «Подмена голосов» проверяется только после полного голосования.
+    # Никто в группе не узнает, что карта вообще была активирована.
+    redirect = await db.get_vote_redirect(chat_id, lobby[4])
+    if redirect:
+        owner_id, target_id = redirect
+        # В votes_data первая колонка — ТОТ, ПРОТИВ КОГО голосовали,
+        # поэтому нельзя искать owner_id среди кандидатов: владелец карты голосует против кого-то другого.
+        # Проверяем, что владелец карты действительно получил единоличное большинство.
+        owner_row = next((v for v in votes_data if v[0] == owner_id), None)
+        if owner_row is not None and owner_row[2] == max_votes and len(top_candidates) == 1:
+            await db.redirect_votes(chat_id, owner_id, target_id)
+            votes_data = await db.get_votes_detailed(chat_id)
+        await db.clear_vote_redirect(chat_id, lobby[4])
+
+    # СКИП — отдельный результат голосования. Если он набрал максимум
+    # (в том числе вровень с игроком), никто не выбывает и пенальти не запускается.
+    skip_votes = await db.get_skip_votes_count(chat_id)
+    max_votes = votes_data[0][2] if votes_data else 0
+    if skip_votes > 0 and skip_votes >= max_votes:
+        await db.increment_skip_count(chat_id)
+        await db.reset_tie_count(chat_id)
+        used_skips = await db.get_skip_count(chat_id)
+        await db.clear_votes(chat_id)
+        await bot.send_message(
+            chat_id,
+            f"⏭️ <b>СКИП!</b> Голосование пропущено — никто не выбывает.\n"
+            f"Использовано скипов: <b>{used_skips}/3</b>.",
+            parse_mode="HTML"
+        )
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+        return
+
+    max_votes = votes_data[0][2]
+    top_candidates = [v for v in votes_data if v[2] == max_votes]
+
+    if len(top_candidates) > 1:
+        await db.clear_votes(chat_id)
+        await db.increment_tie_count(chat_id)
+        tie_count = await db.get_tie_count(chat_id)
+        if tie_count >= 2:
+            # Две ничьи подряд — пенальти. Выбираем одного из лидеров.
+            chosen = random.choice(top_candidates)
+            kicked_id, kicked_name = chosen[0], chosen[1]
+            await db.eliminate_player(chat_id, kicked_id)
+            await db.reset_tie_count(chat_id)
+            await bot.send_message(
+                chat_id,
+                f"⚽ <b>ПЕНАЛЬТИ!</b> Две ничьи подряд. По пенальти из игры выбыл: <b>{html.escape(kicked_name)}</b>",
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_message(
+                chat_id,
+                f"🤝 <b>НИЧЬЯ!</b> Никто не выбывает. Переходим к Раунду {lobby[4] + 1}.",
+                parse_mode="HTML"
+            )
+            asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+            return
+    else:
+        kicked_id, kicked_name = top_candidates[0][0], top_candidates[0][1]
+        await db.reset_tie_count(chat_id)
+        await db.eliminate_player(chat_id, kicked_id)
+        await db.clear_votes(chat_id)
+        await bot.send_message(chat_id, f"❌ Из команды изгнан: <b>{html.escape(kicked_name)}</b>", parse_mode="HTML")
+
+    if len(await db.get_alive_players(chat_id)) <= 2:
+        await announce_winners_and_end(chat_id, await db.get_alive_players(chat_id))
+    else:
+        asyncio.create_task(start_round_flow(chat_id, lobby[4] + 1))
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_silent_mute(message: types.Message):
+    # Молчаливое подавление сообщений только в фазах обсуждения/голосования.
+    lobby = await db.get_lobby(message.chat.id)
+    if not lobby or lobby[0] not in ("discussion", "voting"):
+        return
+    if await db.is_muted_for_round(message.chat.id, message.from_user.id, lobby[4]):
+        try:
+            await message.delete()
+        except Exception:
+            # Если бот не администратор с правом удаления сообщений, скрытое молчание невозможно.
+            pass
+
+async def handle_ping(request):
+    return web.Response(text="Bot Alive")
+
+async def handle_health(request):
+    return web.json_response({"status": "ok", "service": "football-bunker"})
+
+async def main():
+    await db.init_db()
+    await economy_owner_grant()
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
