@@ -137,33 +137,42 @@ TRAIT_LABELS = {
 ECONOMY_OWNER_ID = int(os.getenv("ECONOMY_OWNER_ID", "1624967415"))
 OWNER_STARTING_COINS = 10000
 SHOP_ITEMS = {
-    "title_tactician": {"type": "title", "name": "🧠 Тактик", "price": 450, "desc": "Титул в профиле."},
-    "title_legend": {"type": "title", "name": "👑 Легенда Бункера", "price": 1200, "desc": "Редкий титул в профиле."},
-    "title_strategist": {"type": "title", "name": "🎯 Стратег", "price": 650, "desc": "Титул в профиле."},
-    "title_diplomat": {"type": "title", "name": "🕴️ Дипломат", "price": 700, "desc": "Титул в профиле."},
-    "title_authority": {"type": "title", "name": "👑 Авторитет", "price": 900, "desc": "Титул в профиле."},
-    "title_cold": {"type": "title", "name": "🧊 Хладнокровный", "price": 950, "desc": "Титул в профиле."},
-    "title_fox": {"type": "title", "name": "🦊 Лис", "price": 800, "desc": "Титул в профиле."},
-    "title_comb": {"type": "title", "name": "🧩 Комбинатор", "price": 850, "desc": "Титул в профиле."},
-    "title_winner": {"type": "title", "name": "🏆 Победитель", "price": 1000, "desc": "Титул в профиле."},
-    "title_veteran": {"type": "title", "name": "💎 Ветеран", "price": 1100, "desc": "Титул в профиле."},
-    "title_phenomenon": {"type": "title", "name": "⚡ Феномен", "price": 1400, "desc": "Титул в профиле."},
-    "title_maestro": {"type": "title", "name": "🐐 Маэстро", "price": 1600, "desc": "Титул в профиле."},
-    "title_manipulator": {"type": "title", "name": "🧠 Манипулятор", "price": 1250, "desc": "Титул в профиле."},
-    "victory_fire": {"type": "victory", "name": "🎆 Фейерверк победы", "price": 1300, "desc": "Эффект после победы."},
-    "victory_gold": {"type": "victory", "name": "🏆 Золотой финал", "price": 2500, "desc": "Эффект после победы."},
-    "victory_cold": {"type": "victory", "name": "🧊 Без лишних слов", "price": 1800, "desc": "Сдержанный эффект после победы."},
-    "victory_last": {"type": "victory", "name": "🚪 Последний в бункере", "price": 2200, "desc": "Эффект после победы."},
+    # Титулы
+    "title_tactician": {"type": "title", "name": "🧠 Тактик", "price": 450, "desc": "Отображается рядом с именем в профиле."},
+    "title_legend": {"type": "title", "name": "👑 Легенда Бункера", "price": 1200, "desc": "Редкий титул для профиля."},
+    "title_strategist": {"type": "title", "name": "🎯 Стратег", "price": 650, "desc": "Отображается рядом с именем в профиле."},
+    "title_diplomat": {"type": "title", "name": "🕴️ Дипломат", "price": 700, "desc": "Отображается рядом с именем в профиле."},
+    "title_authority": {"type": "title", "name": "👑 Авторитет", "price": 900, "desc": "Отображается рядом с именем в профиле."},
+    "title_cold": {"type": "title", "name": "🧊 Хладнокровный", "price": 950, "desc": "Отображается рядом с именем в профиле."},
+    "title_fox": {"type": "title", "name": "🦊 Лис", "price": 800, "desc": "Отображается рядом с именем в профиле."},
+    "title_comb": {"type": "title", "name": "🧩 Комбинатор", "price": 850, "desc": "Отображается рядом с именем в профиле."},
+    "title_winner": {"type": "title", "name": "🏆 Победитель", "price": 1000, "desc": "Отображается рядом с именем в профиле."},
+    "title_veteran": {"type": "title", "name": "💎 Ветеран", "price": 1100, "desc": "Отображается рядом с именем в профиле."},
+    "title_phenomenon": {"type": "title", "name": "⚡ Феномен", "price": 1400, "desc": "Отображается рядом с именем в профиле."},
+    "title_maestro": {"type": "title", "name": "🐐 Маэстро", "price": 1600, "desc": "Отображается рядом с именем в профиле."},
+    "title_manipulator": {"type": "title", "name": "🧠 Манипулятор", "price": 1250, "desc": "Отображается рядом с именем в профиле."},
+
+    # Фразы победы
+    "victory_fire": {"type": "victory", "name": "🎆 Фейерверк победы", "price": 1300, "desc": "После победы бот оформляет сообщение особым эффектом."},
+    "victory_gold": {"type": "victory", "name": "🏆 Золотой финал", "price": 2500, "desc": "Победа с более заметной подачей."},
+    "victory_goodbye": {"type": "victory", "name": "🚪 До свидания, дилетанты", "price": 1800, "desc": "Фраза после победы."},
+    "victory_whose_left": {"type": "victory", "name": "😈 Ну и кто тут лишний?", "price": 2000, "desc": "Фраза после победы."},
+    "victory_i_told": {"type": "victory", "name": "🗿 Я же говорил", "price": 1600, "desc": "Фраза после победы."},
+    "victory_cold": {"type": "victory", "name": "🧊 Без лишних слов", "price": 1800, "desc": "Сдержанная подача после победы."},
+    "victory_last": {"type": "victory", "name": "🚪 Последний в бункере", "price": 2200, "desc": "Фраза после победы."},
 }
+# Служебный титул создателя: не отображается в магазине, но считается покупкой владельца.
+SHOP_ITEMS["title_creator"] = {"type": "title", "name": "👑 Создатель игры", "price": 0, "desc": "Уникальный титул владельца Football Bunker."}
 
 # Платные товары только за Telegram Stars (XTR). Никакого P2W.
 STAR_PRODUCTS = {
-    "coins_1500": {"kind": "coins", "name": "1 500 🪙", "stars": 25, "coins": 1500, "desc": "Игровая валюта для косметики в магазине."},
-    "coins_5000": {"kind": "coins", "name": "5 000 🪙", "stars": 65, "coins": 5000, "desc": "Игровая валюта для косметики в магазине."},
-    "coins_12000": {"kind": "coins", "name": "12 000 🪙", "stars": 140, "coins": 12000, "desc": "Игровая валюта для косметики в магазине."},
-    "pack_cosmetic": {"kind": "pack", "name": "Набор оформления", "stars": 150, "items": ["title_phenomenon", "victory_cold"], "desc": "Два косметических предмета без игровых преимуществ."},
-    "premium_30": {"kind": "premium", "name": "Premium · 30 дней", "stars": 100, "days": 30, "desc": "Профиль Premium и эксклюзивная косметика на 30 дней."},
+    "coins_1500": {"kind": "coins", "name": "Получить 1 500 🪙", "stars": 25, "coins": 1500, "desc": "1 500 🪙 на баланс. Тратятся на косметику в обычном магазине."},
+    "coins_5000": {"kind": "coins", "name": "Получить 5 000 🪙", "stars": 65, "coins": 5000, "desc": "5 000 🪙 на баланс. Тратятся на косметику в обычном магазине."},
+    "coins_12000": {"kind": "coins", "name": "Получить 12 000 🪙", "stars": 140, "coins": 12000, "desc": "12 000 🪙 на баланс. Тратятся на косметику в обычном магазине."},
+    "pack_cosmetic": {"kind": "pack", "name": "Пакет «После финала»", "stars": 150, "items": ["title_phenomenon", "victory_goodbye"], "desc": "⚡ Феномен + 🚪 До свидания, дилетанты. Без игровых преимуществ."},
+    "premium_30": {"kind": "premium", "name": "Premium · 30 дней", "stars": 100, "days": 30, "desc": "Статус Premium на 30 дней. Без игровых преимуществ."},
 }
+
 
 CREATOR_ID = 1624967415
 
@@ -173,6 +182,9 @@ CARD_THEME_STYLE = {"classic": ("⚽", "─────────────�
 async def economy_owner_grant():
     if await db.owner_grant_if_needed(ECONOMY_OWNER_ID, OWNER_STARTING_COINS):
         print(f"[ECONOMY] Owner {ECONOMY_OWNER_ID} received {OWNER_STARTING_COINS} coins")
+    # Титул создателя не покупается и всегда возвращается владельцу игры.
+    await db.grant_purchase(ECONOMY_OWNER_ID, "title_creator")
+    await db.equip_item(ECONOMY_OWNER_ID, "title", "title_creator")
 
 async def economy_profile_text(user_id: int, username: str) -> str:
     games, wins = await db.get_user_profile(user_id, username)
@@ -193,42 +205,58 @@ async def economy_profile_text(user_id: int, username: str) -> str:
         f"🏆 Эффект победы: <b>{html.escape(victory or 'По умолчанию')}</b>"
     )
 
-async def economy_shop_text(user_id: int) -> str:
+async def economy_shop_text(user_id: int, category: str = "home") -> str:
     coins = await db.get_coins(user_id)
-    eq = await db.get_equipped(user_id)
-    lines = [
-        "🛍 <b>МАГАЗИН БУНКЕРА</b>",
-        "───────────────────",
-        f"🪙 Баланс: <b>{coins}</b>",
-        "",
-        "<i>Все товары косметические. Они не дают преимущества в игре.</i>",
-        ""
-    ]
-    for item_id, item in SHOP_ITEMS.items():
+    if category == "titles":
+        items = [(i,x) for i,x in SHOP_ITEMS.items() if x["type"] == "title"]
+        title = "🏷 <b>ТИТУЛЫ</b>"
+        note = "Титул отображается рядом с именем в профиле."
+    elif category == "phrases":
+        items = [(i,x) for i,x in SHOP_ITEMS.items() if x["type"] == "victory"]
+        title = "💬 <b>ФРАЗЫ ПОБЕДЫ</b>"
+        note = "Выбранная фраза появляется после твоей победы."
+    else:
+        return (
+            "🛍 <b>МАГАЗИН БУНКЕРА</b>\n"
+            "───────────────────\n"
+            f"🪙 Баланс: <b>{coins}</b>\n\n"
+            "Здесь только косметика — она не влияет на исход игры.\n\n"
+            "🏷 <b>Титулы</b>\n<i>То, что будет стоять рядом с твоим именем.</i>\n\n"
+            "💬 <b>Фразы победы</b>\n<i>То, что бот скажет после твоей победы.</i>"
+        )
+    lines = [title, "───────────────────", f"🪙 Баланс: <b>{coins}</b>", note, ""]
+    for item_id, item in items:
         owned = await db.has_purchase(user_id, item_id)
+        eq = await db.get_equipped(user_id)
         equipped = eq.get(item["type"]) == item_id
-        status = "⚙️ Надето" if equipped else ("✅ Куплено" if owned else f"🪙 {item['price']}")
+        status = "⚙️ Экипировано" if equipped else ("✅ Куплено" if owned else f"🪙 {item['price']}")
         lines.append(f"<b>{item['name']}</b> — {status}\n<i>{html.escape(item['desc'])}</i>\n")
-    lines.append("👇 Нажми на товар: купить или экипировать уже купленный.")
     return "\n".join(lines)
 
-async def shop_keyboard(user_id: int):
+async def shop_keyboard(user_id: int, category: str = "home"):
     builder = InlineKeyboardBuilder()
-    eq = await db.get_equipped(user_id)
-    for item_id, item in SHOP_ITEMS.items():
-        owned = await db.has_purchase(user_id, item_id)
-        equipped = eq.get(item["type"]) == item_id
-        if equipped:
-            text = f"✅ {item['name']}"
-        elif owned:
-            text = f"⚙️ Надеть: {item['name']}"
-        else:
-            text = f"🛒 {item['name']} · {item['price']}"
-        builder.button(text=text, callback_data=f"shop:{'equip' if owned else 'buy'}:{item_id}")
-    builder.button(text="🪙 Кошелёк / квесты", callback_data="menu:wallet")
+    if category == "home":
+        builder.button(text="🏷 Титулы", callback_data="shopcat:titles")
+        builder.button(text="💬 Фразы победы", callback_data="shopcat:phrases")
+        builder.button(text="⭐ Купить за Stars", callback_data="menu:stars")
+        builder.button(text="🎒 Мои покупки", callback_data="menu:inventory")
+    else:
+        eq = await db.get_equipped(user_id)
+        for item_id, item in SHOP_ITEMS.items():
+            if item["type"] != ("title" if category == "titles" else "victory"):
+                continue
+            owned = await db.has_purchase(user_id, item_id)
+            equipped = eq.get(item["type"]) == item_id
+            if equipped:
+                text = f"✅ {item['name']}"
+            elif owned:
+                text = f"⚙️ Экипировать · {item['name']}"
+            else:
+                text = f"🛒 {item['name']} · {item['price']} 🪙"
+            builder.button(text=text, callback_data=f"shop:{'equip' if owned else 'buy'}:{item_id}")
+        builder.button(text="◀️ Назад в магазин", callback_data="menu:shop")
+    builder.button(text="🪙 Кошелёк", callback_data="menu:wallet")
     builder.button(text="👤 Профиль", callback_data="menu:profile")
-    builder.button(text="🎒 Мои покупки", callback_data="menu:inventory")
-    builder.button(text="🏠 Главное меню", callback_data="menu:home")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -242,9 +270,17 @@ async def wallet_text(user_id: int) -> str:
 
 async def victory_effect(user_id: int, name: str) -> str:
     effect = (await db.get_equipped(user_id))["victory"]
-    if effect == "victory_fire": return f"🎆✨ {html.escape(name)} — ПОБЕДИТЕЛЬ! ✨🎆"
-    if effect == "victory_gold": return f"🏆💛 {html.escape(name)} — ЗОЛОТОЙ ФИНАЛ! 💛🏆"
-    return f"🏆 {html.escape(name)} — победитель!"
+    n = html.escape(name)
+    phrases = {
+        "victory_fire": f"🎆✨ {n} — ПОБЕДИТЕЛЬ! ✨🎆",
+        "victory_gold": f"🏆💛 {n} — ЗОЛОТОЙ ФИНАЛ! 💛🏆",
+        "victory_goodbye": f"🚪 {n}: «До свидания, дилетанты.»",
+        "victory_whose_left": f"😈 {n}: «Ну и кто тут лишний?»",
+        "victory_i_told": f"🗿 {n}: «Я же говорил.»",
+        "victory_cold": f"🧊 {n} — без лишних слов.",
+        "victory_last": f"🚪 {n} — последний в бункере.",
+    }
+    return phrases.get(effect, f"🏆 {n} — победитель!")
 
 async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
@@ -1028,25 +1064,22 @@ async def menu_wallet(callback: types.CallbackQuery):
     await callback.message.edit_text(await wallet_text(callback.from_user.id), reply_markup=await private_menu_markup(), parse_mode="HTML"); await callback.answer()
 
 async def stars_store_text() -> str:
-    lines = [
-        "⭐ <b>ЗА STARS</b>",
-        "───────────────────",
-        "Оплата только Telegram Stars. Никаких игровых преимуществ.",
-        "",
-        "🪙 <b>Валюта</b> — трать её на косметику в обычном магазине.",
-        "🎁 <b>Набор оформления</b> — два косметических предмета.",
-        "⭐ <b>Premium</b> — отдельный статус профиля и доступ к закрытым косметическим предложениям на срок действия.",
-        "",
-        "Выбери вариант:",
-    ]
-    return "\n".join(lines)
+    return (
+        "⭐ <b>ПОКУПКА ЗА STARS</b>\n"
+        "───────────────────\n"
+        "Здесь указано, <b>что ты получишь</b>, а ниже — <b>сколько ⭐ это стоит</b>.\n\n"
+        "🪙 Игровая валюта → тратится в магазине Бункера.\n"
+        "🎁 Косметические наборы → предметы сразу попадут в твои покупки.\n"
+        "⭐ Premium → отдельный статус без игровых преимуществ.\n\n"
+        "Все покупки добровольные и не дают преимущества в матче."
+    )
 
 async def stars_store_keyboard():
     b=InlineKeyboardBuilder()
     for pid, product in STAR_PRODUCTS.items():
-        b.button(text=f"⭐ {product['name']} · {product['stars']}", callback_data=f"stars:buy:{pid}")
+        b.button(text=f"{product['name']}  ·  ⭐ {product['stars']}", callback_data=f"stars:buy:{pid}")
     b.button(text="🛍 Магазин за 🪙", callback_data="menu:shop")
-    b.button(text="🏠 Главное меню", callback_data="menu:home")
+    b.button(text="🎒 Мои покупки", callback_data="menu:inventory")
     b.adjust(1)
     return b.as_markup()
 
@@ -1060,7 +1093,7 @@ async def send_star_invoice(message: types.Message, product_id: str):
     await bot.send_invoice(
         chat_id=message.chat.id,
         title=product["name"],
-        description=product["desc"],
+        description=f"Цена: {product['stars']} Telegram Stars. {product['desc']}",
         payload=star_invoice_payload(product_id),
         currency="XTR",
         prices=[LabeledPrice(label=product["name"], amount=product["stars"])],
@@ -1121,16 +1154,74 @@ async def successful_star_payment(message: types.Message):
 
 @dp.callback_query(F.data == "menu:shop")
 async def menu_shop(callback: types.CallbackQuery):
-    await callback.message.edit_text(await economy_shop_text(callback.from_user.id), reply_markup=await shop_keyboard(callback.from_user.id), parse_mode="HTML"); await callback.answer()
+    await callback.message.edit_text(await economy_shop_text(callback.from_user.id, "home"), reply_markup=await shop_keyboard(callback.from_user.id, "home"), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data.startswith("shopcat:"))
+async def shop_category(callback: types.CallbackQuery):
+    category = callback.data.split(":", 1)[1]
+    if category not in ("titles", "phrases"):
+        return await callback.answer("Категория не найдена.", show_alert=True)
+    await callback.message.edit_text(await economy_shop_text(callback.from_user.id, category), reply_markup=await shop_keyboard(callback.from_user.id, category), parse_mode="HTML")
+    await callback.answer()
+
+async def inventory_keyboard(user_id: int):
+    b = InlineKeyboardBuilder()
+    eq = await db.get_equipped(user_id)
+    for category, label in (("title", "🏷 Титулы"), ("victory", "💬 Фразы победы")):
+        b.button(text=label, callback_data=f"invcat:{category}")
+    b.button(text="🛍 Магазин", callback_data="menu:shop")
+    b.button(text="⭐ За Stars", callback_data="menu:stars")
+    b.adjust(1)
+    return b.as_markup()
 
 @dp.callback_query(F.data == "menu:inventory")
 async def menu_inventory(callback: types.CallbackQuery):
     eq = await db.get_equipped(callback.from_user.id)
-    owned = [item["name"] for item_id,item in SHOP_ITEMS.items() if await db.has_purchase(callback.from_user.id,item_id)]
-    text = "🎒 <b>МОИ ПОКУПКИ</b>\n───────────────────\n" + ("\n".join(f"• {html.escape(x)}" for x in owned) if owned else "Пока ничего нет.")
-    text += f"\n\n🏷 Титул: {html.escape(SHOP_ITEMS.get(eq['title'],{}).get('name','по умолчанию'))}"
-    text += f"\n🏆 Эффект победы: {html.escape(SHOP_ITEMS.get(eq.get('victory'),{}).get('name','По умолчанию'))}"
-    await callback.message.edit_text(text, reply_markup=await private_menu_markup(), parse_mode="HTML"); await callback.answer()
+    title = SHOP_ITEMS.get(eq.get("title"), {}).get("name", "Не выбран")
+    phrase = SHOP_ITEMS.get(eq.get("victory"), {}).get("name", "Не выбрана")
+    text = (
+        "🎒 <b>МОИ ПОКУПКИ</b>\n───────────────────\n"
+        f"🏷 Сейчас надето: <b>{html.escape(title)}</b>\n"
+        f"💬 Сейчас выбрано: <b>{html.escape(phrase)}</b>\n\n"
+        "Выбери категорию — там будут только твои купленные предметы.\n"
+        "Экипировка занимает один клик."
+    )
+    await callback.message.edit_text(text, reply_markup=await inventory_keyboard(callback.from_user.id), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data.startswith("invcat:"))
+async def inventory_category(callback: types.CallbackQuery):
+    category = callback.data.split(":",1)[1]
+    items = [(i,x) for i,x in SHOP_ITEMS.items() if x["type"] == category and await db.has_purchase(callback.from_user.id, i)]
+    eq = await db.get_equipped(callback.from_user.id)
+    label = "🏷 <b>МОИ ТИТУЛЫ</b>" if category == "title" else "💬 <b>МОИ ФРАЗЫ</b>"
+    lines = [label, "───────────────────"]
+    b = InlineKeyboardBuilder()
+    for item_id, item in items:
+        equipped = eq.get(category) == item_id
+        lines.append(f"{('✅' if equipped else '•')} {html.escape(item['name'])}")
+        if equipped:
+            b.button(text=f"✅ {item['name']}", callback_data="invnoop")
+        else:
+            b.button(text=f"⚙️ Экипировать · {item['name']}", callback_data=f"invequip:{category}:{item_id}")
+    if not items:
+        lines.append("Пока ничего нет.")
+    b.button(text="◀️ Мои покупки", callback_data="menu:inventory")
+    b.adjust(1)
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup(), parse_mode="HTML"); await callback.answer()
+
+@dp.callback_query(F.data == "invnoop")
+async def inventory_noop(callback: types.CallbackQuery):
+    await callback.answer("Уже экипировано.")
+
+@dp.callback_query(F.data.startswith("invequip:"))
+async def inventory_equip(callback: types.CallbackQuery):
+    _, category, item_id = callback.data.split(":",2)
+    item = SHOP_ITEMS.get(item_id)
+    if not item or item["type"] != category or not await db.has_purchase(callback.from_user.id, item_id):
+        return await callback.answer("Предмет не найден в твоих покупках.", show_alert=True)
+    await db.equip_item(callback.from_user.id, category, item_id)
+    await callback.answer(f"Экипировано: {item['name']}")
+    await inventory_category(callback)
 
 @dp.callback_query(F.data.startswith("shop:"))
 async def shop_action(callback: types.CallbackQuery):
@@ -1142,7 +1233,8 @@ async def shop_action(callback: types.CallbackQuery):
     else:
         if not await db.has_purchase(callback.from_user.id,item_id): return await callback.answer("Сначала купи предмет.", show_alert=True)
         await db.equip_item(callback.from_user.id,item["type"],item_id); await callback.answer(f"⚙️ Экипировано: {item['name']}")
-    await callback.message.edit_text(await economy_shop_text(callback.from_user.id), reply_markup=await shop_keyboard(callback.from_user.id), parse_mode="HTML")
+    category = "titles" if item["type"] == "title" else "phrases"
+    await callback.message.edit_text(await economy_shop_text(callback.from_user.id, category), reply_markup=await shop_keyboard(callback.from_user.id, category), parse_mode="HTML")
 
 @dp.callback_query(F.data == "menu:card")
 async def menu_card(callback: types.CallbackQuery):
