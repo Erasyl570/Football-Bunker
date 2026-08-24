@@ -37,7 +37,8 @@ async def _init_stats_db():
                     equipped_card_theme TEXT NOT NULL DEFAULT 'classic',
                     equipped_victory TEXT NOT NULL DEFAULT 'classic',
                     equipped_badge TEXT NOT NULL DEFAULT '',
-                    owner_granted INTEGER NOT NULL DEFAULT 0
+                    owner_granted INTEGER NOT NULL DEFAULT 0,
+                    premium_until TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS bunker_purchases (
                     user_id BIGINT NOT NULL,
@@ -47,6 +48,8 @@ async def _init_stats_db():
             """)
             # Мягкая миграция для экономики v9 → v10.
             await conn.execute("ALTER TABLE bunker_economy ADD COLUMN IF NOT EXISTS equipped_badge TEXT NOT NULL DEFAULT ''")
+            await conn.execute("ALTER TABLE bunker_economy ADD COLUMN IF NOT EXISTS premium_until TEXT NOT NULL DEFAULT ''")
+            await conn.execute("CREATE TABLE IF NOT EXISTS bunker_star_payments (charge_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, product_id TEXT NOT NULL, stars INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())")
     except Exception as e:
         print(f"[STATS DB] Не удалось подключить внешнюю БД: {e}")
         _stats_pool = None
@@ -125,8 +128,13 @@ async def init_db():
 
         # Экономика: мягкая миграция для уже существующих SQLite-инсталляций.
         try:
-            await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0)")
+            await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0, premium_until TEXT NOT NULL DEFAULT '')")
             await db.execute("ALTER TABLE bunker_economy ADD COLUMN equipped_badge TEXT NOT NULL DEFAULT ''")
+            await db.execute("CREATE TABLE IF NOT EXISTS bunker_star_payments (charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, product_id TEXT NOT NULL, stars INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            try:
+                await db.execute("ALTER TABLE bunker_economy ADD COLUMN premium_until TEXT NOT NULL DEFAULT ''")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -231,7 +239,7 @@ async def get_coins(user_id: int) -> int:
     async with connect_db() as db:
         await _ensure_economy_user_sqlite(db, user_id)
         # SQLite fallback stores economy in a dedicated table.
-        await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0)")
+        await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0, premium_until TEXT NOT NULL DEFAULT '')")
         await db.execute("INSERT OR IGNORE INTO bunker_economy (user_id) VALUES (?)", (user_id,))
         async with db.execute("SELECT coins FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
@@ -297,23 +305,6 @@ async def purchase_item(user_id: int, item_id: str, price: int) -> bool:
         await db.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES (?, ?)", (user_id, item_id))
         await db.commit()
         return True
-
-async def owner_grant_item(user_id: int, purchase_id: str, item_id: str):
-    """Безвозмездно выдаёт уникальный предмет владельцу и экипирует его.
-    Не списывает монеты и безопасно повторяется при каждом запуске.
-    """
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-                await conn.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, purchase_id)
-                await conn.execute("UPDATE bunker_economy SET equipped_title=$2 WHERE user_id=$1", user_id, item_id)
-        return
-    async with connect_db() as db:
-        await get_coins(user_id)
-        await db.execute("INSERT OR IGNORE INTO bunker_purchases (user_id, item_id) VALUES (?, ?)", (user_id, purchase_id))
-        await db.execute("UPDATE bunker_economy SET equipped_title=? WHERE user_id=?", (item_id, user_id))
-        await db.commit()
 
 async def equip_item(user_id: int, item_type: str, item_id: str):
     if _stats_pool:
@@ -394,6 +385,78 @@ async def get_daily_progress(user_id: int):
         if not row or row[0] != today:
             return {"game":0,"win":0,"reveal":0,"vote":0}
         return {"game":row[1],"win":row[2],"reveal":row[3],"vote":row[4]}
+
+async def grant_purchase(user_id: int, item_id: str) -> bool:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            result = await conn.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, item_id)
+            return result.endswith("1")
+    async with connect_db() as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS bunker_purchases (user_id INTEGER NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(user_id,item_id))")
+        cur=await db.execute("INSERT OR IGNORE INTO bunker_purchases (user_id,item_id) VALUES (?,?)",(user_id,item_id))
+        await db.commit()
+        return cur.rowcount == 1
+
+async def extend_premium(user_id: int, days: int):
+    from datetime import datetime, timedelta, timezone
+    now=datetime.now(timezone.utc)
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row=await conn.fetchrow("SELECT premium_until FROM bunker_economy WHERE user_id=$1",user_id)
+            current=None
+            if row and row["premium_until"]:
+                try: current=datetime.fromisoformat(row["premium_until"])
+                except Exception: current=None
+            base=max(now,current) if current else now
+            until=base+timedelta(days=days)
+            await conn.execute("INSERT INTO bunker_economy(user_id,premium_until) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET premium_until=$2",user_id,until.isoformat())
+            return until
+    async with connect_db() as db:
+        await get_coins(user_id)
+        async with db.execute("SELECT premium_until FROM bunker_economy WHERE user_id=?",(user_id,)) as cur: row=await cur.fetchone()
+        current=None
+        if row and row[0]:
+            try: current=datetime.fromisoformat(row[0])
+            except Exception: current=None
+        base=max(now,current) if current else now
+        until=base+timedelta(days=days)
+        await db.execute("UPDATE bunker_economy SET premium_until=? WHERE user_id=?",(until.isoformat(),user_id))
+        await db.commit()
+        return until
+
+async def get_premium_until(user_id: int):
+    from datetime import datetime, timezone
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row=await conn.fetchrow("SELECT premium_until FROM bunker_economy WHERE user_id=$1",user_id)
+            value=row["premium_until"] if row else ""
+    else:
+        async with connect_db() as db:
+            await get_coins(user_id)
+            async with db.execute("SELECT premium_until FROM bunker_economy WHERE user_id=?",(user_id,)) as cur: row=await cur.fetchone()
+            value=row[0] if row else ""
+    if not value: return None
+    try:
+        dt=datetime.fromisoformat(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+async def is_premium(user_id: int) -> bool:
+    from datetime import datetime, timezone
+    dt=await get_premium_until(user_id)
+    return bool(dt and dt > datetime.now(timezone.utc))
+
+async def record_star_payment(charge_id: str, user_id: int, product_id: str, stars: int) -> bool:
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            result = await conn.execute("INSERT INTO bunker_star_payments(charge_id,user_id,product_id,stars) VALUES($1,$2,$3,$4) ON CONFLICT(charge_id) DO NOTHING", charge_id,user_id,product_id,stars)
+            return result.endswith("1")
+    async with connect_db() as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS bunker_star_payments (charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, product_id TEXT NOT NULL, stars INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cur=await db.execute("INSERT OR IGNORE INTO bunker_star_payments(charge_id,user_id,product_id,stars) VALUES(?,?,?,?)",(charge_id,user_id,product_id,stars))
+        await db.commit()
+        return cur.rowcount == 1
 
 async def owner_grant_if_needed(user_id: int, amount: int) -> bool:
     if _stats_pool:
