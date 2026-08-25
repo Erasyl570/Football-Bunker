@@ -969,7 +969,17 @@ async def start_game(callback: types.CallbackQuery):
 
         # Атомарный lock: два быстрых нажатия «Старт» не смогут создать две игры.
         if not await db.try_start_lobby(chat_id):
-            return await callback.answer("⚠️ Игра уже запускается.", show_alert=True)
+            current = await db.get_lobby(chat_id)
+            if current and current[0] == "starting":
+                return await callback.answer("⏳ Игра уже запускается. Подождите несколько секунд.", show_alert=True)
+            return await callback.answer("⚠️ Лобби уже неактивно.", show_alert=True)
+
+        # Сразу убираем старую кнопку старта, чтобы повторный callback не приходил
+        # из того же сообщения после успешного запуска.
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
         players = await db.get_players(chat_id)
         num_players = len(players)
@@ -1054,7 +1064,7 @@ async def start_game(callback: types.CallbackQuery):
         try:
             lobby = await db.get_lobby(chat_id)
             if lobby and lobby[0] == "starting":
-                await db.set_lobby_status(chat_id, "cancelled")
+                await db.set_lobby_status(chat_id, "lobby")
         except Exception:
             pass
         await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
@@ -1328,28 +1338,23 @@ async def settings_text(chat_id: int) -> str:
             f"💬 <b>Обсуждение:</b> {st.get('discussion_time',60)} сек.\n"
             f"🗳 <b>Голосование:</b> {st.get('voting_time',105)} сек.\n"
             f"🎴 <b>Вскрытие карты:</b> {st.get('reveal_time',40)} сек.\n\n"
-            "Настройки применяются к следующей игре. Менять их может создатель лобби.")
+            "Настройки применяются к следующей игре. Во время набора их может менять любой участник чата.")
 
 async def settings_owner_ok(message_or_callback) -> bool:
+    # Настройки доступны любому участнику/пользователю группы, пока идёт набор.
+    # Проверяем только наличие лобби и что игра ещё не запущена.
     chat = message_or_callback.message.chat if hasattr(message_or_callback, "message") else message_or_callback.chat
-    user = message_or_callback.from_user
+    if chat.type == "private":
+        return False
     lobby = await db.get_lobby(chat.id)
-    if not lobby or lobby[0] != "lobby":
-        return False
-    if lobby[1] == user.id:
-        return True
-    try:
-        member = await bot.get_chat_member(chat.id, user.id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
+    return bool(lobby and lobby[0] == "lobby")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
     if message.chat.type == "private":
         return await message.answer("⚙️ /settings работает только в группе во время набора игры.")
     if not await settings_owner_ok(message):
-        return await message.answer("⛔ Настройки лобби может менять только создатель игры или администратор.")
+        return await message.answer("⚠️ Настройки можно менять только пока идёт набор игроков.")
     st = await db.get_lobby_settings(message.chat.id)
     await message.answer(await settings_text(message.chat.id), reply_markup=settings_keyboard(st), parse_mode="HTML")
 
@@ -1358,7 +1363,7 @@ async def settings_callback(callback: types.CallbackQuery):
     if callback.message.chat.type == "private":
         return await callback.answer("⚙️ Только в группе.", show_alert=True)
     if not await settings_owner_ok(callback):
-        return await callback.answer("⛔ Менять настройки может только создатель лобби или администратор.", show_alert=True)
+        return await callback.answer("⚠️ Настройки доступны только во время набора.", show_alert=True)
     action=callback.data.split(":",1)[1]
     chat_id=callback.message.chat.id
     st=await db.get_lobby_settings(chat_id)
