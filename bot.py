@@ -101,6 +101,12 @@ SPECIAL_CARD_NAMES = {
     "swap_skill": "🔄 Фиксированный обмен [Навык]",
     "swap_inventory": "🔄 Фиксированный обмен [Багаж]",
     "swap_secret": "🔄 Фиксированный обмен [Секрет]",
+    "swap_budget": "🔄 Фиксированный обмен [Бюджет]",
+    "swap_squad": "🔄 Фиксированный обмен [Состав]",
+    "swap_finance": "🔄 Фиксированный обмен [Финансы]",
+    "swap_infrastructure": "🔄 Фиксированный обмен [Инфраструктура]",
+    "swap_reputation": "🔄 Фиксированный обмен [Репутация]",
+    "swap_problem": "🔄 Фиксированный обмен [Проблема]",
     "spy": "👁 Шпионаж",
     "yellow_card": "🟨 Желтая карточка",
     "flash": "📸 Вспышка (Публичность)",
@@ -119,6 +125,12 @@ SPECIAL_CARD_DESCRIPTIONS = {
     "swap_skill": "Обменивает твою карту «Навык» на навык любого игрока.",
     "swap_inventory": "Обменивает твой «Багаж» на багаж любого игрока.",
     "swap_secret": "Обменивает твой «Секрет» на секрет любого игрока.",
+    "swap_budget": "Обменивает твой «Бюджет» на бюджет любого клуба.",
+    "swap_squad": "Обменивает твою карту «Состав» на состав любого клуба.",
+    "swap_finance": "Обменивает твою карту «Финансы» на финансы любого клуба.",
+    "swap_infrastructure": "Обменивает твою «Инфраструктуру» на инфраструктуру любого клуба.",
+    "swap_reputation": "Обменивает твою «Репутацию» на репутацию любого клуба.",
+    "swap_problem": "Обменивает твою «Проблему» на проблему любого клуба.",
     "spy": "Позволяет скрыто подсмотреть 1 закрытую карту любого соперника.",
     "yellow_card": "Блокирует использование спец-карты выбранному игроку до конца игры.",
     "flash": "Принудительно вскрывает любую выбранную тобой закрытую карту соперника в общий чат.",
@@ -131,8 +143,13 @@ SPECIAL_CARD_DESCRIPTIONS = {
 
 TRAIT_LABELS = {
     "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
-    "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет"
+    "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет",
+    "club": "Клуб", "budget": "Бюджет", "squad": "Состав", "finance": "Финансы",
+    "infrastructure": "Инфраструктура", "reputation": "Репутация", "problem": "Проблема"
 }
+
+PLAYER_TRAITS = [("position", "💼 Позицию"), ("age", "👤 Возраст"), ("price", "💰 Цену"), ("health", "❤️ Здоровье"), ("skill", "🎯 Навык"), ("inventory", "🎒 Багаж"), ("secret", "🔍 Секрет")]
+CLUB_TRAITS = [("budget", "💰 Бюджет"), ("squad", "👥 Состав"), ("finance", "📊 Финансы"), ("infrastructure", "🏟 Инфраструктуру"), ("reputation", "🏆 Репутацию"), ("problem", "⚠️ Проблему"), ("secret", "🔍 Секрет")]
 
 ECONOMY_OWNER_ID = int(os.getenv("ECONOMY_OWNER_ID", "1624967415"))
 OWNER_STARTING_COINS = 10000
@@ -290,70 +307,65 @@ async def is_game_active(chat_id: int) -> bool:
 async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
     if not GEMINI_API_KEY:
         return "⚠️ <i>GEMINI_API_KEY не задан. Оценка сценария недоступна.</i>"
-
-    players_summary = "".join(
-        f"- Игрок {name}: Позиция={pack.get('position')}, Возраст={pack.get('age')}, "
-        f"Цена={pack.get('price')}, Здоровье={pack.get('health')}, Навык={pack.get('skill')}, "
-        f"Багаж={pack.get('inventory')}, Секрет={pack.get('secret')}\n"
-        for name, pack in winners_data
-    )
-    prompt = (
-        "Ты — футбольный спортивный директор, который хочет найти способ ОДОБРИТЬ разумную финальную пару, а не искать повод отказать.\n\n"
-        f"СЦЕНАРИЙ И УСЛОВИЯ КОНТРАКТА:\n{scenario_text}\n\n"
-        f"ФИНАЛЬНАЯ ПАРА И АКТУАЛЬНЫЕ КАРТОЧКИ:\n{players_summary}\n"
-        "ВАЖНО: контракт всегда заключается ИМЕННО С ДВУМЯ финалистами. Если указан ОБЩИЙ БЮДЖЕТ НА ДВОИХ, сравни сумму цен пары с бюджетом, а не цену каждого по отдельности. "
-        "Проверяй только явно написанные ключевые требования. Описательные второстепенные условия оценивай гибко. Неизвестная характеристика нейтральна. Сильная сторона одного игрока может компенсировать второстепенный недостаток другого. "
-        "ПРОВАЛ ставь ТОЛЬКО если пара явно не проходит бюджет или прямо нарушает ключевое числовое/позиционное требование без разумной компенсации. Во всех спорных и близких случаях выбирай УСПЕХ. Не придумывай факты.\n\n"
-        "Формат строго: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n"
-        "📝 <b>Причина:</b> [2-4 коротких предложения]"
-    )
-    cache_key = str(hash(prompt))
-    if cache_key in GEMINI_CACHE:
-        return GEMINI_CACHE[cache_key]
-
+    game_type = "club" if winners_data and "budget" in winners_data[0][1] and "club" in winners_data[0][1] else "player"
+    if game_type == "club":
+        summary = "".join(
+            f"- Кандидат {name}: Клуб={pack.get('club')}, Бюджет={pack.get('budget')}, Состав={pack.get('squad')}, "
+            f"Финансы={pack.get('finance')}, Инфраструктура={pack.get('infrastructure')}, Репутация={pack.get('reputation')}, "
+            f"Проблема={pack.get('problem')}, Секрет={pack.get('secret')}\n"
+            for name, pack in winners_data
+        )
+        rules = ("Это режим КЛУБОВ. Здесь нет навыка, здоровья, возраста или цены игрока. "
+                 "Главное числовое условие — бюджет клуба. Остальные условия сценария оценивай по карточкам клуба. "
+                 "Не придумывай отсутствующие характеристики. Бюджет проверяй как обязательное минимальное требование. "
+                 "Если клуб проходит бюджет и в целом соответствует проекту, выбирай УСПЕХ. В спорных случаях — УСПЕХ.")
+    else:
+        summary = "".join(
+            f"- Игрок {name}: Позиция={pack.get('position')}, Возраст={pack.get('age')}, Цена={pack.get('price')}, "
+            f"Здоровье={pack.get('health')}, Навык={pack.get('skill')}, Багаж={pack.get('inventory')}, Секрет={pack.get('secret')}\n"
+            for name, pack in winners_data
+        )
+        rules = ("Это режим ИГРОКОВ. Контракт всегда заключается ИМЕННО С ДВУМЯ финалистами. "
+                 "Если указан общий бюджет на двоих, сравни сумму цен пары с бюджетом, а не цену каждого отдельно. "
+                 "Проверяй только явно написанные ключевые требования. Описательные условия оценивай гибко. "
+                 "Неизвестная характеристика нейтральна. Сильная сторона одного может компенсировать второстепенный недостаток другого. "
+                 "ПРОВАЛ ставь только при явном нарушении ключевого требования или бюджета. В спорных случаях — УСПЕХ.")
+    prompt=("Ты — спортивный директор футбольной игры. Твоя задача — вынести честный, но не душный вердикт.\n\n"
+            f"СЦЕНАРИЙ:\n{scenario_text}\n\nКАНДИДАТЫ:\n{summary}\n{rules}\n\n"
+            "Формат строго: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n📝 <b>Причина:</b> [2-4 коротких предложения]")
+    cache_key=str(hash(prompt))
+    if cache_key in GEMINI_CACHE: return GEMINI_CACHE[cache_key]
     async with GEMINI_SEMAPHORE:
-        last_error = None
+        last_error=None
         for attempt in range(3):
             try:
-                model = genai.GenerativeModel(GEMINI_MODEL)
-                response = await model.generate_content_async(
-                    prompt, request_options={"timeout": 25}
-                )
-                if response and getattr(response, "text", None):
-                    result = response.text.strip()
-                    GEMINI_CACHE[cache_key] = result
+                model=genai.GenerativeModel(GEMINI_MODEL)
+                response=await model.generate_content_async(prompt, request_options={"timeout": 25})
+                result=(response.text or "").strip()
+                if result:
+                    GEMINI_CACHE[cache_key]=result
                     return result
-                last_error = "Пустой ответ"
             except Exception as e:
-                last_error = str(e)
-                # 1s, 2s перед повтором; не спамим Gemini при временной ошибке.
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-        print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
-        return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена, но вердикт можно получить повторно позже.</i>"
+                last_error=e
+                if attempt<2: await asyncio.sleep(2**attempt)
+    print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
+    return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена без вердикта.</i>"
 
 async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
-    traits = [
-        ("position", "💼 Позицию"), ("age", "👤 Возраст"),
-        ("price", "💰 Цену"), ("health", "❤️ Здоровье"),
-        ("skill", "🎯 Навык"), ("inventory", "🎒 Багаж"), ("secret", "🔍 Секрет")
-    ]
-    
+    game_type = await get_game_type(chat_id)
+    traits = CLUB_TRAITS if game_type == "club" else PLAYER_TRAITS
     for trait_key, trait_label in traits:
         if not await db.is_trait_revealed(chat_id, user_id, trait_key):
             builder.button(text=trait_label, callback_data=f"reveal:{trait_key}:{chat_id}")
-            
     spec_info = await db.get_player_special_info(chat_id, user_id)
     if spec_info and not spec_info[1]:
         builder.button(text="✨ Спецкарта", callback_data=f"use_spec:{chat_id}")
-
     builder.adjust(2)
     return builder.as_markup()
 
 async def build_private_card_text(chat_id: int, user_id: int) -> str:
     pack = await db.get_player_pack(chat_id, user_id) or {}
-    username = await db.get_username(chat_id, user_id)
     spec_info = await db.get_player_special_info(chat_id, user_id)
     spec_code = spec_info[0] if spec_info else ""
     spec_used = bool(spec_info[1]) if spec_info else False
@@ -361,27 +373,35 @@ async def build_private_card_text(chat_id: int, user_id: int) -> str:
     spec_desc = SPECIAL_CARD_DESCRIPTIONS.get(spec_code, "Описание отсутствует.")
     if spec_used:
         spec_title = f"{spec_title} (уже использована)"
-
-    eq = await db.get_equipped(user_id)
-    theme_emoji, theme_line = CARD_THEME_STYLE["classic"]
-    title_name = SHOP_ITEMS.get(eq.get("title"), {}).get("name", "") if eq.get("title") else ""
-    decoration = html.escape(title_name)
-    return (
-        f"{theme_emoji} <b>ТВОЯ АКТУАЛЬНАЯ КАРТОЧКА ИГРОКА</b>\n{theme_line}\n"
-        f"{decoration}\n"
-        f"💼 <b>Позиция:</b> <code>{html.escape(str(pack.get('position', '-')))}</code>\n"
-        f"👤 <b>Возраст:</b> <code>{pack.get('age', '-')} лет</code>\n"
-        f"💰 <b>Цена:</b> <code>{html.escape(str(pack.get('price', '-')))}</code>\n"
-        f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack.get('health', '-')))}</code>\n"
-        f"🎯 <b>Навык:</b> <code>{html.escape(str(pack.get('skill', '-')))}</code>\n"
-        f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack.get('inventory', '-')))}</code>\n"
-        f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret', '-')))}</i>\n"
-        f"───────────────────\n"
-        f"✨ <b>Спец-карта:</b> <b>{html.escape(spec_title)}</b>\n"
-        f"ℹ️ <b>Что делает:</b> <i>{html.escape(spec_desc)}</i>\n"
-        f"───────────────────\n"
-        f"👇 <i>Используй кнопки ниже во время своего хода.</i>"
-    )
+    game_type = await get_game_type(chat_id)
+    if game_type == "club":
+        title = html.escape(str(pack.get("club", "Клуб")))
+        lines = [
+            f"🏟️ <b>КАРТОЧКА КЛУБА — {title}</b>",
+            "───────────────────",
+            f"💰 <b>Бюджет:</b> <code>{html.escape(str(pack.get('budget','-')))}</code>",
+            f"👥 <b>Состав:</b> <code>{html.escape(str(pack.get('squad','-')))}</code>",
+            f"📊 <b>Финансы:</b> <code>{html.escape(str(pack.get('finance','-')))}</code>",
+            f"🏟️ <b>Инфраструктура:</b> <code>{html.escape(str(pack.get('infrastructure','-')))}</code>",
+            f"🏆 <b>Репутация:</b> <code>{html.escape(str(pack.get('reputation','-')))}</code>",
+            f"⚠️ <b>Проблема:</b> <code>{html.escape(str(pack.get('problem','-')))}</code>",
+            f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret','-')))}</i>",
+        ]
+    else:
+        title_name = await db.get_username(chat_id, user_id) or "Игрок"
+        lines = [
+            f"⚽ <b>КАРТОЧКА ИГРОКА — {html.escape(title_name)}</b>",
+            "───────────────────",
+            f"💼 <b>Позиция:</b> <code>{html.escape(str(pack.get('position','-')))}</code>",
+            f"👤 <b>Возраст:</b> <code>{pack.get('age','-')} лет</code>",
+            f"💰 <b>Цена:</b> <code>{html.escape(str(pack.get('price','-')))}</code>",
+            f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack.get('health','-')))}</code>",
+            f"🎯 <b>Навык:</b> <code>{html.escape(str(pack.get('skill','-')))}</code>",
+            f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack.get('inventory','-')))}</code>",
+            f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret','-')))}</i>",
+        ]
+    lines += ["───────────────────", f"✨ <b>Спец-карта:</b> <b>{html.escape(spec_title)}</b>", f"ℹ️ <b>Что делает:</b> <i>{html.escape(spec_desc)}</i>", "───────────────────", "👇 <i>Используй кнопки ниже во время своего хода.</i>"]
+    return "\n".join(lines)
 
 async def refresh_private_card(chat_id: int, user_id: int):
     message_id = await db.get_private_card_message_id(chat_id, user_id)
@@ -476,31 +496,42 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
             await db.record_daily_event(p_id, "win")
 
     # После завершения показываем всем полные карточки всех участников.
-    # Это происходит только после окончания игры, поэтому скрытая информация
-    # больше не влияет на игровой процесс.
     all_cards_blocks = []
+    game_type = await get_game_type(chat_id)
     for idx, (p_name, p_id, _) in enumerate(all_players, 1):
         pack = await db.get_player_pack(chat_id, p_id) or {}
         spec_info = await db.get_player_special_info(chat_id, p_id)
         spec_code = spec_info[0] if spec_info else ""
         spec_used = bool(spec_info[1]) if spec_info else False
         spec_title = SPECIAL_CARD_NAMES.get(spec_code, "—")
-        if spec_used and spec_title != "—":
-            spec_title += " (использована)"
+        if spec_used and spec_title != "—": spec_title += " (использована)"
         alive_mark = "🏆" if p_id in alive_ids else "❌"
-        age = pack.get("age", "-")
-        age_text = f"{age} лет" if age != "-" else "-"
-        all_cards_blocks.append(
-            f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b>\n"
-            f"├ 💼 Позиция: <b>{html.escape(str(pack.get('position', '-')))}</b>\n"
-            f"├ 👤 Возраст: <b>{html.escape(str(age_text))}</b>\n"
-            f"├ 💰 Цена: <b>{html.escape(str(pack.get('price', '-')))}</b>\n"
-            f"├ ❤️ Здоровье: <b>{html.escape(str(pack.get('health', '-')))}</b>\n"
-            f"├ 🎯 Навык: <b>{html.escape(str(pack.get('skill', '-')))}</b>\n"
-            f"├ 🎒 Багаж: <b>{html.escape(str(pack.get('inventory', '-')))}</b>\n"
-            f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret', '-')))}</b>\n"
-            f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
-        )
+        if game_type == "club":
+            all_cards_blocks.append(
+                f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b> — 🏟️ <b>{html.escape(str(pack.get('club','-')))}</b>\n"
+                f"├ 💰 Бюджет: <b>{html.escape(str(pack.get('budget','-')))}</b>\n"
+                f"├ 👥 Состав: <b>{html.escape(str(pack.get('squad','-')))}</b>\n"
+                f"├ 📊 Финансы: <b>{html.escape(str(pack.get('finance','-')))}</b>\n"
+                f"├ 🏟️ Инфраструктура: <b>{html.escape(str(pack.get('infrastructure','-')))}</b>\n"
+                f"├ 🏆 Репутация: <b>{html.escape(str(pack.get('reputation','-')))}</b>\n"
+                f"├ ⚠️ Проблема: <b>{html.escape(str(pack.get('problem','-')))}</b>\n"
+                f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret','-')))}</b>\n"
+                f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
+            )
+        else:
+            age = pack.get("age", "-")
+            age_text = f"{age} лет" if age != "-" else "-"
+            all_cards_blocks.append(
+                f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b>\n"
+                f"├ 💼 Позиция: <b>{html.escape(str(pack.get('position','-')))}</b>\n"
+                f"├ 👤 Возраст: <b>{html.escape(str(age_text))}</b>\n"
+                f"├ 💰 Цена: <b>{html.escape(str(pack.get('price','-')))}</b>\n"
+                f"├ ❤️ Здоровье: <b>{html.escape(str(pack.get('health','-')))}</b>\n"
+                f"├ 🎯 Навык: <b>{html.escape(str(pack.get('skill','-')))}</b>\n"
+                f"├ 🎒 Багаж: <b>{html.escape(str(pack.get('inventory','-')))}</b>\n"
+                f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret','-')))}</b>\n"
+                f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
+            )
 
     if not alive_players:
         await bot.send_message(chat_id, "❌ <b>ИГРА ОКОНЧЕНА</b>\n───────────────────\nВсе претенденты выбыли! Победителей нет.", parse_mode="HTML")
@@ -584,7 +615,9 @@ async def start_round_flow(chat_id: int, current_round: int):
                 parse_mode="HTML"
             )
 
-            for _ in range(40):
+            settings = await db.get_lobby_settings(chat_id)
+            reveal_time = int(settings.get("reveal_time", 40)) if settings else 40
+            for _ in range(reveal_time):
                 if not await is_game_active(chat_id): return
                 if await db.has_revealed_in_round(chat_id, p_id, current_round): break
                 await asyncio.sleep(1)
@@ -601,7 +634,10 @@ async def start_round_flow(chat_id: int, current_round: int):
         if not await db.transition_lobby_status(chat_id, "discussion", ["reveal_phase"], current_round):
             return
         has_voting = not (total_count in (3, 4) and current_round < 3)
-        discussion_time = 60 if has_voting else 30
+        settings = await db.get_lobby_settings(chat_id)
+        discussion_time = int(settings.get("discussion_time", 60)) if settings else (60 if has_voting else 30)
+        if not has_voting:
+            discussion_time = min(discussion_time, 60)
 
         discussion_msg = f"💬 <b>РАУНД {current_round} | ОБСУЖДЕНИЕ ({discussion_time} СЕКУНД)</b>\n───────────────────\n"
         discussion_msg += "Обсуждайте открытые карты и готовьтесь к голосованию!" if has_voting else "Первое голосование откроется в Раунде 3."
@@ -905,14 +941,17 @@ async def process_flash_reveal(callback: types.CallbackQuery):
 
     image_url = CARD_IMAGES.get(trait, "")
     msg_text = (
-        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> '
+        f'<a href="{image_url}">&#8203;</a>📸 <b>ВСПЫШКА!</b> ' if image_url else '📸 <b>ВСПЫШКА!</b> '
+    ) + (
         f'<b>{html.escape(actor.first_name)}</b> принудительно вскрывает у '
         f'<b>{html.escape(target_name)}</b> карту <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n'
         f'└ 👉 <b>{html.escape(str(val))}</b>'
     )
-    preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
-
-    await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
+    if image_url:
+        preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
+        await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
+    else:
+        await bot.send_message(chat_id, msg_text, parse_mode="HTML")
     await callback.message.edit_text(f"✅ Ты успешно вскрыл карту [{TRAIT_LABELS.get(trait, trait)}] игрока {html.escape(target_name)}!")
     await callback.answer()
 
@@ -941,14 +980,20 @@ async def start_game(callback: types.CallbackQuery):
 
         await callback.answer("Игра начинается!")
         
-        scen = cards.generate_scenario(num_players)
+        settings = await db.get_lobby_settings(chat_id)
+        game_type = settings.get("game_type", "player") if settings else "player"
+        scen = cards.generate_scenario(num_players, game_type=game_type)
         await db.update_lobby_scenario(chat_id, scen["text"], 1)
 
-        packs = cards.generate_game_packs(num_players, scen["line"])
+        packs = cards.generate_game_packs(num_players, scen["line"], game_type=game_type)
         # Баланс спец-карт: карта обмена характеристикой (swap_*)
         # может достаться только ОДНОМУ игроку за матч.
         # Остальные игроки получают карты из пула без обменов.
-        swap_cards = [code for code in SPECIAL_CARD_NAMES if code.startswith("swap_")]
+        settings = await db.get_lobby_settings(chat_id)
+        game_type = settings.get("game_type", "player") if settings else "player"
+        allowed_swaps = (["swap_budget", "swap_squad", "swap_finance", "swap_infrastructure", "swap_reputation", "swap_problem", "swap_secret"]
+                         if game_type == "club" else ["swap_position", "swap_age", "swap_price", "swap_health", "swap_skill", "swap_inventory", "swap_secret"])
+        swap_cards = allowed_swaps
         non_swap_cards = [code for code in SPECIAL_CARD_NAMES if not code.startswith("swap_")]
 
         if num_players >= 1:
@@ -1263,6 +1308,72 @@ async def menu_home(callback: types.CallbackQuery):
     await callback.message.edit_text(await private_welcome_text(), reply_markup=await private_menu_markup(), parse_mode="HTML")
     await callback.answer()
 
+
+def settings_keyboard(settings):
+    b = InlineKeyboardBuilder()
+    game_type = settings.get("game_type", "player")
+    b.button(text=f"{'👤 Игроки' if game_type == 'player' else '🏟️ Клубы'}", callback_data="settings:toggle_type")
+    b.button(text=f"💬 Обсуждение: {settings.get('discussion_time',60)}с", callback_data="settings:discussion")
+    b.button(text=f"🗳 Голосование: {settings.get('voting_time',105)}с", callback_data="settings:voting")
+    b.button(text=f"🎴 Вскрытие: {settings.get('reveal_time',40)}с", callback_data="settings:reveal")
+    b.button(text="🔄 Сбросить", callback_data="settings:reset")
+    b.adjust(1)
+    return b.as_markup()
+
+async def settings_text(chat_id: int) -> str:
+    st = await db.get_lobby_settings(chat_id)
+    gt = "👤 За игроков" if st.get("game_type") == "player" else "🏟️ За клубы"
+    return ("⚙️ <b>НАСТРОЙКИ БУНКЕРА</b>\n───────────────────\n"
+            f"🎮 <b>Тип игры:</b> {gt}\n"
+            f"💬 <b>Обсуждение:</b> {st.get('discussion_time',60)} сек.\n"
+            f"🗳 <b>Голосование:</b> {st.get('voting_time',105)} сек.\n"
+            f"🎴 <b>Вскрытие карты:</b> {st.get('reveal_time',40)} сек.\n\n"
+            "Настройки применяются к следующей игре. Менять их может создатель лобби.")
+
+async def settings_owner_ok(message_or_callback) -> bool:
+    chat = message_or_callback.message.chat if hasattr(message_or_callback, "message") else message_or_callback.chat
+    user = message_or_callback.from_user
+    lobby = await db.get_lobby(chat.id)
+    if not lobby or lobby[0] != "lobby":
+        return False
+    if lobby[1] == user.id:
+        return True
+    try:
+        member = await bot.get_chat_member(chat.id, user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: types.Message):
+    if message.chat.type == "private":
+        return await message.answer("⚙️ /settings работает только в группе во время набора игры.")
+    if not await settings_owner_ok(message):
+        return await message.answer("⛔ Настройки лобби может менять только создатель игры или администратор.")
+    st = await db.get_lobby_settings(message.chat.id)
+    await message.answer(await settings_text(message.chat.id), reply_markup=settings_keyboard(st), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("settings:"))
+async def settings_callback(callback: types.CallbackQuery):
+    if callback.message.chat.type == "private":
+        return await callback.answer("⚙️ Только в группе.", show_alert=True)
+    if not await settings_owner_ok(callback):
+        return await callback.answer("⛔ Менять настройки может только создатель лобби или администратор.", show_alert=True)
+    action=callback.data.split(":",1)[1]
+    chat_id=callback.message.chat.id
+    st=await db.get_lobby_settings(chat_id)
+    if action == "toggle_type":
+        await db.set_lobby_setting(chat_id, "game_type", "club" if st.get("game_type") == "player" else "player")
+    elif action == "reset":
+        await db.reset_lobby_settings(chat_id)
+    elif action in ("discussion", "voting", "reveal"):
+        key, values = {"discussion": ("discussion_time", [30,45,60,90,120,180,240,300]), "voting": ("voting_time", [45,60,75,90,105,120,150,180]), "reveal": ("reveal_time", [20,30,40,50,60])}[action]
+        current=int(st.get(key, values[0])); nxt=values[(values.index(current)+1)%len(values)] if current in values else values[0]
+        await db.set_lobby_setting(chat_id, key, nxt)
+    st=await db.get_lobby_settings(chat_id)
+    await callback.message.edit_text(await settings_text(chat_id), reply_markup=settings_keyboard(st), parse_mode="HTML")
+    await callback.answer("Настройки сохранены")
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     if message.chat.type == "private":
@@ -1414,11 +1525,13 @@ async def process_reveal(callback: types.CallbackQuery):
         await db.record_reveal(target_chat_id, user.id, trait, current_round)
         await db.record_daily_event(user.id, "reveal")
         image_url = CARD_IMAGES.get(trait, "")
-
-        msg_text = f'<a href="{image_url}">&#8203;</a>🔓 <b>{html.escape(user.first_name)}</b> вскрывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n└ 👉 <b>{html.escape(str(val))}</b>'
-        preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
-
-        await bot.send_message(target_chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
+        msg_text = ((f'<a href="{image_url}">&#8203;</a>🔓 ' if image_url else '🔓 ') +
+                    f'<b>{html.escape(user.first_name)}</b> вскрывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n└ 👉 <b>{html.escape(str(val))}</b>')
+        if image_url:
+            preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
+            await bot.send_message(target_chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
+        else:
+            await bot.send_message(target_chat_id, msg_text, parse_mode="HTML")
         new_markup = await build_reveal_keyboard(target_chat_id, user.id)
         await callback.message.edit_reply_markup(reply_markup=new_markup)
         await callback.answer(f"Карта {TRAIT_LABELS.get(trait, trait)} открыта!")
@@ -1437,6 +1550,8 @@ async def start_voting_flow(chat_id: int, round_num: int):
     if not await db.transition_lobby_status(chat_id, "voting", ["discussion"], round_num):
         return
     await db.clear_votes(chat_id)
+    settings = await db.get_lobby_settings(chat_id)
+    voting_time = int(settings.get("voting_time", 105)) if settings else 105
     summary_text = await build_players_summary(chat_id)
 
     builder = InlineKeyboardBuilder()
@@ -1453,7 +1568,7 @@ async def start_voting_flow(chat_id: int, round_num: int):
         f"📋 <b>ОТКРЫТЫЕ ХАРАКТЕРИСТИКИ</b>\n\n{summary_text}\n───────────────────\n🗳 <b>ГОЛОСОВАНИЕ (Раунд {round_num})</b>\n⏭️ <b>Скип:</b> можно пропустить максимум 3 голосования за игру. Скип работает как ничья — никто не выбывает, пенальти за него не будет.\n⏳ Время: 1 минута 45 секунд.",
         reply_markup=builder.as_markup(), parse_mode="HTML"
     )
-    await asyncio.sleep(105)
+    await asyncio.sleep(voting_time)
 
     lobby = await db.get_lobby(chat_id)
     if lobby and lobby[0] == "voting" and lobby[4] == round_num:
