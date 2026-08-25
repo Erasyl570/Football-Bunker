@@ -1331,42 +1331,38 @@ def settings_keyboard(settings):
     return b.as_markup()
 
 async def settings_text(chat_id: int) -> str:
-    st = await db.get_lobby_settings(chat_id)
+    st = await db.get_chat_settings(chat_id)
     gt = "👤 За игроков" if st.get("game_type") == "player" else "🏟️ За клубы"
     return ("⚙️ <b>НАСТРОЙКИ БУНКЕРА</b>\n───────────────────\n"
             f"🎮 <b>Тип игры:</b> {gt}\n"
             f"💬 <b>Обсуждение:</b> {st.get('discussion_time',60)} сек.\n"
             f"🗳 <b>Голосование:</b> {st.get('voting_time',105)} сек.\n"
             f"🎴 <b>Вскрытие карты:</b> {st.get('reveal_time',40)} сек.\n\n"
-            "Настройки применяются к следующей игре. Во время набора их может менять любой участник чата.")
+            "Настройки сохраняются для этой группы и применяются ко всем следующим играм. Менять их можно в любое время.")
 
 async def settings_owner_ok(message_or_callback) -> bool:
-    # Настройки доступны любому участнику/пользователю группы, пока идёт набор.
-    # Проверяем только наличие лобби и что игра ещё не запущена.
+    """Settings are group-wide and can be changed by any member at any time."""
     chat = message_or_callback.message.chat if hasattr(message_or_callback, "message") else message_or_callback.chat
-    if chat.type == "private":
-        return False
-    lobby = await db.get_lobby(chat.id)
-    return bool(lobby and lobby[0] == "lobby")
+    return chat.type in ("group", "supergroup")
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: types.Message):
-    if message.chat.type == "private":
-        return await message.answer("⚙️ /settings работает только в группе во время набора игры.")
+    if message.chat.type not in ("group", "supergroup"):
+        return await message.answer("⚙️ /settings работает только в группе.")
     if not await settings_owner_ok(message):
-        return await message.answer("⚠️ Настройки можно менять только пока идёт набор игроков.")
-    st = await db.get_lobby_settings(message.chat.id)
+        return await message.answer("⚠️ Настройки доступны только в группе.")
+    st = await db.get_chat_settings(message.chat.id)
     await message.answer(await settings_text(message.chat.id), reply_markup=settings_keyboard(st), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("settings:"))
 async def settings_callback(callback: types.CallbackQuery):
-    if callback.message.chat.type == "private":
+    if callback.message.chat.type not in ("group", "supergroup"):
         return await callback.answer("⚙️ Только в группе.", show_alert=True)
     if not await settings_owner_ok(callback):
-        return await callback.answer("⚠️ Настройки доступны только во время набора.", show_alert=True)
+        return await callback.answer("⚠️ Настройки доступны только в группе.", show_alert=True)
     action=callback.data.split(":",1)[1]
     chat_id=callback.message.chat.id
-    st=await db.get_lobby_settings(chat_id)
+    st=await db.get_chat_settings(chat_id)
     if action == "toggle_type":
         await db.set_lobby_setting(chat_id, "game_type", "club" if st.get("game_type") == "player" else "player")
     elif action == "reset":
@@ -1375,9 +1371,9 @@ async def settings_callback(callback: types.CallbackQuery):
         key, values = {"discussion": ("discussion_time", [30,45,60,90,120,180,240,300]), "voting": ("voting_time", [45,60,75,90,105,120,150,180]), "reveal": ("reveal_time", [20,30,40,50,60])}[action]
         current=int(st.get(key, values[0])); nxt=values[(values.index(current)+1)%len(values)] if current in values else values[0]
         await db.set_lobby_setting(chat_id, key, nxt)
-    st=await db.get_lobby_settings(chat_id)
+    st=await db.get_chat_settings(chat_id)
     await callback.message.edit_text(await settings_text(chat_id), reply_markup=settings_keyboard(st), parse_mode="HTML")
-    await callback.answer("Настройки сохранены")
+    await callback.answer("Настройки сохранены для группы")
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
