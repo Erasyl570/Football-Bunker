@@ -45,6 +45,14 @@ async def _init_stats_db():
                     item_id TEXT NOT NULL,
                     PRIMARY KEY (user_id, item_id)
                 )
+                ;
+                CREATE TABLE IF NOT EXISTS bunker_chat_settings (
+                    chat_id BIGINT PRIMARY KEY,
+                    game_type TEXT NOT NULL DEFAULT 'player',
+                    discussion_time INTEGER NOT NULL DEFAULT 60,
+                    voting_time INTEGER NOT NULL DEFAULT 105,
+                    reveal_time INTEGER NOT NULL DEFAULT 40
+                )
             """)
             # Мягкая миграция для экономики v9 → v10.
             await conn.execute("ALTER TABLE bunker_economy ADD COLUMN IF NOT EXISTS equipped_badge TEXT NOT NULL DEFAULT ''")
@@ -501,20 +509,88 @@ async def _ensure_lobby_setting_columns():
                 await db.execute(f"ALTER TABLE lobbies ADD COLUMN {name} {definition}")
         await db.commit()
 
-async def get_lobby_settings(chat_id: int) -> dict:
+async def _default_settings():
+    return {"game_type": "player", "discussion_time": 60, "voting_time": 105, "reveal_time": 40}
+
+async def _get_persistent_chat_settings(chat_id: int) -> dict:
+    defaults = await _default_settings()
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT game_type, discussion_time, voting_time, reveal_time FROM bunker_chat_settings WHERE chat_id=$1",
+                chat_id,
+            )
+            if not row:
+                await conn.execute(
+                    "INSERT INTO bunker_chat_settings(chat_id) VALUES($1) ON CONFLICT(chat_id) DO NOTHING",
+                    chat_id,
+                )
+                return defaults.copy()
+            return {
+                "game_type": row["game_type"] or "player",
+                "discussion_time": int(row["discussion_time"] or 60),
+                "voting_time": int(row["voting_time"] or 105),
+                "reveal_time": int(row["reveal_time"] or 40),
+            }
     await _ensure_lobby_setting_columns()
     async with connect_db() as db:
-        async with db.execute("SELECT game_type, discussion_time, voting_time, reveal_time FROM lobbies WHERE chat_id=?", (chat_id,)) as cur:
-            row=await cur.fetchone()
-    if not row:
-        return {"game_type":"player", "discussion_time":60, "voting_time":105, "reveal_time":40}
-    return {"game_type": row[0] or "player", "discussion_time": row[1] or 60, "voting_time": row[2] or 105, "reveal_time": row[3] or 40}
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bunker_chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                game_type TEXT NOT NULL DEFAULT 'player',
+                discussion_time INTEGER NOT NULL DEFAULT 60,
+                voting_time INTEGER NOT NULL DEFAULT 105,
+                reveal_time INTEGER NOT NULL DEFAULT 40
+            )
+        """)
+        async with db.execute("SELECT game_type, discussion_time, voting_time, reveal_time FROM bunker_chat_settings WHERE chat_id=?", (chat_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT OR IGNORE INTO bunker_chat_settings(chat_id) VALUES(?)", (chat_id,))
+            await db.commit()
+            return defaults.copy()
+        return {"game_type": row[0] or "player", "discussion_time": row[1] or 60, "voting_time": row[2] or 105, "reveal_time": row[3] or 40}
+
+async def get_chat_settings(chat_id: int) -> dict:
+    """Persistent settings configured for the group, independent of active games."""
+    return await _get_persistent_chat_settings(chat_id)
+
+async def get_lobby_settings(chat_id: int) -> dict:
+    """Return active-lobby snapshot; otherwise return the group's persistent settings."""
+    await _ensure_lobby_setting_columns()
+    async with connect_db() as db:
+        async with db.execute("SELECT status, game_type, discussion_time, voting_time, reveal_time FROM lobbies WHERE chat_id=?", (chat_id,)) as cur:
+            row = await cur.fetchone()
+    if row and row[0] not in ("ended", "cancelled"):
+        return {"game_type": row[1] or "player", "discussion_time": row[2] or 60, "voting_time": row[3] or 105, "reveal_time": row[4] or 40}
+    return await _get_persistent_chat_settings(chat_id)
 
 async def set_lobby_setting(chat_id: int, key: str, value):
     allowed={"game_type","discussion_time","voting_time","reveal_time"}
     if key not in allowed:
         return False
     await _ensure_lobby_setting_columns()
+    # Persistent group preference: survives lobby deletion and process restarts.
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            await conn.execute(
+                f"INSERT INTO bunker_chat_settings(chat_id, {key}) VALUES($1, $2) ON CONFLICT(chat_id) DO UPDATE SET {key}=EXCLUDED.{key}",
+                chat_id, value,
+            )
+    else:
+        async with connect_db() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bunker_chat_settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    game_type TEXT NOT NULL DEFAULT 'player',
+                    discussion_time INTEGER NOT NULL DEFAULT 60,
+                    voting_time INTEGER NOT NULL DEFAULT 105,
+                    reveal_time INTEGER NOT NULL DEFAULT 40
+                )
+            """)
+            await db.execute(f"INSERT INTO bunker_chat_settings(chat_id,{key}) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET {key}=excluded.{key}", (chat_id,value))
+            await db.commit()
+    # Keep a lobby snapshot stable; only change it while the lobby is still being configured.
     async with connect_db() as db:
         await db.execute(f"UPDATE lobbies SET {key}=? WHERE chat_id=? AND status='lobby'", (value,chat_id))
         await db.commit()
@@ -522,6 +598,26 @@ async def set_lobby_setting(chat_id: int, key: str, value):
 
 async def reset_lobby_settings(chat_id: int):
     await _ensure_lobby_setting_columns()
+    defaults = await _default_settings()
+    if _stats_pool:
+        async with _stats_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO bunker_chat_settings(chat_id) VALUES($1)
+                ON CONFLICT(chat_id) DO UPDATE SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40
+            """, chat_id)
+    else:
+        async with connect_db() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bunker_chat_settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    game_type TEXT NOT NULL DEFAULT 'player',
+                    discussion_time INTEGER NOT NULL DEFAULT 60,
+                    voting_time INTEGER NOT NULL DEFAULT 105,
+                    reveal_time INTEGER NOT NULL DEFAULT 40
+                )
+            """)
+            await db.execute("INSERT INTO bunker_chat_settings(chat_id) VALUES(?) ON CONFLICT(chat_id) DO UPDATE SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40", (chat_id,))
+            await db.commit()
     async with connect_db() as db:
         await db.execute("UPDATE lobbies SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40 WHERE chat_id=? AND status='lobby'", (chat_id,))
         await db.commit()
@@ -529,6 +625,7 @@ async def reset_lobby_settings(chat_id: int):
 async def create_lobby(chat_id: int, host_id: int) -> bool:
     """Создаёт лобби только если в чате нет активной игры. Возвращает True/False."""
     await _ensure_lobby_setting_columns()
+    prefs = await _get_persistent_chat_settings(chat_id)
     async with connect_db() as db:
         async with db.execute("SELECT status FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
@@ -541,8 +638,8 @@ async def create_lobby(chat_id: int, host_id: int) -> bool:
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM hidden_captains WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id, game_type, discussion_time, voting_time, reveal_time) VALUES (?, ?, ?, 1, 0, 'player', 60, 105, 40)",
-            (chat_id, host_id, "lobby")
+            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id, game_type, discussion_time, voting_time, reveal_time) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?)",
+            (chat_id, host_id, "lobby", prefs["game_type"], prefs["discussion_time"], prefs["voting_time"], prefs["reveal_time"])
         )
         await db.commit()
         return True
