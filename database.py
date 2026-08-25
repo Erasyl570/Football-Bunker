@@ -74,6 +74,7 @@ async def init_db():
             )
         """)
         
+        await db.commit()
         await db.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 chat_id INTEGER,
@@ -484,8 +485,50 @@ async def health_check():
 
 # --- ЛОГИКА ЛОББИ ---
 
+
+async def _ensure_lobby_setting_columns():
+    async with connect_db() as db:
+        async with db.execute("PRAGMA table_info(lobbies)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        additions = {
+            "game_type": "TEXT DEFAULT 'player'",
+            "discussion_time": "INTEGER DEFAULT 60",
+            "voting_time": "INTEGER DEFAULT 105",
+            "reveal_time": "INTEGER DEFAULT 40",
+        }
+        for name, definition in additions.items():
+            if name not in cols:
+                await db.execute(f"ALTER TABLE lobbies ADD COLUMN {name} {definition}")
+        await db.commit()
+
+async def get_lobby_settings(chat_id: int) -> dict:
+    await _ensure_lobby_setting_columns()
+    async with connect_db() as db:
+        async with db.execute("SELECT game_type, discussion_time, voting_time, reveal_time FROM lobbies WHERE chat_id=?", (chat_id,)) as cur:
+            row=await cur.fetchone()
+    if not row:
+        return {"game_type":"player", "discussion_time":60, "voting_time":105, "reveal_time":40}
+    return {"game_type": row[0] or "player", "discussion_time": row[1] or 60, "voting_time": row[2] or 105, "reveal_time": row[3] or 40}
+
+async def set_lobby_setting(chat_id: int, key: str, value):
+    allowed={"game_type","discussion_time","voting_time","reveal_time"}
+    if key not in allowed:
+        return False
+    await _ensure_lobby_setting_columns()
+    async with connect_db() as db:
+        await db.execute(f"UPDATE lobbies SET {key}=? WHERE chat_id=? AND status='lobby'", (value,chat_id))
+        await db.commit()
+    return True
+
+async def reset_lobby_settings(chat_id: int):
+    await _ensure_lobby_setting_columns()
+    async with connect_db() as db:
+        await db.execute("UPDATE lobbies SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40 WHERE chat_id=? AND status='lobby'", (chat_id,))
+        await db.commit()
+
 async def create_lobby(chat_id: int, host_id: int) -> bool:
     """Создаёт лобби только если в чате нет активной игры. Возвращает True/False."""
+    await _ensure_lobby_setting_columns()
     async with connect_db() as db:
         async with db.execute("SELECT status FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
@@ -498,7 +541,7 @@ async def create_lobby(chat_id: int, host_id: int) -> bool:
         await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
         await db.execute("DELETE FROM hidden_captains WHERE chat_id = ?", (chat_id,))
         await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id) VALUES (?, ?, ?, 1, 0)",
+            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id, game_type, discussion_time, voting_time, reveal_time) VALUES (?, ?, ?, 1, 0, 'player', 60, 105, 40)",
             (chat_id, host_id, "lobby")
         )
         await db.commit()
