@@ -351,6 +351,14 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
     print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
     return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена без вердикта.</i>"
 
+async def get_game_type(chat_id: int) -> str:
+    """Возвращает тип текущей игры или сохранённый тип группы."""
+    try:
+        settings = await db.get_lobby_settings(chat_id)
+        return (settings or {}).get("game_type", "player")
+    except Exception:
+        return "player"
+
 async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
     game_type = await get_game_type(chat_id)
@@ -986,6 +994,20 @@ async def start_game(callback: types.CallbackQuery):
         
         if num_players < 3:
             await db.set_lobby_status(chat_id, "lobby")
+            # Возвращаем кнопки после неудачной попытки старта.
+            try:
+                kb = InlineKeyboardBuilder()
+                kb.button(text="⚽️ Вступить в игру", callback_data="join_game")
+                kb.button(text="🚀 Начать игру (от 3 игроков)", callback_data="start_game")
+                kb.adjust(1)
+                plist = "\n".join([f"├ 👤 {html.escape(p[0])}" for p in players[:-1]] + ([f"└ 👤 {html.escape(players[-1][0])}"] if players else []))
+                await callback.message.edit_text(
+                    f"🎮 <b>НАБОР В ФУТБОЛЬНЫЙ БУНКЕР</b>\n───────────────────\n"
+                    f"👥 <b>Участники ({num_players}):</b>\n{plist}",
+                    reply_markup=kb.as_markup(), parse_mode="HTML"
+                )
+            except Exception:
+                pass
             return await callback.answer(f"⚠️ Сейчас участников: {num_players}. Нужно минимум 3 человека!", show_alert=True)
 
         await callback.answer("Игра начинается!")
@@ -1065,9 +1087,32 @@ async def start_game(callback: types.CallbackQuery):
             lobby = await db.get_lobby(chat_id)
             if lobby and lobby[0] == "starting":
                 await db.set_lobby_status(chat_id, "lobby")
+            # ВАЖНО: если старт упал после снятия клавиатуры, восстанавливаем лобби.
+            players_now = await db.get_players(chat_id)
+            kb = InlineKeyboardBuilder()
+            kb.button(text="⚽️ Вступить в игру", callback_data="join_game")
+            kb.button(text="🚀 Начать игру (от 3 игроков)", callback_data="start_game")
+            kb.adjust(1)
+            if players_now:
+                plist = "\n".join([f"├ 👤 {html.escape(p[0])}" for p in players_now[:-1]] + [f"└ 👤 {html.escape(players_now[-1][0])}"])
+            else:
+                plist = "—"
+            await callback.message.edit_text(
+                f"🎮 <b>НАБОР В ФУТБОЛЬНЫЙ БУНКЕР</b>\n───────────────────\n"
+                f"👥 <b>Участники ({len(players_now)}):</b>\n{plist}\n\n"
+                f"⚠️ <i>Не удалось запустить игру. Попробуйте ещё раз.</i>",
+                reply_markup=kb.as_markup(), parse_mode="HTML"
+            )
         except Exception:
             pass
-        await callback.answer(f"❌ Ошибка старта: {e}", show_alert=True)
+        try:
+            await callback.answer("❌ Не удалось запустить игру. Лобби восстановлено.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            print(f"[START_GAME] Ошибка в чате {chat_id}: {e}")
+        except Exception:
+            pass
 
 # --- КОМАНДЫ БОТА ---
 
