@@ -904,12 +904,24 @@ async def has_revealed_in_round(chat_id: int, user_id: int, round_num: int) -> b
         async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND round_num = ?", (chat_id, user_id, round_num)) as cursor:
             return await cursor.fetchone() is not None
 
-async def get_unrevealed_traits(chat_id: int, user_id: int):
-    all_traits = ["position", "age", "price", "health", "skill", "inventory", "secret"]
+async def get_unrevealed_traits(chat_id: int, user_id: int, all_traits=None):
+    # Список характеристик зависит от режима игры. В старой версии здесь
+    # всегда были характеристики игрока, поэтому в режиме клубов бот мог
+    # автоматически выбрать несуществующий "Навык" или "Багаж".
+    if all_traits is None:
+        all_traits = ["position", "age", "price", "health", "skill", "inventory", "secret"]
     async with connect_db() as db:
         async with db.execute("SELECT trait FROM reveals WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
             revealed = [row[0] for row in await cursor.fetchall()]
     return [t for t in all_traits if t not in revealed]
+
+async def get_lobby_game_type_snapshot(chat_id: int):
+    """Тип конкретной игры, сохранённый в лобби, включая уже завершённую игру."""
+    await _ensure_lobby_setting_columns()
+    async with connect_db() as db:
+        async with db.execute("SELECT game_type FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+    return (row[0] or "player") if row else None
 
 # --- ГОЛОСОВАНИЕ И ИСКЛЮЧЕНИЕ ---
 
