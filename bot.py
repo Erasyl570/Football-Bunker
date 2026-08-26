@@ -352,12 +352,18 @@ async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
     return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена без вердикта.</i>"
 
 async def get_game_type(chat_id: int) -> str:
-    """Возвращает тип текущей игры или сохранённый тип группы."""
+    """Возвращает тип конкретной игры из snapshot лобби; иначе постоянную настройку группы."""
     try:
+        snapshot = await db.get_lobby_game_type_snapshot(chat_id)
+        if snapshot in ("player", "club"):
+            return snapshot
         settings = await db.get_lobby_settings(chat_id)
         return (settings or {}).get("game_type", "player")
     except Exception:
         return "player"
+
+async def get_game_traits(chat_id: int):
+    return [key for key, _ in (CLUB_TRAITS if await get_game_type(chat_id) == "club" else PLAYER_TRAITS)]
 
 async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
@@ -434,11 +440,19 @@ async def build_players_summary(chat_id: int) -> str:
     if not alive_players:
         return ""
 
-    trait_structure = [
-        ("position", "💼", "Позиция"), ("age", "👤", "Возраст"),
-        ("price", "💰", "Цена"), ("health", "❤️", "Здоровье"),
-        ("skill", "🎯", "Навык"), ("inventory", "🎒", "Багаж"), ("secret", "🔍", "Секрет")
-    ]
+    if await get_game_type(chat_id) == "club":
+        trait_structure = [
+            ("budget", "💰", "Бюджет"), ("squad", "👥", "Состав"),
+            ("finance", "📊", "Финансы"), ("infrastructure", "🏟️", "Инфраструктура"),
+            ("reputation", "🏆", "Репутация"), ("problem", "⚠️", "Проблема"),
+            ("secret", "🔍", "Секрет")
+        ]
+    else:
+        trait_structure = [
+            ("position", "💼", "Позиция"), ("age", "👤", "Возраст"),
+            ("price", "💰", "Цена"), ("health", "❤️", "Здоровье"),
+            ("skill", "🎯", "Навык"), ("inventory", "🎒", "Багаж"), ("secret", "🔍", "Секрет")
+        ]
 
     players_blocks = []
     for idx, (p_name, p_id) in enumerate(alive_players, 1):
@@ -464,13 +478,19 @@ async def build_players_summary(chat_id: int) -> str:
     return "\n\n".join(players_blocks)
 
 async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, current_round: int):
-    unrevealed = await db.get_unrevealed_traits(chat_id, user_id)
+    unrevealed = await db.get_unrevealed_traits(chat_id, user_id, await get_game_traits(chat_id))
     if unrevealed:
         chosen_trait = random.choice(unrevealed)
         pack = await db.get_player_pack(chat_id, user_id)
-        
-        val = pack.get(chosen_trait, "-")
-        if chosen_trait == "age" and val != "-":
+        if chosen_trait not in pack or pack.get(chosen_trait) in (None, ""):
+            # Не записываем "-" как раскрытую характеристику: выбираем
+            # другую существующую карту, если данные были повреждены.
+            valid = [t for t in await get_game_traits(chat_id) if t in pack and pack.get(t) not in (None, "") and not await db.is_trait_revealed(chat_id, user_id, t)]
+            if not valid:
+                return
+            chosen_trait = random.choice(valid)
+        val = pack[chosen_trait]
+        if chosen_trait == "age":
             val = f"{val} лет"
         
         await db.record_reveal(chat_id, user_id, chosen_trait, current_round)
@@ -865,7 +885,7 @@ async def process_special_target(callback: types.CallbackQuery):
 
     elif card_code == "spy":
         target_pack = await db.get_player_pack(chat_id, target_user_id)
-        unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
+        unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id, await get_game_traits(chat_id))
         if not unrevealed:
             await callback.message.answer("👁 Все карты этого игрока уже открыты!")
         else:
@@ -887,7 +907,7 @@ async def process_special_target(callback: types.CallbackQuery):
         await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
     elif card_code == "flash":
-        unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
+        unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id, await get_game_traits(chat_id))
         if not unrevealed:
             await callback.message.edit_text(f"📸 У игрока {html.escape(target_name)} нет закрытых карт!")
         else:
@@ -904,8 +924,8 @@ async def process_special_target(callback: types.CallbackQuery):
             )
 
     elif card_code == "chaos":
-        actor_unrevealed = await db.get_unrevealed_traits(chat_id, actor.id)
-        target_unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id)
+        actor_unrevealed = await db.get_unrevealed_traits(chat_id, actor.id, await get_game_traits(chat_id))
+        target_unrevealed = await db.get_unrevealed_traits(chat_id, target_user_id, await get_game_traits(chat_id))
 
         if actor_unrevealed and target_unrevealed:
             a_trait = random.choice(actor_unrevealed)
@@ -939,10 +959,15 @@ async def process_flash_reveal(callback: types.CallbackQuery):
     if actor.id not in {p[1] for p in alive_players}:
         return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
 
+    valid_traits = await get_game_traits(chat_id)
+    if trait not in valid_traits:
+        return await callback.answer("❌ Эта карта отсутствует в текущем режиме игры.", show_alert=True)
     target_name = await db.get_username(chat_id, target_user_id)
     pack = await db.get_player_pack(chat_id, target_user_id)
-    val = pack.get(trait, "-")
-    if trait == "age" and val != "-":
+    if trait not in pack or pack.get(trait) in (None, ""):
+        return await callback.answer("❌ Значение карты не найдено.", show_alert=True)
+    val = pack[trait]
+    if trait == "age":
         val = f"{val} лет"
 
     await db.record_reveal(chat_id, target_user_id, trait, 0)
@@ -1564,9 +1589,15 @@ async def process_reveal(callback: types.CallbackQuery):
         if await db.has_revealed_in_round(target_chat_id, user.id, current_round):
             return await callback.answer(f"⚠️ В этом раунде ты уже вскрывал карту!", show_alert=True)
 
+        valid_traits = await get_game_traits(target_chat_id)
+        if trait not in valid_traits:
+            return await callback.answer("⚠️ Эта характеристика не используется в текущем режиме игры.", show_alert=True)
+
         pack = await db.get_player_pack(target_chat_id, user.id)
-        val = pack.get(trait, "-")
-        if trait == "age" and val != "-": val = f"{val} лет"
+        if trait not in pack or pack.get(trait) in (None, ""):
+            return await callback.answer("⚠️ Карта не загрузилась. Попробуй ещё раз.", show_alert=True)
+        val = pack[trait]
+        if trait == "age": val = f"{val} лет"
 
         await db.record_reveal(target_chat_id, user.id, trait, current_round)
         await db.record_daily_event(user.id, "reveal")
