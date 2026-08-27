@@ -378,6 +378,17 @@ async def get_game_type(chat_id: int) -> str:
 async def get_game_traits(chat_id: int):
     return [key for key, _ in (CLUB_TRAITS if await get_game_type(chat_id) == "club" else PLAYER_TRAITS)]
 
+async def delete_reveal_queue_message(chat_id: int, user_id: int, current_round: int):
+    """Удаляет публичное сообщение об очереди сразу после открытия карты."""
+    queue_key = (chat_id, user_id, current_round)
+    message_id = REVEAL_QUEUE_MESSAGES.pop(queue_key, None)
+    if message_id:
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception as e:
+            # Сообщение могло уже быть удалено таймером/модерацией. Игру это не ломает.
+            print(f"[QUEUE CLEANUP] Не удалось удалить очередь {queue_key}: {e}")
+
 async def build_reveal_keyboard(chat_id: int, user_id: int):
     builder = InlineKeyboardBuilder()
     game_type = await get_game_type(chat_id)
@@ -449,46 +460,63 @@ async def refresh_private_card(chat_id: int, user_id: int):
         print(f"[CARD REFRESH] Не удалось обновить ЛС игрока {user_id}: {e}")
 
 async def build_players_summary(chat_id: int) -> str:
+    """Компактный и легко читаемый список карт для фазы обсуждения."""
     alive_players = await db.get_alive_players(chat_id)
     if not alive_players:
         return ""
 
-    if await get_game_type(chat_id) == "club":
+    game_type = await get_game_type(chat_id)
+    if game_type == "club":
         trait_structure = [
-            ("budget", "💰", "Бюджет"), ("squad", "👥", "Состав"),
-            ("finance", "📊", "Финансы"), ("infrastructure", "🏟️", "Инфраструктура"),
-            ("reputation", "🏆", "Репутация"), ("problem", "⚠️", "Проблема"),
-            ("secret", "🔍", "Секрет")
+            ("budget", "Бюджет"), ("squad", "Состав"),
+            ("finance", "Финансы"), ("infrastructure", "Инфраструктура"),
+            ("reputation", "Репутация"), ("problem", "Проблема"),
+            ("secret", "Секрет")
         ]
     else:
         trait_structure = [
-            ("position", "💼", "Позиция"), ("age", "👤", "Возраст"),
-            ("price", "💰", "Цена"), ("health", "❤️", "Здоровье"),
-            ("skill", "🎯", "Навык"), ("inventory", "🎒", "Багаж"), ("secret", "🔍", "Секрет")
+            ("position", "Позиция"), ("age", "Возраст"),
+            ("price", "Цена"), ("health", "Здоровье"),
+            ("skill", "Навык"), ("inventory", "Багаж"),
+            ("secret", "Секрет")
         ]
 
-    players_blocks = []
+    number_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    players_blocks = ["📋 <b>СТАТУС КАРТОЧЕК</b>", "<i>Открытое — видно всем · 🔒 — пока скрыто</i>", "───────────────────"]
+
     for idx, (p_name, p_id) in enumerate(alive_players, 1):
         pack = await db.get_player_pack(chat_id, p_id) or {}
-        player_lines = [f"👤 <b>{idx}. {html.escape(p_name)}</b>"]
+        icon = number_icons[idx - 1] if idx <= len(number_icons) else f"<b>{idx}.</b>"
+        lines = [f"{icon} <b>{html.escape(p_name)}</b>"]
 
-        total_traits = len(trait_structure)
-        for t_idx, (trait_key, emoji, title) in enumerate(trait_structure):
-            is_last = (t_idx == total_traits - 1)
-            prefix = "└" if is_last else "├"
-            
+        if game_type == "club":
+            # Название клуба является частью самой карточки и показывается отдельно,
+            # только если оно уже доступно в карточке игрока.
+            club_name = pack.get("club")
+            if club_name:
+                lines.append(f"   Клуб — <b>{html.escape(str(club_name))}</b>")
+
+        for trait_key, title in trait_structure:
             is_revealed = await db.is_trait_revealed(chat_id, p_id, trait_key)
             if is_revealed:
-                val = pack.get(trait_key, "-")
-                if trait_key == "age" and val != "-":
-                    val = f"{val} лет"
-                player_lines.append(f"{prefix} {emoji} {title}: <b>{html.escape(str(val))}</b>")
+                val = pack.get(trait_key)
+                if val in (None, ""):
+                    value_text = "—"
+                else:
+                    value_text = str(val)
+                    if trait_key == "age":
+                        value_text += " лет"
+                lines.append(f"   {title} — <b>{html.escape(value_text)}</b>")
             else:
-                player_lines.append(f"{prefix} {emoji} {title}: <i>🔒 Скрыто</i>")
+                lines.append(f"   {title} — 🔒 <i>скрыто</i>")
 
-        players_blocks.append("\n\n".join(player_lines))
+        players_blocks.append("\n".join(lines))
+        players_blocks.append("───────────────────")
 
-    return "\n\n".join(players_blocks)
+    # Не оставляем лишнюю разделительную линию в самом конце.
+    if players_blocks[-1] == "───────────────────":
+        players_blocks.pop()
+    return "\n".join(players_blocks)
 
 async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, current_round: int):
     unrevealed = await db.get_unrevealed_traits(chat_id, user_id, await get_game_traits(chat_id))
@@ -645,20 +673,20 @@ async def start_round_flow(chat_id: int, current_round: int):
             if not await is_game_active(chat_id): return
             await db.set_current_turn(chat_id, p_id)
             
+            settings = await db.get_lobby_settings(chat_id)
+            reveal_time = int(settings.get("reveal_time", 40)) if settings else 40
+
             builder = InlineKeyboardBuilder()
             builder.button(text="📩 Открыть карту / Спец-карту", url=f"https://t.me/{bot_info.username}")
             
             safe_p_name = html.escape(p_name)
             queue_msg = await bot.send_message(
                 chat_id,
-                f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n───────────────────\n👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n⏳ <i>У тебя 40 секунд...</i>",
+                f"🎲 <b>ОЧЕРЕДЬ: {safe_p_name}</b>\n───────────────────\n👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, открой 1 карту в ЛС.\n⏳ <i>На ход: {format_duration(reveal_time)}</i>",
                 reply_markup=builder.as_markup(),
                 parse_mode="HTML"
             )
             REVEAL_QUEUE_MESSAGES[(chat_id, p_id, current_round)] = queue_msg.message_id
-
-            settings = await db.get_lobby_settings(chat_id)
-            reveal_time = int(settings.get("reveal_time", 40)) if settings else 40
             for _ in range(reveal_time):
                 if not await is_game_active(chat_id): return
                 if await db.has_revealed_in_round(chat_id, p_id, current_round): break
@@ -1626,6 +1654,8 @@ async def process_reveal(callback: types.CallbackQuery):
 
         await db.record_reveal(target_chat_id, user.id, trait, current_round)
         await db.record_daily_event(user.id, "reveal")
+        # Игрок открыл карту — публичное сообщение «Очередь игрока» больше не нужно.
+        await delete_reveal_queue_message(target_chat_id, user.id, current_round)
         image_url = CARD_IMAGES.get(trait, "")
         msg_text = ((f'<a href="{image_url}">&#8203;</a>🔓 ' if image_url else '🔓 ') +
                     f'<b>{html.escape(user.first_name)}</b> вскрывает <b>[{TRAIT_LABELS.get(trait, trait)}]</b>:\n└ 👉 <b>{html.escape(str(val))}</b>')
@@ -1654,8 +1684,6 @@ async def start_voting_flow(chat_id: int, round_num: int):
     await db.clear_votes(chat_id)
     settings = await db.get_lobby_settings(chat_id)
     voting_time = int(settings.get("voting_time", 105)) if settings else 105
-    summary_text = await build_players_summary(chat_id)
-
     builder = InlineKeyboardBuilder()
     for p_name, p_id in alive_players:
         builder.button(text=f"❌ {p_name}", callback_data=f"vote:{p_id}")
