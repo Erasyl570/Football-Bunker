@@ -56,6 +56,19 @@ dp.callback_query.outer_middleware(CallbackRateLimitMiddleware())
 # Один запрос Gemini одновременно. При 429/503/временных сбоях — повтор с backoff.
 GEMINI_SEMAPHORE = asyncio.Semaphore(1)
 GEMINI_CACHE = {}
+
+# Сообщения «очередь игрока» в общем чате. Удаляются сразу после вскрытия карты.
+REVEAL_QUEUE_MESSAGES = {}
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    parts = []
+    if minutes:
+        parts.append(f"{minutes} минута" if minutes == 1 else f"{minutes} минуты" if minutes in (2, 3, 4) else f"{minutes} минут")
+    if secs:
+        parts.append(f"{secs} секунда" if secs == 1 else f"{secs} секунды" if secs in (2, 3, 4) else f"{secs} секунд")
+    return " ".join(parts) if parts else "0 секунд"
 FINALIZING_GAMES = set()
 # Один управляемый игровой task на чат. Не даём старым раундам накапливаться.
 GAME_TASKS = {}
@@ -289,15 +302,15 @@ async def victory_effect(user_id: int, name: str) -> str:
     effect = (await db.get_equipped(user_id))["victory"]
     n = html.escape(name)
     phrases = {
-        "victory_fire": f"🎆✨ {n} — ПОБЕДИТЕЛЬ! ✨🎆",
-        "victory_gold": f"🏆💛 {n} — ЗОЛОТОЙ ФИНАЛ! 💛🏆",
-        "victory_goodbye": f"🚪 {n}: «До свидания, дилетанты.»",
-        "victory_whose_left": f"😈 {n}: «Ну и кто тут лишний?»",
-        "victory_i_told": f"🗿 {n}: «Я же говорил.»",
-        "victory_cold": f"🧊 {n} — без лишних слов.",
-        "victory_last": f"🚪 {n} — последний в бункере.",
+        "victory_fire": f"🎆 В финале <b>{n}</b> спокойно откидывается назад.\n💬 <i>«Вот теперь можно праздновать. Вы сами оставили меня в бункере.»</i>",
+        "victory_gold": f"🏆 Последний голос затихает. <b>{n}</b> смотрит на остальных и усмехается.\n💬 <i>«Спасибо за выбор. В следующий раз думайте дольше.»</i>",
+        "victory_goodbye": f"🚪 <b>{n}</b> проходит в финал, оборачивается к выбывшим и бросает: <i>«До свидания, дилетанты. Контракт уже мой.»</i>",
+        "victory_whose_left": f"😈 Когда всё заканчивается, <b>{n}</b> оглядывает оставшихся: <i>«И кто теперь тут лишний?»</i>",
+        "victory_i_told": f"🗿 <b>{n}</b> пожимает плечами: <i>«Я же говорил. Просто вы решили проверить.»</i>",
+        "victory_cold": f"🧊 Все спорят ещё несколько секунд. <b>{n}</b> лишь говорит: <i>«Результат перед вами.»</i>",
+        "victory_last": f"🚪 Дверь бункера закрывается. Последним остаётся <b>{n}</b>.\n💬 <i>«Ну что, увидимся на следующем отборе.»</i>",
     }
-    return phrases.get(effect, f"🏆 {n} — победитель!")
+    return phrases.get(effect, f"🏆 В конце <b>{n}</b> усмехается: <i>«Контракт остаётся за мной.»</i>")
 
 async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
@@ -636,12 +649,13 @@ async def start_round_flow(chat_id: int, current_round: int):
             builder.button(text="📩 Открыть карту / Спец-карту", url=f"https://t.me/{bot_info.username}")
             
             safe_p_name = html.escape(p_name)
-            await bot.send_message(
+            queue_msg = await bot.send_message(
                 chat_id,
                 f"🎲 <b>ОЧЕРЕДЬ ИГРОКА: {safe_p_name}</b>\n───────────────────\n👉 <a href='tg://user?id={p_id}'><b>{safe_p_name}</b></a>, перейди в ЛС и открой 1 карту!\n⏳ <i>У тебя 40 секунд...</i>",
                 reply_markup=builder.as_markup(),
                 parse_mode="HTML"
             )
+            REVEAL_QUEUE_MESSAGES[(chat_id, p_id, current_round)] = queue_msg.message_id
 
             settings = await db.get_lobby_settings(chat_id)
             reveal_time = int(settings.get("reveal_time", 40)) if settings else 40
@@ -651,6 +665,14 @@ async def start_round_flow(chat_id: int, current_round: int):
                 await asyncio.sleep(1)
 
             if not await is_game_active(chat_id): return
+            queue_key = (chat_id, p_id, current_round)
+            queue_message_id = REVEAL_QUEUE_MESSAGES.pop(queue_key, None)
+            if queue_message_id:
+                try:
+                    await bot.delete_message(chat_id, queue_message_id)
+                except Exception as e:
+                    print(f"[QUEUE CLEANUP] Не удалось удалить сообщение очереди: {e}")
+
             if not await db.has_revealed_in_round(chat_id, p_id, current_round):
                 await auto_reveal_single_player(chat_id, p_id, p_name, current_round)
 
@@ -667,8 +689,11 @@ async def start_round_flow(chat_id: int, current_round: int):
         if not has_voting:
             discussion_time = min(discussion_time, 60)
 
+        summary_text = await build_players_summary(chat_id)
         discussion_msg = f"💬 <b>РАУНД {current_round} | ОБСУЖДЕНИЕ ({discussion_time} СЕКУНД)</b>\n───────────────────\n"
-        discussion_msg += "Обсуждайте открытые карты и готовьтесь к голосованию!" if has_voting else "Первое голосование откроется в Раунде 3."
+        discussion_msg += ("Обсуждайте открытые карты и готовьтесь к голосованию!" if has_voting else "Первое голосование откроется в Раунде 3.")
+        if summary_text:
+            discussion_msg += f"\n\n📋 <b>КАРТЫ В РАУНДЕ</b>\n\n{summary_text}"
         
         await bot.send_message(chat_id, discussion_msg, parse_mode="HTML")
         await asyncio.sleep(discussion_time)
@@ -1642,10 +1667,19 @@ async def start_voting_flow(chat_id: int, round_num: int):
 
     await bot.send_message(
         chat_id,
-        f"📋 <b>ОТКРЫТЫЕ ХАРАКТЕРИСТИКИ</b>\n\n{summary_text}\n───────────────────\n🗳 <b>ГОЛОСОВАНИЕ (Раунд {round_num})</b>\n⏭️ <b>Скип:</b> можно пропустить максимум 3 голосования за игру. Скип работает как ничья — никто не выбывает, пенальти за него не будет.\n⏳ Время: 1 минута 45 секунд.",
+        f"🗳 <b>ГОЛОСОВАНИЕ (Раунд {round_num})</b>\n───────────────────\n⏭️ <b>Скип:</b> можно пропустить максимум 3 голосования за игру. Скип работает как ничья — никто не выбывает, пенальти за него не будет.\n⏳ Время: <b>{format_duration(voting_time)}</b>.",
         reply_markup=builder.as_markup(), parse_mode="HTML"
     )
-    await asyncio.sleep(voting_time)
+
+    # Одно предупреждение за 30 секунд до конца, если сам таймер больше 30 секунд.
+    if voting_time > 30:
+        await asyncio.sleep(voting_time - 30)
+        lobby_30 = await db.get_lobby(chat_id)
+        if lobby_30 and lobby_30[0] == "voting" and lobby_30[4] == round_num:
+            await bot.send_message(chat_id, "⏳ <b>До конца голосования осталось 30 секунд.</b>", parse_mode="HTML")
+        await asyncio.sleep(30)
+    else:
+        await asyncio.sleep(voting_time)
 
     lobby = await db.get_lobby(chat_id)
     if lobby and lobby[0] == "voting" and lobby[4] == round_num:
