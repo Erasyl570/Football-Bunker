@@ -553,9 +553,16 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
         await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
 
 async def announce_winners_and_end(chat_id: int, alive_players: list):
+    # Сохраняем данные игры ДО перевода лобби в ended.
+    # Это гарантирует, что сценарий и статистика не потеряются в финале.
+    lobby_before_end = await db.get_lobby(chat_id)
+    scenario_text = (lobby_before_end[2] if lobby_before_end and len(lobby_before_end) > 2 and lobby_before_end[2]
+                     else "Цель сценария не указана.")
+    game_type = await get_game_type(chat_id)
+    game_stats = await db.get_game_stats(chat_id)
+
     if not await db.try_end_game(chat_id):
         return
-    game_stats = await db.get_game_stats(chat_id)
 
     all_players = await db.get_players(chat_id)
     alive_ids = {p[1] for p in alive_players}
@@ -569,15 +576,16 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
 
     # После завершения показываем всем полные карточки всех участников.
     all_cards_blocks = []
-    game_type = await get_game_type(chat_id)
     for idx, (p_name, p_id, _) in enumerate(all_players, 1):
         pack = await db.get_player_pack(chat_id, p_id) or {}
         spec_info = await db.get_player_special_info(chat_id, p_id)
         spec_code = spec_info[0] if spec_info else ""
         spec_used = bool(spec_info[1]) if spec_info else False
         spec_title = SPECIAL_CARD_NAMES.get(spec_code, "—")
-        if spec_used and spec_title != "—": spec_title += " (использована)"
+        if spec_used and spec_title != "—":
+            spec_title += " (использована)"
         alive_mark = "🏆" if p_id in alive_ids else "❌"
+
         if game_type == "club":
             all_cards_blocks.append(
                 f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b> — 🏟️ <b>{html.escape(str(pack.get('club','-')))}</b>\n"
@@ -606,30 +614,43 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
             )
 
     if not alive_players:
-        await bot.send_message(chat_id, "❌ <b>ИГРА ОКОНЧЕНА</b>\n───────────────────\nВсе претенденты выбыли! Победителей нет.", parse_mode="HTML")
-    else:
-        winners_str = "\n".join([f"├ 🏆 <b>{html.escape(p[0])}</b>" for p in alive_players[:-1]] + [f"└ 🏆 <b>{html.escape(alive_players[-1][0])}</b>"])
         await bot.send_message(
             chat_id,
-            f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nОставшиеся игроки претендуют на контракт:\n{winners_str}\n\n🤖 <i>ИИ-эксперт изучает все карточки и формирует вердикт...</i>",
+            "❌ <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\nВсе претенденты выбыли. Контракт никто не получает.",
+            parse_mode="HTML"
+        )
+    else:
+        winners_str = "\n".join(
+            [f"├ 🏆 <b>{html.escape(p[0])}</b>" for p in alive_players[:-1]] +
+            [f"└ 🏆 <b>{html.escape(alive_players[-1][0])}</b>"]
+        )
+        await bot.send_message(
+            chat_id,
+            f"🎉 <b>ИГРА ОКОНЧЕНА!</b>\n───────────────────\n"
+            f"Контракт получают:\n{winners_str}\n\n"
+            f"📋 <b>СЦЕНАРИЙ БЫЛ:</b>\n{scenario_text}\n\n"
+            f"🤖 <i>Проверяем, выполнены ли условия контракта...</i>",
             parse_mode="HTML"
         )
 
-    await bot.send_chat_action(chat_id, action="typing")
-
-    lobby = await db.get_lobby(chat_id)
-    scenario_text = lobby[2] if (lobby and len(lobby) > 2 and lobby[2]) else "Цель сценария не указана."
-
-    winners_data = []
-    for p_name, p_id in alive_players:
-        pack = await db.get_player_pack(chat_id, p_id) or {}
-        winners_data.append((p_name, pack))
-
-    ai_verdict = await evaluate_game_outcome(scenario_text, winners_data)
+    # Даже если Gemini временно недоступен, финал игры всё равно должен отправиться.
+    try:
+        await bot.send_chat_action(chat_id, action="typing")
+        winners_data = []
+        for p_name, p_id in alive_players:
+            pack = await db.get_player_pack(chat_id, p_id) or {}
+            winners_data.append((p_name, pack))
+        ai_verdict = await evaluate_game_outcome(scenario_text, winners_data)
+    except Exception as e:
+        print(f"[FINAL] Ошибка оценки сценария: {e}")
+        ai_verdict = "⚠️ <i>ИИ-судья не смог вынести вердикт. Карточки и сценарий всё равно раскрыты.</i>"
 
     await bot.send_message(
         chat_id,
-        f"📊 <b>ИТОГИ СЦЕНАРИЯ</b>\n───────────────────\n{ai_verdict}\n\n"
+        f"📋 <b>ИТОГ СЦЕНАРИЯ</b>\n"
+        f"───────────────────\n"
+        f"🎬 <b>Сценарий:</b>\n{scenario_text}\n\n"
+        f"{ai_verdict}\n\n"
         f"📈 <b>СТАТИСТИКА ИГРЫ</b>\n"
         f"🎮 Раундов: <b>{game_stats['rounds']}</b>\n"
         f"🗳 Голосов: <b>{game_stats['votes']}</b>\n"
@@ -640,14 +661,17 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     )
 
     if alive_players:
-        effects = "\n".join([await victory_effect(p_id, p_name) for p_name,p_id in alive_players])
-        await bot.send_message(chat_id, f"✨ <b>ПОБЕДНЫЕ ЭФФЕКТЫ</b>\n{effects}", parse_mode="HTML")
+        try:
+            effects = "\n".join([await victory_effect(p_id, p_name) for p_name, p_id in alive_players])
+            await bot.send_message(chat_id, f"✨ <b>ПОБЕДНЫЕ ЭФФЕКТЫ</b>\n{effects}", parse_mode="HTML")
+        except Exception as e:
+            print(f"[FINAL] Ошибка победных эффектов: {e}")
 
     await bot.send_message(
         chat_id,
         "🔓 <b>КАРТЫ РАСКРЫТЫ</b>\n───────────────────\n"
-        "Теперь можно узнать, что на самом деле скрывал каждый игрок:\n\n"
-        + "\n\n".join(all_cards_blocks),
+        "Теперь можно узнать, что на самом деле скрывал каждый игрок:\n\n" +
+        "\n\n".join(all_cards_blocks),
         parse_mode="HTML"
     )
 
@@ -1720,6 +1744,32 @@ async def start_voting_flow(chat_id: int, round_num: int):
             await bot.send_message(chat_id, f"👞 <b>{html.escape(nv_name)}</b> исключен за AFK!", parse_mode="HTML")
         await finish_voting_flow(chat_id)
 
+async def voting_outcome_is_fixed(chat_id: int) -> bool:
+    """True, если ни один ещё не проголосовавший уже не может изменить победивший исход."""
+    alive_players = await db.get_alive_players(chat_id)
+    non_voters = await db.get_non_voted_alive_players(chat_id)
+    n = len(non_voters)
+    if n == 0:
+        return False
+
+    votes_data = await db.get_votes_detailed(chat_id)
+    skip_votes = await db.get_skip_votes_count(chat_id)
+    counts = [row[2] for row in votes_data]
+    counts.append(skip_votes)
+    if not counts:
+        return False
+
+    top = max(counts)
+    # Если есть несколько текущих лидеров, любой оставшийся голос может изменить результат.
+    if counts.count(top) > 1:
+        return False
+
+    # Единственный лидер должен сохранить преимущество даже если все не проголосовавшие
+    # отдадут голоса одному сопернику/СКИПУ.
+    second = max((v for v in counts if v != top), default=0)
+    return (top - second) > n
+
+
 @dp.callback_query(F.data.startswith("vote:"))
 async def process_vote(callback: types.CallbackQuery):
     try:
@@ -1755,6 +1805,21 @@ async def process_vote(callback: types.CallbackQuery):
             await db.record_daily_event(voter.id, "vote")
             await callback.answer("Голос принят!")
             await bot.send_message(chat_id, f"🗳 <b>{html.escape(voter.first_name)}</b> проголосовал против <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
+
+        # Если оставшиеся игроки уже не способны изменить исход голосования,
+        # не заставляем их ждать таймер — они считаются AFK и сразу выбывают.
+        if await voting_outcome_is_fixed(chat_id):
+            non_voters_now = await db.get_non_voted_alive_players(chat_id)
+            if non_voters_now:
+                for nv_id, nv_name in non_voters_now:
+                    await db.eliminate_player(chat_id, nv_id)
+                    await bot.send_message(
+                        chat_id,
+                        f"👞 <b>{html.escape(nv_name)}</b> исключен: его голос уже не мог изменить исход.",
+                        parse_mode="HTML"
+                    )
+                await finish_voting_flow(chat_id)
+                return
 
         if await db.get_voters_count(chat_id) >= len(alive_players):
             await finish_voting_flow(chat_id)
