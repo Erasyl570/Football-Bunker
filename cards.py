@@ -420,13 +420,36 @@ CLUB_SECRETS = [
     "Скаутский отдел нашёл несколько скрытых кандидатов"
 ]
 
-def generate_game_packs(num_players: int, line_type: str = "attacker", game_type: str = "player") -> list:
+def generate_game_packs(num_players: int, line_type: str = "attacker", game_type: str = "player", required_positions=None) -> list:
+    """Generate cards. For player scenarios, required_positions guarantees that mandatory role(s)
+    mentioned in the scenario actually exist among the generated cards."""
     if game_type == "club":
         return generate_club_packs(num_players)
-    if line_type not in POSITIONS:
-        line_type = "attacker"
-    positions = get_sampled_list(POSITIONS[line_type], num_players)
-    skills = get_sampled_list(SKILLS[line_type], num_players)
+
+    if line_type == "mixed":
+        position_pool = POSITIONS["attacker"] + POSITIONS["defender"] + POSITIONS["midfielder"]
+        positions = get_sampled_list(position_pool, num_players)
+    elif line_type in POSITIONS:
+        positions = get_sampled_list(POSITIONS[line_type], num_players)
+    else:
+        positions = get_sampled_list(POSITIONS["attacker"], num_players)
+
+    # Force mandatory role categories into the pack so a scenario can always be completed.
+    required_positions = required_positions or []
+    for required_role in required_positions:
+        if required_role not in POSITIONS or not positions:
+            continue
+        # Replace a random slot, but never duplicate the same slot for two requirements.
+        idx = random.randrange(len(positions))
+        positions[idx] = random.choice(POSITIONS[required_role])
+
+    skill_pool_type = line_type if line_type in SKILLS else "attacker"
+    if line_type == "mixed":
+        skill_pool = SKILLS["attacker"] + SKILLS["defender"] + SKILLS["midfielder"]
+        skills = get_sampled_list(skill_pool, num_players)
+    else:
+        skills = get_sampled_list(SKILLS[skill_pool_type], num_players)
+
     healths = get_sampled_list(HEALTH_TRAITS, num_players)
     inventories = get_sampled_list(INVENTORIES, num_players)
     secrets = get_sampled_list(SECRETS, num_players)
@@ -456,55 +479,71 @@ def generate_club_packs(num_players: int) -> list:
     return packs
 
 def generate_scenario(players_count: int, game_type: str = "player") -> dict:
-    """Большой пул сценариев. Игроки: контракт на двоих + бюджет. Клубы: выбирается один клуб-победитель."""
+    """Generate a precise player contract scenario.
+    The first block contains mandatory conditions; the second is only narrative context.
+    """
     if game_type == "club":
         return generate_club_scenario(players_count)
+
     budget = random.choice([90, 100, 120, 140, 160, 180, 200, 230, 260, 300, 350, 400])
     club = random.choice(CLUB_NAMES)
-    primary = random.choice([
-        ("🎯", "Хотя бы один игрок должен иметь навык не ниже <b>{skill}</b>.", lambda: {"skill": random.choice([72,76,80,84,88])}),
-        ("❤️", "Оба игрока должны иметь здоровье не ниже <b>{health}</b>.", lambda: {"health": random.choice([35,45,55,65,75])}),
-        ("👶", "Хотя бы один игрок должен быть не старше <b>{age}</b> лет.", lambda: {"age": random.choice([22,24,26,28])}),
-        ("🧠", "Один игрок должен иметь навык <b>{skill}+</b>, второй — здоровье <b>{health}+</b>.", lambda: {"skill": random.choice([78,82,86]), "health": random.choice([45,55,65])}),
-        ("⚽", "В паре обязательно должен быть атакующий игрок." , lambda: {}),
-        ("🛡", "В паре обязательно должен быть защитник.", lambda: {}),
-        ("⚙️", "В паре обязательно должен быть полузащитник.", lambda: {}),
-        ("🔥", "Хотя бы один игрок должен сочетать здоровье <b>{health}+</b> и навык <b>{skill}+</b>.", lambda: {"health": random.choice([45,55,65]), "skill": random.choice([75,80,85])}),
-        ("💎", "Один игрок должен быть не старше <b>{age}</b> лет и иметь навык <b>{skill}+</b>.", lambda: {"age": random.choice([23,25,27]), "skill": random.choice([75,80,85])}),
-        ("🎒", "Хотя бы один игрок должен иметь багаж, полезный для командной подготовки.", lambda: {}),
-        ("🔍", "Ни один раскрытый секрет не должен прямо уничтожать смысл контракта.", lambda: {}),
-        ("🧬", "Пара должна сочетать молодого игрока и более опытного партнёра.", lambda: {}),
-    ])
-    secondary = random.choice([
-        ("🤝", "Два игрока должны дополнять друг друга, а не дублировать одну и ту же роль."),
-        ("📋", "Пара должна иметь смысл и на ближайший сезон, и для дальнейшего проекта."),
-        ("🩺", "Очевидный медицинский риск допустим только если остальные характеристики пары его компенсируют."),
-        ("🎲", "Нераскрытая карта не считается автоматически отрицательной."),
-        ("💼", "Клуб должен получить практическую пользу от обоих игроков, а не только от одного."),
-        ("🧩", "У пары должно быть хотя бы одно явное взаимное преимущество."),
-        ("📈", "Необходимо учитывать не только текущую силу, но и перспективу пары."),
-        ("🧱", "Один игрок может быть слабее по одному параметру, если второй закрывает этот недостаток."),
-    ])
-    stories = [
-        "ПОСЛЕДНИЕ ЧАСЫ ОКНА", "ПЕРЕЗАГРУЗКА СОСТАВА", "ОХОТА ЗА НЕДООЦЕНЁННЫМИ", "ФИНАЛЬНЫЙ ВА-БАНК",
-        "ПРОЕКТ НОВОЙ ЭРЫ", "АВАРИЙНЫЙ ПЛАН", "ДВОЙНОЕ УСИЛЕНИЕ", "РЫНОК ПОД ДАВЛЕНИЕМ",
-        "ОПЕРАЦИЯ «ФИНАЛЬНАЯ ПАРА»", "СРОЧНАЯ РЕКОНСТРУКЦИЯ", "СМЕЛАЯ СТАВКА", "ТРАНСФЕР БЕЗ ПРАВА НА ОШИБКУ",
-        "ДВА МЕСТА В СОСТАВЕ", "ПОСЛЕДНИЙ ХОД СПОРТДИРЕКТОРА", "ОКНО, КОТОРОЕ НЕ ПРОЩАЕТ", "ПЕРЕСТРОЙКА НА ХОДУ",
-        "ПЛАН Б", "ТРАНСФЕРНЫЙ ШТУРМ", "ДВА КОНТРАКТА ДО ПОЛУНОЧИ", "СТАВКА НА СВЯЗКУ",
-        "ОБНОВЛЕНИЕ БЕЗ РЕВОЛЮЦИИ", "СЕЗОН НА ГРАНИ", "НЕОЖИДАННЫЙ ДУЭТ", "РЫНОК ОТКРЫТ",
-        "ДЕФИЦИТ РЕШЕНИЙ", "ПОСЛЕДНИЙ КОНВЕРТ", "ДВОЙНАЯ ПОДПИСЬ", "ТРАНСФЕРНАЯ РАЗВИЛКА",
-        "НОВЫЙ ЦЕНТР ПРОЕКТА", "КЛУБ ДЕЛАЕТ СТАВКУ"
+
+    role_requirements = [
+        ("🛡", "Хотя бы один из двух игроков — ЦЗ", "defender"),
+        ("⚙️", "Хотя бы один из двух игроков — полузащитник", "midfielder"),
+        ("⚔️", "Хотя бы один из двух игроков — атакующий игрок", "attacker"),
+        ("🛡⚔️", "В паре должны быть разные линии: один защитник и один атакующий игрок", "defender_attacker"),
+        ("🛡⚙️", "В паре должны быть разные линии: один защитник и один полузащитник", "defender_midfielder"),
+        ("⚙️⚔️", "В паре должны быть разные линии: один полузащитник и один атакующий игрок", "midfielder_attacker"),
     ]
-    _, req_template, values_factory = primary
-    req1 = req_template.format(**values_factory())
-    icon2, req2 = secondary
-    text = (f"⚽ <b>{random.choice(stories)} — {club.upper()}</b>\n"
-            f"Спортивный директор готовит <b>контракт сразу на двух игроков</b>.\n\n"
-            f"📌 <b>ТРЕБОВАНИЕ 1</b>\n{req1}\n\n"
-            f"{icon2} <b>ТРЕБОВАНИЕ 2</b>\n{req2}\n\n"
-            f"💰 <b>ОБЩИЙ БЮДЖЕТ НА ДВОИХ: €{budget}M</b>\n"
-            f"Суммарная трансферная стоимость финальной пары должна укладываться в этот бюджет.")
-    return {"club": club, "winners_needed": 2, "line": "mixed", "text": text, "price_requirement": None, "market_event": "", "budget": budget, "game_type": "player"}
+
+    role_icon, role_text, role_code = random.choice(role_requirements)
+    extra_requirements = [
+        f"Суммарная трансферная стоимость двух игроков — не более €{budget}M.",
+        f"Хотя бы один игрок должен стоить не более €{random.choice([50,60,70,80,90])}M.",
+        f"Хотя бы один игрок должен быть не старше {random.choice([22,24,26,28])} лет.",
+        f"Один игрок должен быть не старше {random.choice([23,25,27])} лет, второй — не моложе {random.choice([28,29,30])} лет.",
+    ]
+    extra = random.choice(extra_requirements)
+
+    contexts = [
+        "Тренер строит новую команду и не хочет тратить окно на одиночный трансфер.",
+        "Спортивный директор получил два места в заявке и должен закрыть их одной сделкой.",
+        "Клубу нужна пара игроков, которая даст результат уже в этом сезоне.",
+        "После провального сезона руководство требует изменить состав без бездумных расходов.",
+        "Последние часы трансферного окна: решение нужно принять быстро, но ошибка обойдётся дорого.",
+        "Новый тренер собирает костяк команды и требует, чтобы два новичка дополняли друг друга.",
+        "Клуб ищет не самых громких игроков, а именно подходящую комбинацию под проект.",
+        "Руководство разрешило только один пакет из двух контрактов — выбирать нужно как связку.",
+    ]
+    context = random.choice(contexts)
+
+    # If a role combination is required, generate the appropriate guaranteed roles.
+    required_positions = []
+    if role_code == "defender_attacker":
+        required_positions = ["defender", "attacker"]
+    elif role_code == "defender_midfielder":
+        required_positions = ["defender", "midfielder"]
+    elif role_code == "midfielder_attacker":
+        required_positions = ["midfielder", "attacker"]
+    else:
+        required_positions = [role_code]
+
+    text = (
+        f"⚽ <b>{random.choice(['НОВЫЙ КОНТРАК', 'ДВОЙНОЕ УСИЛЕНИЕ', 'ТРАНСФЕРНАЯ СВЯЗКА', 'ПОСЛЕДНИЕ ЧАСЫ ОКНА', 'ПЕРЕСТРОЙКА СОСТАВА'])} — {club.upper()}</b>\n\n"
+        f"{context}\n\n"
+        f"📋 <b>УСЛОВИЯ КОНТРАКТА</b>\n"
+        f"Нужно выбрать <b>ровно 2 игроков</b>. Для успеха должны выполняться <b>ВСЕ</b> условия ниже:\n\n"
+        f"{role_icon} <b>1.</b> {role_text}.\n"
+        f"💰 <b>2.</b> {extra}\n\n"
+        f"⚠️ <b>Важно:</b> всё, что написано выше как условие, обязательно. Остальной текст — контекст для принятия решения, а не отдельные требования."
+    )
+    return {
+        "club": club, "winners_needed": 2, "line": "mixed",
+        "required_positions": required_positions,
+        "text": text, "price_requirement": budget, "market_event": "",
+        "budget": budget, "game_type": "player"
+    }
 
 def generate_club_scenario(players_count: int) -> dict:
     budget = random.choice([100, 120, 150, 180, 220, 260, 300, 350, 400, 500])
