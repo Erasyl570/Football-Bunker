@@ -420,55 +420,92 @@ CLUB_SECRETS = [
     "Скаутский отдел нашёл несколько скрытых кандидатов"
 ]
 
-def generate_game_packs(num_players: int, line_type: str = "attacker", game_type: str = "player", required_positions=None) -> list:
-    """Generate cards. For player scenarios, required_positions guarantees that mandatory role(s)
-    mentioned in the scenario actually exist among the generated cards."""
+def _role_of_position(position: str) -> str:
+    for role, values in POSITIONS.items():
+        if position in values:
+            return role
+    return "attacker"
+
+def _price_num(value: str) -> int:
+    try:
+        return int(str(value).replace("€", "").replace("M", "").strip())
+    except Exception:
+        return 0
+
+def generate_game_packs(num_players: int, line_type: str = "attacker", game_type: str = "player", required_positions=None, scenario_conditions=None) -> list:
     if game_type == "club":
-        return generate_club_packs(num_players)
+        return generate_club_packs(num_players, scenario_conditions=scenario_conditions)
 
-    if line_type == "mixed":
-        position_pool = POSITIONS["attacker"] + POSITIONS["defender"] + POSITIONS["midfielder"]
-        positions = get_sampled_list(position_pool, num_players)
-    elif line_type in POSITIONS:
-        positions = get_sampled_list(POSITIONS[line_type], num_players)
-    else:
-        positions = get_sampled_list(POSITIONS["attacker"], num_players)
-
-    # Force mandatory role categories into the pack so a scenario can always be completed.
-    required_positions = required_positions or []
-    for required_role in required_positions:
-        if required_role not in POSITIONS or not positions:
+    required_positions = list(required_positions or [])
+    conditions = scenario_conditions or {}
+    # Start with mixed positions unless the scenario explicitly limits the pool.
+    position_pool = POSITIONS["attacker"] + POSITIONS["defender"] + POSITIONS["midfielder"]
+    positions = get_sampled_list(position_pool, num_players)
+    used = set()
+    for role in required_positions:
+        if role not in POSITIONS or role in used or not positions:
             continue
-        # Replace a random slot, but never duplicate the same slot for two requirements.
-        idx = random.randrange(len(positions))
-        positions[idx] = random.choice(POSITIONS[required_role])
+        # Put each mandatory role into a different slot.
+        available = [i for i in range(len(positions)) if i not in used]
+        idx = random.choice(available or list(range(len(positions))))
+        positions[idx] = random.choice(POSITIONS[role])
+        used.add(idx)
 
-    skill_pool_type = line_type if line_type in SKILLS else "attacker"
-    if line_type == "mixed":
-        skill_pool = SKILLS["attacker"] + SKILLS["defender"] + SKILLS["midfielder"]
-        skills = get_sampled_list(skill_pool, num_players)
-    else:
-        skills = get_sampled_list(SKILLS[skill_pool_type], num_players)
+    # Make age requirements actually possible in the generated pool.
+    ages = [random.randint(17, 35) for _ in range(num_players)]
+    young_max = conditions.get("young_max")
+    old_min = conditions.get("old_min")
+    if young_max is not None:
+        idx = random.randrange(num_players)
+        ages[idx] = random.randint(17, min(int(young_max), 35))
+    if old_min is not None and num_players > 1:
+        idx = random.randrange(num_players)
+        ages[idx] = random.randint(max(int(old_min), 17), 35)
 
+    skill_pool = SKILLS["attacker"] + SKILLS["defender"] + SKILLS["midfielder"]
+    skills = get_sampled_list(skill_pool, num_players)
     healths = get_sampled_list(HEALTH_TRAITS, num_players)
     inventories = get_sampled_list(INVENTORIES, num_players)
     secrets = get_sampled_list(SECRETS, num_players)
+
+    # Price requirements are generated first so the displayed scenario is mathematically coherent.
+    max_total = conditions.get("price_max")
+    min_total = conditions.get("price_min")
+    cheap_max = conditions.get("cheap_one_max")
+    prices = [random.randint(20, 200) for _ in range(num_players)]
+    if cheap_max is not None:
+        prices[random.randrange(num_players)] = random.randint(20, min(int(cheap_max), 200))
+    if num_players >= 2 and max_total is not None:
+        # Guarantee at least one possible pair under the ceiling.
+        a = random.randint(20, max(20, min(100, int(max_total)//2)))
+        b = random.randint(20, max(20, min(100, int(max_total)-a)))
+        ids = random.sample(range(num_players), 2)
+        prices[ids[0]], prices[ids[1]] = a, b
+    if num_players >= 2 and min_total is not None:
+        ids = random.sample(range(num_players), 2)
+        target = max(int(min_total), 40)
+        a = min(200, max(20, target // 2))
+        b = min(200, max(20, target - a))
+        prices[ids[0]], prices[ids[1]] = a, b
+
     packs = []
     for i in range(num_players):
         packs.append({
-            "position": positions[i], "age": random.randint(17, 35),
-            "price": f"€{random.randint(20, 200)}M", "health": healths[i],
-            "skill": skills[i], "inventory": inventories[i], "secret": secrets[i]
+            "position": positions[i], "age": ages[i], "price": f"€{prices[i]}M",
+            "health": healths[i], "skill": skills[i], "inventory": inventories[i], "secret": secrets[i]
         })
     return packs
 
-def generate_club_packs(num_players: int) -> list:
+def generate_club_packs(num_players: int, scenario_conditions=None) -> list:
     names = get_sampled_list(CLUB_NAMES, num_players)
     packs = []
+    conditions = scenario_conditions or {}
+    min_budget = int(conditions.get("min_budget", 0) or 0)
     for i in range(num_players):
+        eligible_budgets = [b for b in CLUB_BUDGETS if b >= min_budget] or [max(CLUB_BUDGETS)]
         packs.append({
             "club": names[i],
-            "budget": f"€{random.choice(CLUB_BUDGETS)}M",
+            "budget": f"€{random.choice(eligible_budgets)}M",
             "squad": random.choice(CLUB_SQUADS),
             "finance": random.choice(CLUB_FINANCE),
             "infrastructure": random.choice(CLUB_INFRA),
@@ -479,105 +516,197 @@ def generate_club_packs(num_players: int) -> list:
     return packs
 
 def generate_scenario(players_count: int, game_type: str = "player") -> dict:
-    """Generate a precise player contract scenario.
-    The first block contains mandatory conditions; the second is only narrative context.
-    """
+    """Generate a machine-readable scenario. The displayed requirements are exactly what the evaluator checks."""
     if game_type == "club":
         return generate_club_scenario(players_count)
 
-    budget = random.choice([90, 100, 120, 140, 160, 180, 200, 230, 260, 300, 350, 400])
-    club = random.choice(CLUB_NAMES)
-
-    role_requirements = [
-        ("🛡", "Хотя бы один из двух игроков — ЦЗ", "defender"),
-        ("⚙️", "Хотя бы один из двух игроков — полузащитник", "midfielder"),
-        ("⚔️", "Хотя бы один из двух игроков — атакующий игрок", "attacker"),
-        ("🛡⚔️", "В паре должны быть разные линии: один защитник и один атакующий игрок", "defender_attacker"),
-        ("🛡⚙️", "В паре должны быть разные линии: один защитник и один полузащитник", "defender_midfielder"),
-        ("⚙️⚔️", "В паре должны быть разные линии: один полузащитник и один атакующий игрок", "midfielder_attacker"),
+    templates = [
+        ("ДВА МЕСТА В ЗАЯВКЕ", "Окно закрывается. Клубу нужна связка из двух игроков, которые закрывают разные задачи.", {"roles":["defender","attacker"]}),
+        ("НОВЫЙ КОСТЯК", "Тренер меняет структуру команды и хочет начать перестройку сразу с двух позиций.", {"roles":["midfielder","defender"]}),
+        ("АТАКА С НУЛЯ", "После провального сезона руководство требует усилить переднюю линию без покупки пары за любые деньги.", {"roles":["attacker"]}),
+        ("ЗАКРЫТЬ ЦЕНТР", "Команде нужен игрок центра и надёжный партнёр для него.", {"roles":["midfielder"]}),
+        ("ПОСЛЕДНИЕ ДЕНЬГИ", "Бюджет ограничен: спортивный директор должен собрать рабочую пару без переплаты.", {"roles":[]}),
+        ("ОПЫТ + МОЛОДОСТЬ", "Клубу нужна пара, сочетающая игрока на перспективу и опытного исполнителя.", {"roles":[]}),
+        ("СБАЛАНСИРОВАННАЯ СДЕЛКА", "Руководство не хочет ставить всё на одного дорогого кандидата.", {"roles":[]}),
+        ("ПЕРЕЗАПУСК", "Новый тренер получил право изменить состав, но не может игнорировать финансовые рамки.", {"roles":["defender"]}),
     ]
-
-    role_icon, role_text, role_code = random.choice(role_requirements)
-    extra_requirements = [
-        f"Суммарная трансферная стоимость двух игроков — не более €{budget}M.",
-        f"Хотя бы один игрок должен стоить не более €{random.choice([50,60,70,80,90])}M.",
-        f"Хотя бы один игрок должен быть не старше {random.choice([22,24,26,28])} лет.",
-        f"Один игрок должен быть не старше {random.choice([23,25,27])} лет, второй — не моложе {random.choice([28,29,30])} лет.",
+    title, context, base = random.choice(templates)
+    cond = dict(base)
+    extra_choices = [
+        ("price_max", random.choice([120, 140, 160, 180, 200, 230, 260])),
+        ("price_min", random.choice([100, 120, 140, 160])),
+        ("cheap_one_max", random.choice([50, 60, 70, 80])),
+        ("young_max", random.choice([22, 24, 26, 28])),
+        ("old_min", random.choice([29, 30, 31, 32])),
     ]
-    extra = random.choice(extra_requirements)
+    key, value = random.choice(extra_choices)
+    cond[key] = value
+    # A second condition makes scenarios less repetitive, but never creates contradictory limits.
+    if key == "price_max":
+        cond["cheap_one_max"] = random.choice([60, 70, 80])
+    elif key == "young_max":
+        cond["price_max"] = random.choice([160, 180, 200, 230])
+    elif key == "old_min":
+        cond["price_max"] = random.choice([180, 200, 230, 260])
 
-    contexts = [
-        "Тренер строит новую команду и не хочет тратить окно на одиночный трансфер.",
-        "Спортивный директор получил два места в заявке и должен закрыть их одной сделкой.",
-        "Клубу нужна пара игроков, которая даст результат уже в этом сезоне.",
-        "После провального сезона руководство требует изменить состав без бездумных расходов.",
-        "Последние часы трансферного окна: решение нужно принять быстро, но ошибка обойдётся дорого.",
-        "Новый тренер собирает костяк команды и требует, чтобы два новичка дополняли друг друга.",
-        "Клуб ищет не самых громких игроков, а именно подходящую комбинацию под проект.",
-        "Руководство разрешило только один пакет из двух контрактов — выбирать нужно как связку.",
-    ]
-    context = random.choice(contexts)
-
-    # If a role combination is required, generate the appropriate guaranteed roles.
-    required_positions = []
-    if role_code == "defender_attacker":
-        required_positions = ["defender", "attacker"]
-    elif role_code == "defender_midfielder":
-        required_positions = ["defender", "midfielder"]
-    elif role_code == "midfielder_attacker":
-        required_positions = ["midfielder", "attacker"]
-    else:
-        required_positions = [role_code]
+    lines = []
+    roles = cond.get("roles", [])
+    role_names = {"defender":"защитник", "midfielder":"полузащитник", "attacker":"атакующий игрок"}
+    for r in roles:
+        lines.append(f"• В паре должен быть минимум один {role_names[r]}.")
+    if "price_max" in cond:
+        lines.append(f"• Общая цена двух игроков — не более €{cond['price_max']}M.")
+    if "price_min" in cond:
+        lines.append(f"• Общая цена двух игроков — не менее €{cond['price_min']}M.")
+    if "cheap_one_max" in cond:
+        lines.append(f"• Хотя бы один игрок должен стоить не более €{cond['cheap_one_max']}M.")
+    if "young_max" in cond:
+        lines.append(f"• Хотя бы один игрок должен быть не старше {cond['young_max']} лет.")
+    if "old_min" in cond:
+        lines.append(f"• Хотя бы один игрок должен быть не моложе {cond['old_min']} лет.")
 
     text = (
-        f"⚽ <b>{random.choice(['НОВЫЙ КОНТРАК', 'ДВОЙНОЕ УСИЛЕНИЕ', 'ТРАНСФЕРНАЯ СВЯЗКА', 'ПОСЛЕДНИЕ ЧАСЫ ОКНА', 'ПЕРЕСТРОЙКА СОСТАВА'])} — {club.upper()}</b>\n\n"
-        f"{context}\n\n"
-        f"📋 <b>УСЛОВИЯ КОНТРАКТА</b>\n"
-        f"Нужно выбрать <b>ровно 2 игроков</b>. Для успеха должны выполняться <b>ВСЕ</b> условия ниже:\n\n"
-        f"{role_icon} <b>1.</b> {role_text}.\n"
-        f"💰 <b>2.</b> {extra}\n\n"
-        f"⚠️ <b>Важно:</b> всё, что написано выше как условие, обязательно. Остальной текст — контекст для принятия решения, а не отдельные требования."
+        f"⚽ <b>{title}</b>\n\n{context}\n\n"
+        f"📋 <b>ЧТО НУЖНО СДЕЛАТЬ</b>\n"
+        f"Выбрать <b>ровно 2 игроков</b>. Успех будет, если выполнены <b>ВСЕ пункты</b>:\n"
+        + "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1))
+        + "\n\n<i>Только этот список определяет результат. Описание сверху — сюжет.</i>"
     )
-    return {
-        "club": club, "winners_needed": 2, "line": "mixed",
-        "required_positions": required_positions,
-        "text": text, "price_requirement": budget, "market_event": "",
-        "budget": budget, "game_type": "player"
-    }
+    return {"club":"Трансферный отдел", "winners_needed":2, "line":"mixed",
+            "required_positions":roles, "conditions":cond, "text":text,
+            "game_type":"player"}
 
 def generate_club_scenario(players_count: int) -> dict:
-    budget = random.choice([100, 120, 150, 180, 220, 260, 300, 350, 400, 500])
-    destination = random.choice(CLUB_NAMES)
-    scenarios = [
-        ("РАЗРЫВ КОНТРАКТА", "Игрок покинул прежний клуб после конфликта и выбирает новый проект. Ему нужен клуб с бюджетом от €{budget}M и понятным спортивным планом."),
-        ("ПОСЛЕ НЕОЖИДАННОЙ ПРОДАЖИ", "Клуб только что потерял лидера. Новый проект должен выдержать удар по составу и иметь бюджет не меньше €{budget}M."),
-        ("ПОСЛЕДНИЙ ШАНС", "Игрок ищет место, где сможет снова стать центральной фигурой. Предпочтение получает клуб с бюджетом €{budget}M+ и сильной инфраструктурой."),
-        ("НОВЫЙ ТРЕНЕР", "После смены тренера нужен клуб, способный быстро перестроиться. Бюджет должен быть не ниже €{budget}M."),
-        ("ПРОЕКТ НА ТРИ ГОДА", "Игрок не хочет просто короткий контракт. Ему нужен клуб с ресурсами €{budget}M+ и хорошими условиями для развития состава."),
-        ("ВОЗВРАЩЕНИЕ НА ВЕРШИНУ", "Игрок выбирает амбициозный проект после неудачного сезона. Нужен клуб с бюджетом €{budget}M+ и репутацией борьбы за титулы."),
-        ("ТРАНСФЕР БЕЗ РОМАНТИКИ", "Предложений много, но решение принимается прагматично: бюджет от €{budget}M и отсутствие критической проблемы внутри клуба."),
-        ("СЛОЖНЫЙ ВЫБОР", "Игрок выбирает между громким именем и проектом с ресурсами. Минимальный бюджет клуба — €{budget}M."),
-        ("НОВАЯ РАЗДЕВАЛКА", "Игроку нужен клуб, где уже есть сильные лидеры и инфраструктура. Бюджет проекта — от €{budget}M."),
-        ("ПОСЛЕДНИЙ ПОЕЗД", "Возраст поджимает, поэтому нужен клуб, готовый дать результат сейчас. Требуется бюджет от €{budget}M и готовый состав."),
-        ("АКАДЕМИЯ ПРОТИВ ЗВЁЗД", "Игрок выбирает проект, который умеет развивать состав. Бюджет — не менее €{budget}M, но клуб не должен быть полностью зависим от покупок."),
-        ("КЛУБ ДЛЯ ПЕРЕЗАПУСКА", "После тяжёлого периода нужен проект с хорошей инфраструктурой и бюджетом от €{budget}M."),
-        ("БОЛЬШАЯ СТАВКА", "Руководство готово поставить всё на новый проект. Бюджет клуба должен быть не меньше €{budget}M."),
-        ("ТИХИЙ ПРЕТЕНДЕНТ", "Игрок не гонится за самым громким названием. Ему нужен устойчивый клуб с бюджетом €{budget}M+ и перспективным составом."),
-        ("КОНТРАК ПОСЛЕ СКАНДАЛА", "После шумного расставания игрок выбирает клуб, способный дать новый старт. Бюджет — €{budget}M+ и отсутствие критической внутренней проблемы."),
-        ("СВОЙ ПРОЕКТ", "Игрок хочет влиять на развитие команды. Нужен клуб с бюджетом €{budget}M+ и сильной спортивной инфраструктурой."),
-        ("ДЕНЬГИ НЕ ВСЁ", "Одного бюджета недостаточно: клуб должен иметь сильный состав или инфраструктуру. Минимальный бюджет — €{budget}M."),
-        ("СРОЧНЫЙ ВЫБОР", "До закрытия окна осталось мало времени. Клуб должен быть финансово готов к немедленному подписанию — €{budget}M+."),
-        ("НОВЫЙ ДОМИНИРУЮЩИЙ ЦИКЛ", "Игрок ищет клуб, который способен строить долгий успешный цикл. Бюджет — от €{budget}M и ставка на развитие."),
-        ("КЛУБ С ХАРАКТЕРОМ", "Важна не только сумма: клуб должен иметь сильную репутацию и понятную проблему, которую игрок может помочь решить. Бюджет — €{budget}M+.")
+    min_budget = random.choice([100, 120, 150, 180, 220, 260, 300, 350, 400])
+    templates = [
+        ("АЛЬВАРЕС ИЩЕТ НОВЫЙ ПРОЕКТ", "Игрок покидает прежний клуб и выбирает, где продолжить карьеру."),
+        ("ПОСЛЕ РАЗРЫВА", "После конфликта сторонам нужен новый старт без долгих переговоров."),
+        ("НОВЫЙ ТРЕНЕР", "Новый тренер хочет начать цикл с клуба, способного действовать сразу."),
+        ("ПОСЛЕДНИЙ ШАНС", "Игроку нужен проект, где от него ждут результата уже в ближайшем сезоне."),
+        ("БОЛЬШОЙ ПЕРЕЗАПУСК", "Клуб меняет направление и ищет человека, который впишется в новый проект."),
+        ("ПОСЛЕ ПРОДАЖИ ЛИДЕРА", "Главная звезда ушла, и клуб теперь должен доказать, что проект не зависит от одного имени."),
+        ("ТИХИЙ ПРЕТЕНДЕНТ", "Самое громкое название не обязательно лучшее — важна пригодность проекта."),
+        ("ТРАНСФЕР БЕЗ ОШИБКИ", "Руководство готово платить, но не хочет подписывать клуб с очевидной системной проблемой."),
+        ("ПРОЕКТ НА ТРИ ГОДА", "Игрок выбирает не только текущий состав, но и условия для долгосрочного развития."),
+        ("ДЕНЬГИ И СИСТЕМА", "Большой бюджет сам по себе не гарантирует хороший выбор."),
     ]
-    title, body = random.choice(scenarios)
-    extra = random.choice([
-        "Выбор должен быть обоснован двумя разными сторонами карточки клуба.",
-        "Бюджет — обязательное условие; остальные факторы помогают выбрать лучший проект.",
-        "Скрытая информация может изменить решение после вскрытия карты.",
-        "Необязательно выбирать самый богатый клуб, если остальные условия заметно сильнее.",
-        "Клуб с проблемой может оказаться лучшим, если она решаема его ресурсами.",
-        "Репутация важна, но не отменяет финансовые ограничения."
-    ])
-    text = f"🏟️ <b>{title}</b>\n\n{body.format(budget=budget)}\n\n💰 <b>МИНИМАЛЬНЫЙ БЮДЖЕТ КЛУБА: €{budget}M</b>\n📌 {extra}"
-    return {"club": destination, "winners_needed": 1, "line": "club", "text": text, "budget": budget, "game_type": "club"}
+    title, context = random.choice(templates)
+    cond = {"min_budget": min_budget}
+    extra = random.choice(["strong_squad", "strong_infrastructure", "stable_finance", "strong_reputation", "no_critical_problem"])
+    cond["club_factor"] = extra
+    factor_text = {
+        "strong_squad":"состав должен быть конкурентоспособным",
+        "strong_infrastructure":"инфраструктура должна быть сильной",
+        "stable_finance":"финансы клуба должны быть стабильными",
+        "strong_reputation":"репутация должна соответствовать борьбе за результат",
+        "no_critical_problem":"у клуба не должно быть проблемы, прямо указывающей на системный кризис",
+    }[extra]
+    text = (
+        f"🏟️ <b>{title}</b>\n\n{context}\n\n"
+        f"📋 <b>ЧТО НУЖНО СДЕЛАТЬ</b>\n"
+        f"Выбрать <b>1 клуб</b>. Успех будет, если выполнены <b>ВСЕ пункты</b>:\n"
+        f"1. Бюджет клуба — минимум <b>€{min_budget}M</b>.\n"
+        f"2. {factor_text.capitalize()}.\n\n"
+        f"<i>Только эти два пункта определяют результат. Остальное — сюжет.</i>"
+    )
+    return {"club":"Трансферный отдел", "winners_needed":1, "line":"club", "conditions":cond, "text":text, "budget":min_budget, "game_type":"club"}
+
+
+def apply_random_event(scenario: dict, chance: float = 0.12) -> dict:
+    """Rare match event. Mutates a copy of scenario and keeps the changed rule explicit."""
+    import copy
+    out = copy.deepcopy(scenario)
+    if random.random() >= chance:
+        out["event"] = None
+        return out
+    cond = out.setdefault("conditions", {})
+    if out.get("game_type") == "club":
+        events = [
+            ("ФИНАНСОВОЕ ОКНО", "min_budget", 0.80, "Рынок открыл дополнительное финансирование: минимальный бюджет снижен на 20%."),
+            ("ФИНАНСОВАЯ ЗАМОРОЗКА", "min_budget", 1.25, "Часть бюджета заморожена: минимальный бюджет вырос на 25%."),
+        ]
+    else:
+        events = [
+            ("ТРАНСФЕРНЫЙ ОБВАЛ", "price_max", 0.75, "Цены на рынке резко упали: максимальный общий бюджет пары снижен на 25%."),
+            ("ПАНИКА НА РЫНКЕ", "price_max", 1.25, "Клубы начали переплачивать: максимальный общий бюджет пары вырос на 25%."),
+            ("СРОЧНАЯ ПРОДАЖА", "price_min", 0.80, "Один из продавцов готов уступить: минимальная общая цена пары снижена на 20%."),
+        ]
+    title, key, multiplier, desc = random.choice(events)
+    if key in cond:
+        cond[key] = max(40 if key == "price_max" else 60, int(round(int(cond[key]) * multiplier)))
+    else:
+        # Fallback for a template without that condition: add a clean requirement.
+        base = 200 if key == "price_max" else 140 if key == "price_min" else 200
+        cond[key] = max(40, int(round(base * multiplier)))
+    out["event"] = {"title": title, "description": desc}
+    # Rewrite the visible numeric requirement so the displayed rule and validator are identical.
+    if key == "price_max":
+        import re
+        out["text"] = re.sub(r"Общая цена двух игроков — не более €\d+M\.", f"Общая цена двух игроков — не более €{cond[key]}M.", out["text"])
+    elif key == "price_min":
+        import re
+        out["text"] = re.sub(r"Общая цена двух игроков — не менее €\d+M\.", f"Общая цена двух игроков — не менее €{cond[key]}M.", out["text"])
+    elif key == "min_budget":
+        import re
+        out["text"] = re.sub(r"Бюджет клуба — минимум <b>€\d+M</b>\.", f"Бюджет клуба — минимум <b>€{cond[key]}M</b>.", out["text"])
+    marker = f"\n\n⚡ <b>СОБЫТИЕ РЫНКА: {title}</b>\n{desc}"
+    out["text"] += marker
+    return out
+
+
+def scenario_check(scenario: dict, packs: list, winner_count: int = None) -> tuple[bool, list[str]]:
+    """Deterministic final validator. Returns (success, reasons)."""
+    cond = scenario.get("conditions") or {}
+    n = winner_count or scenario.get("winners_needed", 2)
+    selected = packs[:n]
+    if len(selected) != n:
+        return False, [f"Нужно выбрать {n} {'игрока' if n == 1 else 'игроков'}."]
+    reasons = []
+    if scenario.get("game_type") == "club":
+        budgets = [_price_num(p.get("budget", "0")) for p in selected]
+        b = budgets[0] if budgets else 0
+        if b < int(cond.get("min_budget", 0)):
+            reasons.append(f"Бюджет €{b}M ниже требуемых €{cond['min_budget']}M.")
+        factor = cond.get("club_factor")
+        text_map = {
+            "strong_squad": ("состав", "конкурентоспособным"),
+            "strong_infrastructure": ("инфраструктура", "сильной"),
+            "stable_finance": ("finance", "стабильными"),
+            "strong_reputation": ("reputation", "соответствующей борьбе за результат"),
+            "no_critical_problem": ("problem", "без системного кризиса"),
+        }
+        if factor == "no_critical_problem":
+            val = str(selected[0].get("problem", "")).lower()
+            if any(x in val for x in ("срочно", "криз", "проваль", "перегруз")):
+                reasons.append("У клуба есть проблема, указывающая на системный кризис.")
+        elif factor in text_map:
+            key, _ = text_map[factor]
+            val = str(selected[0].get(key, "")).lower()
+            bad = {
+                "squad": ("слаб", "проблем", "возраст"),
+                "infrastructure": ("требует вложений", "перегруж"),
+                "finance": ("нестабиль", "напряж", "криз"),
+                "reputation": ("не любит", "неудач", "под давлением"),
+            }.get(key, ())
+            if any(x in val for x in bad):
+                reasons.append(f"Характеристика «{key}» не соответствует условию.")
+        return not reasons, reasons
+
+    roles = cond.get("roles", [])
+    for role in roles:
+        if not any(_role_of_position(str(p.get("position", ""))) == role for p in selected):
+            reasons.append(f"Нет требуемого типа: { {'defender':'защитник','midfielder':'полузащитник','attacker':'атакующий игрок'}.get(role, role) }.")
+    prices = [_price_num(p.get("price", "0")) for p in selected]
+    total = sum(prices)
+    if "price_max" in cond and total > int(cond["price_max"]):
+        reasons.append(f"Общая цена €{total}M выше лимита €{cond['price_max']}M.")
+    if "price_min" in cond and total < int(cond["price_min"]):
+        reasons.append(f"Общая цена €{total}M ниже минимума €{cond['price_min']}M.")
+    if "cheap_one_max" in cond and not any(x <= int(cond["cheap_one_max"]) for x in prices):
+        reasons.append(f"Нет игрока дешевле или равного €{cond['cheap_one_max']}M.")
+    ages = [int(p.get("age", 0) or 0) for p in selected]
+    if "young_max" in cond and not any(x <= int(cond["young_max"]) for x in ages):
+        reasons.append(f"Нет игрока не старше {cond['young_max']} лет.")
+    if "old_min" in cond and not any(x >= int(cond["old_min"]) for x in ages):
+        reasons.append(f"Нет игрока не моложе {cond['old_min']} лет.")
+    return not reasons, reasons
