@@ -134,6 +134,10 @@ async def init_db():
             await db.execute("ALTER TABLE lobbies ADD COLUMN total_votes INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE lobbies ADD COLUMN scenario_data TEXT DEFAULT ''")
+        except Exception:
+            pass
 
         # Экономика: мягкая миграция для уже существующих SQLite-инсталляций.
         try:
@@ -698,10 +702,24 @@ async def get_current_turn(chat_id: int) -> int:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
-async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1):
+async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1, scenario_data=None):
+    import json
+    payload = json.dumps(scenario_data or {}, ensure_ascii=False)
     async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET scenario = ?, current_round = ? WHERE chat_id = ?", (scenario_text, current_round, chat_id))
+        await db.execute("UPDATE lobbies SET scenario = ?, scenario_data = ?, current_round = ? WHERE chat_id = ?", (scenario_text, payload, current_round, chat_id))
         await db.commit()
+
+async def get_lobby_scenario_data(chat_id: int) -> dict:
+    import json
+    async with connect_db() as db:
+        async with db.execute("SELECT scenario_data FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
+            row = await cursor.fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
 
 async def get_tie_count(chat_id: int) -> int:
     async with connect_db() as db:
