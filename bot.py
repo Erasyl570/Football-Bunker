@@ -316,59 +316,72 @@ async def is_game_active(chat_id: int) -> bool:
     lobby = await db.get_lobby(chat_id)
     return lobby is not None and lobby[0] not in ("ended", "cancelled")
 
+# --- ДЕТЕРМИНИРОВАННЫЙ ФИНАЛ СЦЕНАРИЯ ---
+async def build_contract_verdict(chat_id: int, alive_players: list) -> str:
+    scenario = await db.get_lobby_scenario_data(chat_id)
+    if not scenario:
+        return "⚠️ <i>Структурированные условия этой игры не сохранены. Старый формат сценария нельзя надёжно проверить автоматически.</i>"
+
+    winners_data = []
+    for p_name, p_id in alive_players:
+        winners_data.append((p_name, await db.get_player_pack(chat_id, p_id) or {}))
+
+    success, reasons = cards.validate_scenario(scenario, winners_data)
+    if success:
+        return "📌 <b>ВЕРДИКТ: УСПЕХ</b>\n📝 " + " ".join(html.escape(x) for x in reasons)
+    return "📌 <b>ВЕРДИКТ: ПРОВАЛ</b>\n📝 " + " ".join(html.escape(x) for x in reasons)
+
+
 # --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK С ТАЙМАУТОМ) ---
-async def evaluate_game_outcome(scenario_text: str, winners_data: list, scenario_data: dict | None = None) -> str:
-    """Rules are authoritative; Gemini only writes the explanation."""
+async def evaluate_game_outcome(scenario_text: str, winners_data: list) -> str:
+    if not GEMINI_API_KEY:
+        return "⚠️ <i>GEMINI_API_KEY не задан. Оценка сценария недоступна.</i>"
     game_type = "club" if winners_data and "budget" in winners_data[0][1] and "club" in winners_data[0][1] else "player"
-    verdict = None
-    deterministic_reason = ""
-    if scenario_data and scenario_data.get("conditions"):
-        ok, failures = cards.scenario_check(
-            scenario_data, [pack for _, pack in winners_data],
-            winner_count=scenario_data.get("winners_needed")
-        )
-        verdict = "УСПЕХ" if ok else "ПРОВАЛ"
-        deterministic_reason = "Все обязательные пункты выполнены." if ok else "Не выполнено: " + " ".join(failures[:3])
-
     if game_type == "club":
-        summary = "".join(f"- {name}: клуб={pack.get('club')}, бюджет={pack.get('budget')}, состав={pack.get('squad')}, финансы={pack.get('finance')}, инфраструктура={pack.get('infrastructure')}, репутация={pack.get('reputation')}, проблема={pack.get('problem')}\n" for name, pack in winners_data)
+        summary = "".join(
+            f"- Кандидат {name}: Клуб={pack.get('club')}, Бюджет={pack.get('budget')}, Состав={pack.get('squad')}, "
+            f"Финансы={pack.get('finance')}, Инфраструктура={pack.get('infrastructure')}, Репутация={pack.get('reputation')}, "
+            f"Проблема={pack.get('problem')}, Секрет={pack.get('secret')}\n"
+            for name, pack in winners_data
+        )
+        rules = ("Это режим КЛУБОВ. Здесь нет навыка, здоровья, возраста или цены игрока. "
+                 "Главное числовое условие — бюджет клуба. Остальные условия сценария оценивай по карточкам клуба. "
+                 "Не придумывай отсутствующие характеристики. Бюджет проверяй как обязательное минимальное требование. "
+                 "Если клуб проходит бюджет и в целом соответствует проекту, выбирай УСПЕХ. В спорных случаях — УСПЕХ.")
     else:
-        summary = "".join(f"- {name}: позиция={pack.get('position')}, возраст={pack.get('age')}, цена={pack.get('price')}, здоровье={pack.get('health')}, навык={pack.get('skill')}, багаж={pack.get('inventory')}, секрет={pack.get('secret')}\n" for name, pack in winners_data)
-
-    if verdict is None:
-        if not GEMINI_API_KEY:
-            return "⚠️ <i>ИИ-судья недоступен.</i>"
-        prompt = ("Ты — спортивный директор футбольной игры. Вынеси честный, но не душный вердикт.\n\n"
-                  f"СЦЕНАРИЙ:\n{scenario_text}\n\nКАНДИДАТЫ:\n{summary}\n\n"
-                  "Формат: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n📝 <b>Причина:</b> [2-4 коротких предложения]")
-    else:
-        if not GEMINI_API_KEY:
-            return f"📌 <b>ВЕРДИКТ ИИ:</b> {verdict}\n📝 <b>Причина:</b> {html.escape(deterministic_reason)}"
-        prompt = ("Ты — комментатор футбольной игры. Вердикт уже рассчитан кодом. Не меняй его. "
-                  "Коротко объясни результат только по фактам карточек.\n\n"
-                  f"СЦЕНАРИЙ:\n{scenario_text}\n\nКАНДИДАТЫ:\n{summary}\n\n"
-                  f"ФИКСИРОВАННЫЙ ВЕРДИКТ: {verdict}. Основа: {deterministic_reason}\n\n"
-                  f"Формат: 📌 <b>ВЕРДИКТ ИИ:</b> {verdict}\n📝 <b>Причина:</b> [2-4 коротких предложения. Не меняй вердикт.]")
-
-    cache_key = str(hash(prompt))
-    if cache_key in GEMINI_CACHE:
-        return GEMINI_CACHE[cache_key]
+        summary = "".join(
+            f"- Игрок {name}: Позиция={pack.get('position')}, Возраст={pack.get('age')}, Цена={pack.get('price')}, "
+            f"Здоровье={pack.get('health')}, Навык={pack.get('skill')}, Багаж={pack.get('inventory')}, Секрет={pack.get('secret')}\n"
+            for name, pack in winners_data
+        )
+        rules = ("Это режим ИГРОКОВ. Контракт всегда заключается ИМЕННО С ДВУМЯ финалистами. "
+                 "Если указан общий бюджет на двоих, сравни сумму цен пары с бюджетом, а не цену каждого отдельно. "
+                 "В сценарии блок «УСЛОВИЯ КОНТРАКТА» содержит обязательные условия. Все пронумерованные условия должны выполняться одновременно. "
+                 "Фраза «ВСЕ условия» означает, что нарушение любого обязательного пункта = ПРОВАЛ. "
+                 "Если указан тип позиции (ЦЗ, полузащитник, атакующий игрок), проверяй категорию позиции по карточке, а не по названию навыка. "
+                 "Описательный текст вне блока условий не является отдельным требованием. "
+                 "Неизвестная характеристика нейтральна только если она не нужна для обязательного пункта. "
+                 "ПРОВАЛ ставь при явном нарушении любого обязательного условия или бюджета. В спорных случаях по необязательному описанию — УСПЕХ.")
+    prompt=("Ты — спортивный директор футбольной игры. Твоя задача — вынести честный, но не душный вердикт.\n\n"
+            f"СЦЕНАРИЙ:\n{scenario_text}\n\nКАНДИДАТЫ:\n{summary}\n{rules}\n\n"
+            "Формат строго: 📌 <b>ВЕРДИКТ ИИ:</b> [УСПЕХ или ПРОВАЛ]\n📝 <b>Причина:</b> [2-4 коротких предложения]")
+    cache_key=str(hash(prompt))
+    if cache_key in GEMINI_CACHE: return GEMINI_CACHE[cache_key]
     async with GEMINI_SEMAPHORE:
-        last_error = None
+        last_error=None
         for attempt in range(3):
             try:
-                model = genai.GenerativeModel(GEMINI_MODEL)
-                response = await model.generate_content_async(prompt, request_options={"timeout": 25})
-                result = (response.text or "").strip()
+                model=genai.GenerativeModel(GEMINI_MODEL)
+                response=await model.generate_content_async(prompt, request_options={"timeout": 25})
+                result=(response.text or "").strip()
                 if result:
-                    GEMINI_CACHE[cache_key] = result
+                    GEMINI_CACHE[cache_key]=result
                     return result
             except Exception as e:
-                last_error = e
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
+                last_error=e
+                if attempt<2: await asyncio.sleep(2**attempt)
     print(f"[GEMINI] Ошибка после 3 попыток: {last_error}")
-    return f"📌 <b>ВЕРДИКТ ИИ:</b> {verdict}\n📝 <b>Причина:</b> {html.escape(deterministic_reason)}" if verdict else "⚠️ <i>ИИ-судья временно недоступен.</i>"
+    return "⚠️ <i>ИИ-судья временно недоступен. Игра завершена без вердикта.</i>"
 
 async def get_game_type(chat_id: int) -> str:
     """Возвращает тип конкретной игры из snapshot лобби; иначе постоянную настройку группы."""
@@ -561,7 +574,6 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
     lobby_before_end = await db.get_lobby(chat_id)
     scenario_text = (lobby_before_end[2] if lobby_before_end and len(lobby_before_end) > 2 and lobby_before_end[2]
                      else "Цель сценария не указана.")
-    scenario_data = await db.get_lobby_scenario_data(chat_id)
     game_type = await get_game_type(chat_id)
     game_stats = await db.get_game_stats(chat_id)
 
@@ -637,17 +649,13 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
             parse_mode="HTML"
         )
 
-    # Даже если Gemini временно недоступен, финал игры всё равно должен отправиться.
+    # Финальный результат больше не зависит от Gemini:
+    # условия сценария проверяются по структурированным данным игры.
     try:
-        await bot.send_chat_action(chat_id, action="typing")
-        winners_data = []
-        for p_name, p_id in alive_players:
-            pack = await db.get_player_pack(chat_id, p_id) or {}
-            winners_data.append((p_name, pack))
-        ai_verdict = await evaluate_game_outcome(scenario_text, winners_data, scenario_data)
+        ai_verdict = await build_contract_verdict(chat_id, alive_players)
     except Exception as e:
-        print(f"[FINAL] Ошибка оценки сценария: {e}")
-        ai_verdict = "⚠️ <i>ИИ-судья не смог вынести вердикт. Карточки и сценарий всё равно раскрыты.</i>"
+        print(f"[FINAL] Ошибка проверки сценария: {e}")
+        ai_verdict = "⚠️ <i>Не удалось автоматически проверить условия сценария. Карточки и итог всё равно раскрыты.</i>"
 
     await bot.send_message(
         chat_id,
@@ -1124,13 +1132,9 @@ async def start_game(callback: types.CallbackQuery):
         settings = await db.get_lobby_settings(chat_id)
         game_type = settings.get("game_type", "player") if settings else "player"
         scen = cards.generate_scenario(num_players, game_type=game_type)
-        scen = cards.apply_random_event(scen, chance=0.12)
-        await db.update_lobby_scenario(chat_id, scen["text"], 1, scenario_data=scen)
+        await db.update_lobby_scenario(chat_id, scen["text"], 1, scen)
 
-        packs = cards.generate_game_packs(
-            num_players, scen.get("line", "mixed"), game_type=game_type,
-            required_positions=scen.get("required_positions"), scenario_conditions=scen.get("conditions")
-        )
+        packs = cards.generate_game_packs(num_players, scen["line"], game_type=game_type, required_positions=scen.get("required_positions"))
         # Баланс спец-карт: карта обмена характеристикой (swap_*)
         # может достаться только ОДНОМУ игроку за матч.
         # Остальные игроки получают карты из пула без обменов.
@@ -1753,7 +1757,7 @@ async def start_voting_flow(chat_id: int, round_num: int):
         await finish_voting_flow(chat_id)
 
 async def voting_outcome_is_fixed(chat_id: int) -> bool:
-    """True, если ни один ещё не проголосовавший уже не может изменить победивший исход."""
+    """True, если ни один ещё не проголосовавший уже не может изменить исход.\n    Учитываем капитана: один оставшийся голос теоретически может иметь вес 2."""
     alive_players = await db.get_alive_players(chat_id)
     non_voters = await db.get_non_voted_alive_players(chat_id)
     n = len(non_voters)
@@ -1775,7 +1779,7 @@ async def voting_outcome_is_fixed(chat_id: int) -> bool:
     # Единственный лидер должен сохранить преимущество даже если все не проголосовавшие
     # отдадут голоса одному сопернику/СКИПУ.
     second = max((v for v in counts if v != top), default=0)
-    return (top - second) > n
+    return (top - second) > (2 * n)
 
 
 @dp.callback_query(F.data.startswith("vote:"))
@@ -1814,20 +1818,10 @@ async def process_vote(callback: types.CallbackQuery):
             await callback.answer("Голос принят!")
             await bot.send_message(chat_id, f"🗳 <b>{html.escape(voter.first_name)}</b> проголосовал против <b>{html.escape(target_name)}</b>!", parse_mode="HTML")
 
-        # Если оставшиеся игроки уже не способны изменить исход голосования,
-        # не заставляем их ждать таймер — они считаются AFK и сразу выбывают.
-        if await voting_outcome_is_fixed(chat_id):
-            non_voters_now = await db.get_non_voted_alive_players(chat_id)
-            if non_voters_now:
-                for nv_id, nv_name in non_voters_now:
-                    await db.eliminate_player(chat_id, nv_id)
-                    await bot.send_message(
-                        chat_id,
-                        f"👞 <b>{html.escape(nv_name)}</b> исключен: его голос уже не мог изменить исход.",
-                        parse_mode="HTML"
-                    )
-                await finish_voting_flow(chat_id)
-                return
+        # ВАЖНО: нельзя исключать неголосовавших только потому, что текущий
+        # результат уже математически не меняется. Игрок мог быть целью голосования
+        # и при этом не обязан голосовать прямо сейчас. AFK-исключение происходит
+        # только после окончания таймера голосования (см. start_voting_flow).
 
         if await db.get_voters_count(chat_id) >= len(alive_players):
             await finish_voting_flow(chat_id)
