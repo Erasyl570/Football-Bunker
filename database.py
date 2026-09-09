@@ -1,1019 +1,721 @@
-import aiosqlite
-import json
-import os
+import random
+import re
 
-DB_NAME = os.getenv("SQLITE_DB_PATH", "bunker.db")
-STATS_DATABASE_URL = os.getenv("STATS_DATABASE_URL") or os.getenv("DATABASE_URL")
-_stats_pool = None
+CLUBS = [
+    "Барселона", "Реал Мадрид", "Ливерпуль", "Манчестер Сити",
+    "Бавария", "ПСЖ", "Арсенал", "Челси", "Интер", "Ювентус",
+    "Боруссия Дортмунд", "Атлетико Мадрид", "Тоттенхэм", "Милан"
+]
 
-def connect_db():
-    return aiosqlite.connect(DB_NAME, timeout=10.0)
+POSITIONS = {
+    "attacker": [
+        "⚔️ Центральный форвард (ST)",
+        "⚔️ Габаритный таргетмен (ФРВ)",
+        "⚔️ Ложная девятка (False 9)",
+        "⚔️ Оттянутый нападающий (CF)",
+        "⚔️ Взрывной инсайд-форвард",
+        "⚔️ Прессингующий нападающий",
+        "⚔️ Штрафной «лис» (Poacher)",
+        "⚔️ Атакующий завершитель",
+        '⚔️ Оттянутый форвард-прессингист',
+        '⚔️ Инсайд-форвард с акцентом на завершение',
+    ],
+    "defender": [
+        "🛡 Разрушающий ЦЗ (Жесткий опекун)",
+        "🛡 Созидательный ЦЗ (Пасующий)",
+        "🛡 Атакующий латераль (Бегунок по бровке)",
+        "🛡 Инвертированный фулбек (Уходит в центр)",
+        "🛡 Последний защитник (Либеро)",
+        "🛡 Страхующий ЦЗ (Крайний в тройке)",
+        '🛡 Фулбек-инвертировщик',
+        '🛡 Центральный защитник-организатор',
+    ],
+    "midfielder": [
+        "⚙️ Чистый опорник (Разрушитель / CDM)",
+        "⚙️ Бокс-ту-бокс (От штрафной до штрафной)",
+        "⚙️ Атакующий плеймейкер (ЦАП)",
+        "⚙️ Глубинный плеймейкер (Regista)",
+        "⚙️ Опорник-волнорез",
+        "⚙️ Меццала (Полуфланговый хавбек)",
+        '⚙️ Полуфланговый разрушитель',
+        '⚙️ Центральный диспетчер',
+    ]
+}
 
-async def _init_stats_db():
-    global _stats_pool
-    if not STATS_DATABASE_URL:
-        return
-    try:
-        import asyncpg
-        _stats_pool = await asyncpg.create_pool(STATS_DATABASE_URL, min_size=1, max_size=3, command_timeout=10)
-        async with _stats_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS bunker_users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    games_played INTEGER NOT NULL DEFAULT 0,
-                    wins INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS bunker_economy (
-                    user_id BIGINT PRIMARY KEY,
-                    coins INTEGER NOT NULL DEFAULT 0,
-                    daily_date TEXT NOT NULL DEFAULT '',
-                    daily_games INTEGER NOT NULL DEFAULT 0,
-                    daily_wins INTEGER NOT NULL DEFAULT 0,
-                    daily_reveals INTEGER NOT NULL DEFAULT 0,
-                    daily_votes INTEGER NOT NULL DEFAULT 0,
-                    equipped_title TEXT NOT NULL DEFAULT '',
-                    equipped_frame TEXT NOT NULL DEFAULT '',
-                    equipped_card_theme TEXT NOT NULL DEFAULT 'classic',
-                    equipped_victory TEXT NOT NULL DEFAULT 'classic',
-                    equipped_badge TEXT NOT NULL DEFAULT '',
-                    owner_granted INTEGER NOT NULL DEFAULT 0,
-                    premium_until TEXT NOT NULL DEFAULT ''
-                );
-                CREATE TABLE IF NOT EXISTS bunker_purchases (
-                    user_id BIGINT NOT NULL,
-                    item_id TEXT NOT NULL,
-                    PRIMARY KEY (user_id, item_id)
-                )
-                ;
-                CREATE TABLE IF NOT EXISTS bunker_chat_settings (
-                    chat_id BIGINT PRIMARY KEY,
-                    game_type TEXT NOT NULL DEFAULT 'player',
-                    discussion_time INTEGER NOT NULL DEFAULT 60,
-                    voting_time INTEGER NOT NULL DEFAULT 105,
-                    reveal_time INTEGER NOT NULL DEFAULT 40
-                )
-            """)
-            # Мягкая миграция для экономики v9 → v10.
-            await conn.execute("ALTER TABLE bunker_economy ADD COLUMN IF NOT EXISTS equipped_badge TEXT NOT NULL DEFAULT ''")
-            await conn.execute("ALTER TABLE bunker_economy ADD COLUMN IF NOT EXISTS premium_until TEXT NOT NULL DEFAULT ''")
-            await conn.execute("CREATE TABLE IF NOT EXISTS bunker_star_payments (charge_id TEXT PRIMARY KEY, user_id BIGINT NOT NULL, product_id TEXT NOT NULL, stars INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW())")
-    except Exception as e:
-        print(f"[STATS DB] Не удалось подключить внешнюю БД: {e}")
-        _stats_pool = None
+SKILLS = {
+    "attacker": [
+        "Пушечный удар с обеих ног",
+        "Частые ошибки и потери при простых передачах назад",
+        "Мастер изолированного дриблинга 1 в 1",
+        "Играет всегда честно и проявляет уважение",
+        "Эффективный дриблинг на ограниченном пространстве",
+        "Видение поля и скрытые передачи на высочайшем уровне",
+        "Частые неоправданные фолы",
+        "100% реализация пенальти",
+        "Безупречное исполнение угловых и фланговых навесов",
+        "Ужасная игра слабой ногой при передачах и ударах",
+        "Высокий футбольный IQ",
+        "Хладнокровен при выходе 1 на 1",
+        "Слишком часто симулирует в штрафной",
+        "Мастер в исполнении крученых штрафных",
+        "Деревянный прием мяча при обработке",
+        "Полное доминирование на втором этаже (в воздухе)",
+        "Ужасная реализация убойных моментов",
+        "Способность задавать темп игре",
+        "Идеальный контроль мяча на большой скорости",
+        "Умение вбрасывать ауты напрямую в штрафную",
+        "Агрессивный и непрерывный прессинг без мяча",
+        "Абсолютный лидер на поле и в раздевалке",
+        "Склонность к панике при интенсивном прессинге",
+        "Умение грамотно провоцировать соперника",
+        "Пассивность в фазе обороны и неохотно возвращается назад",
+        "Взрывной стартовый рывок на первых 10 метрах",
+        "Чересчур токсичный",
+        "Отличная координация и плотный удар с лета",
+        "Уникальный тайминг открывания за спину защитникам",
+        "Радиоуправляемые диагональные передачи на 60 метров",
+        "Абсолютно не умеет играть головой, несмотря на высокий рост",
+        "Идеальное чтение игры при перехватах и игре на опережение",
+        "Слишком долго принимает решения, если соперник включает жесткий прессинг",
+        "Король «слепых» зон, всегда незаметно находит пространство за спинами защитников",
+        "Злоупотребляет индивидуальными проходами в ущерб командной тактике",
+        "Мастер тактического фола при срыве опасных контратак",
+        "Отлично бьет штрафные удары непредсказуемым стилем «наклбол»",
+        "Постоянно попадает в офсайды из-за спешки при открываниях на грани линии",
+        "Феноменальная игра в одно касание (тики-така) в узких пространствах",
+        "Имеет коронный финт, на который покупаются даже топовые защитники",
+        'Хладнокровно принимает решения под высоким прессингом',
+        'Регулярно теряет мяч при попытке обыграть двух соперников',
+        'Отлично открывается между линиями',
+        'Плохо играет спиной к воротам',
+        'Уверенно завершает атаки первым касанием',
+        'Опасен на дальней штанге',
+        'Часто выбирает неправильный момент для рывка',
+        'Умеет удерживать мяч корпусом под давлением',
+        'Слабо участвует в командном прессинге',
+        'Постоянно создает пространство для партнеров',
+    ],
+    "defender": [
+        "Безупречные подкаты в собственной штрафной",
+        "Регулярно срезает мяч в собственные ворота (автогольщик)",
+        "Доминирование в верховых дуэлях при стандартах",
+        "Паникует при прессинге и просто выбивает мяч за пределы стадиона",
+        "Персональная опека лучшего бомбардира соперника",
+        "Слишком часто получает прямые красные карточки за фолы последней надежды",
+        "Первый пас и выходы из-под прессинга через короткий пас",
+        "Теряет позицию и «залипает», постоянно ломая офсайдную ловушку",
+        "Мастер тактических фолов в центре поля без желтой карточки",
+        "Не умеет вести силовую борьбу, уступает габаритным форвардам",
+        "Чтение траекторий навесов и снятие всех верховых мячей",
+        "Постоянно «привозит» пенальти из-за неаккуратной игры руками",
+        "Идеальный выбор позиции при офсайдных ловушках",
+        "Совершенно не умеет играть рабочей левой ногой",
+        "Блокировка плотных ударов собственным телом",
+        "Медленный на развороте, соперники легко оббегают его на шаге",
+        "Жесткий силовой отбор без нарушения правил",
+        "Регулярно отдаёт «слепые» пасы назад прямо на ход нападающим соперника",
+        "Выбивание мяча с линии пустых ворот",
+        "Боится идти в жесткие стыки из-за страха получить травму",
+        "Страховка партнеров при провалах на флангах",
+        "Часто «залипает» с мячом в ногах и дарит его прессингующим",
+        "Мощный ввод мяча из аута напрямую во вратарскую",
+        "Ужасен в верховых дуэлях, несмотря на высокий рост",
+        "Координирует всю линию обороны командным голосом",
+        "Пассивно пласируется и дает соперникам спокойно бить из-за штрафной",
+        "Теряет нападающих за спиной при розыгрышах угловых",
+        'Уверенно играет один в один против быстрых нападающих',
+        'Часто теряет игрока при смене направления атаки',
+        'Отлично читает передачи вразрез',
+        'Слаб в позиционной обороне против низких передач',
+        'Спокойно начинает атаки первым пасом',
+        'Неуверенно действует против высоких навесов',
+        'Грамотно страхует партнеров за спиной',
+        'Часто выходит из линии слишком рано',
+        'Сильный отбор в момент приема мяча соперником',
+        'Плохо ориентируется при быстрых сменах фланга',
+    ],
+    "midfielder": [
+        "Разрезные передачи через две линии обороны",
+        "Передерживает мяч до последнего и постоянно попадает под обрез",
+        "Удержание мяча под жестким двойным прессингом",
+        "Отдает пасы исключительно назад или ближнему центральному защитнику",
+        "Дальние пушечные удары из-за пределов штрафной",
+        "Полностью игнорирует оборонительные обязанности и не возвращается назад",
+        "Дирижирование темпом и ритмом игры всей команды",
+        "Паникует и отдает передачу чужому игроку при малейшем давлении",
+        "Идеальные перехваты в переходных фазах",
+        "Гарантированно получает желтую карточку уже на первых 15 минутах матча",
+        "Выход из-под прессинга через один быстрый финт",
+        "Абсолютно не умеет бить по воротам из убойных позиций",
+        "Исполнение стандартов и подач с точностью до сантиметра",
+        "Хрупкий в физической борьбе, легко теряет мяч от любого контакта",
+        "Бесконечный объем беговой работы «от штрафной до штрафной»",
+        "Не видит продолжения атаки на противоположном фланге (узкое видение)",
+        "Мастер «тики-така» и игры в стенку в узких пространствах",
+        "Часто теряет позицию, увлекаясь бесполезным дриблингом",
+        "Феноменальное видение свободного пространства",
+        "Слишком медленно принимает решения при развитии быстрых контратак",
+        "Выдает идеальные диагонали на 50 метров точно в ногу",
+        "Регулярно фолит возле своей штрафной, даря сопернику опасные стандарты",
+        "Быстро выдыхается и теряет концентрацию во втором тайме",
+        "Игнорирует установки тренера и играет сам по себе",
+        'Отлично меняет направление атаки одной передачей',
+        'Теряет мяч при попытке ускорить темп',
+        'Умеет закрывать линии передач соперника',
+        'Редко подключается к атакам из глубины',
+        'Уверенно играет под давлением в центре',
+        'Часто оставляет свободную зону за спиной',
+        'Сильная игра вторым темпом',
+        'Плохо действует в единоборствах на открытом пространстве',
+        'Грамотно выбирает позицию между линиями',
+        'Слишком долго держит мяч перед передачей',
+    ]
+}
 
-async def init_db():
-    await _init_stats_db()
-    async with connect_db() as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS lobbies (
-                chat_id INTEGER PRIMARY KEY,
-                host_id INTEGER,
-                status TEXT,
-                scenario TEXT,
-                current_round INTEGER DEFAULT 1,
-                current_turn_user_id INTEGER DEFAULT 0,
-                tie_count INTEGER DEFAULT 0,
-                skip_count INTEGER DEFAULT 0,
-                total_ties INTEGER DEFAULT 0,
-                total_votes INTEGER DEFAULT 0
-            )
-        """)
-        
-        await db.commit()
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                chat_id INTEGER,
-                user_id INTEGER,
-                user_name TEXT,
-                pack_json TEXT,
-                is_alive INTEGER DEFAULT 1,
-                special_card TEXT DEFAULT '',
-                special_used INTEGER DEFAULT 0,
-                is_blocked INTEGER DEFAULT 0,
-                shield_active INTEGER DEFAULT 0,
-                muted_round INTEGER DEFAULT 0,
-                vote_redirect_target INTEGER DEFAULT 0,
-                vote_redirect_round INTEGER DEFAULT 0,
-                private_card_message_id INTEGER DEFAULT 0,
-                PRIMARY KEY (chat_id, user_id)
-            )
-        """)
-        
-        # Миграция колонок для спец-карт, если таблица уже существовала
-        for col, col_type in [
-            ("special_card", "TEXT DEFAULT ''"),
-            ("special_used", "INTEGER DEFAULT 0"),
-            ("is_blocked", "INTEGER DEFAULT 0"),
-            ("shield_active", "INTEGER DEFAULT 0"),
-            ("muted_round", "INTEGER DEFAULT 0"),
-            ("vote_redirect_target", "INTEGER DEFAULT 0"),
-            ("vote_redirect_round", "INTEGER DEFAULT 0"),
-            ("private_card_message_id", "INTEGER DEFAULT 0")
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE players ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass
+HEALTH_TRAITS = [
+    "Абсолютно нетравматичный",
+    "Часто уходит в тильт",
+    "Пиковая физическая форма сохраняется на протяжении всего сезона",
+    "Часто получает травму от любого жесткого стыка",
+    "Пропускает стабильно 15 матчей за сезон из-за травм",
+    "Слабая физическая выносливость",
+    "Замедленное восстановление после международных пауз",
+    "Вернулся из отпуска с +8 кг лишнего веса",
+    "Высокий болевой порог, способен играть с микроповреждениями",
+    "Частый недосып и вялость",
+    "Минимальный процент жира, филигранная выносливость",
+    "Боится идти в стыки на искусственном газоне",
+    "2 раза разрывал кресты",
+    "Полная устойчивость к силовым единоборствам и жестким стыкам",
+    "Проблемы с голеностопом при игре на жестких покрытиях",
+    "Восстанавливается после любых нагрузок за 24 часа",
+    "Теряет кондиции после 10 дней без игровой практики",
+    "Пропускает стартовые туры из-за медленного набора формы",
+    "Тяжело переносит матчи при высокой температуре и влажности",
+    "Соблюдает жесткую диету, спит по 9 часов, принимает ледяные ванны",
+    "Проблемы с паховыми кольцами (играет на уколах)",
+    "Хронический тенденит коленного сустава",
+    "Идеальное восстановление при графике два матча в неделю",
+    "Склонен к судорогам и спазмам",
+    "Имеется Проблемы с сердцем",
+    "Стальная психика",
+    "Подвержен частым мелким повреждениям на тренировках",
+    "Склонен к рецидивам старых повреждений колена",
+    "Гибкие связки, устойчивые к растяжениям и вывихам",
+    "Частые проблемы с задней поверхностью бедра",
+    "Астма (использует специальный ингалятор по разрешению WADA)",
+    "Хроническая усталость при графике два матча в неделю, требуется регулярная ротация",
+    "Страдает от мигреней при игре под мощным искусственным освещением",
+    "Генетическая аномалия: уникальная выносливость и низкий пульс",
+    "Тяжело переносит длительные перелеты на гостевые матчи",
+    "Вырезаны мениски на обеих ногах, играет исключительно за счет мощного мышечного корсета",
+    "Склонен к мышечным спазмам на последних 15 минутах интенсивного матча",
+    "Превосходная генетика: ни одной мышечной травмы за 5 лет карьеры",
+    "Регулярные проблемы с ахилловым сухожилием при смене бутс",
+    "Страдает от сезонной аллергии, резкий спад физической формы каждую весну",
+    "Повышенная хрупкость костей, высокий риск переломов при неудачных падениях",
+    "Имеет асимметрию таза, из-за чего перегружает одну ногу при рывках",
+    'Идеальная мышечная выносливость при плотном календаре',
+    'Старое повреждение плеча периодически ограничивает единоборства',
+    'Отлично переносит холодную погоду и тяжелые поля',
+    'Резко теряет скорость после сильных нагрузок',
+    'Никогда не пропускает восстановительные процедуры',
+    'Повышенный риск мышечных травм после двух матчей за неделю',
+    'Способен провести весь матч без заметного падения интенсивности',
+    'Часто играет через боль, скрывая повреждения от штаба',
+    'Отлично восстанавливается после силовых тренировок',
+    'Плохо переносит недостаток сна перед матчем',
+    'Сильные мышцы корпуса, редко проигрывает в контакте',
+    'Периодические проблемы с коленом после резких смен направления',
+    'Стабильная физическая форма на протяжении всего сезона',
+    'Требует осторожного управления нагрузкой после травмы',
+    'Очень быстро восстанавливается между матчами',
+    'Высокая выносливость, но слабая устойчивость к жестким стыкам',
+]
 
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN tie_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN skip_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN total_ties INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN total_votes INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE lobbies ADD COLUMN scenario_data TEXT DEFAULT ''")
-        except Exception:
-            pass
+INVENTORIES = [
+    "Золотые бутсы от персонального спонсора",
+    "Именные бутсы с индивидуальной стелькой под анатомию стопы",
+    "Карбоновые щитки, изготовленные по 3D-скану голени",
+    "GPS-трекер и датчики отслеживания рывковой нагрузки",
+    "Умные часы для постоянного контроля пульса и качества сна",
+    "Персональный массажист и личный фитнес-тренер",
+    "Портативная барокамера для ускоренной регенерации тканей",
+    "Компрессионные лимфодренажные штаны для применения после игр",
+    "Портативный ультразвуковой стимулятор мышечного восстановления",
+    "Индивидуальный набор тейпов и профессиональных охлаждающих гелей",
+    "Диплом спортивного аналитика и планшет с разбором соперников",
+    "Ингалятор, эластичные бинты и заживляющие спреи",
+    "Вип-подписка на спортивную аналитику и персональный SMM-менеджер",
+    "Счастливая капитанская повязка, приносящая удачу",
+    "Банка энергетика и изотоники перед матчем",
+    "Защищенный планшет с видео-нарезками действий конкретных оппонентов",
+    "VR-гарнитура для моделирования тактических эпизодов и принятия решений",
+    "Портативный массажный пистолет и крио-рукав",
+    "Защитная карбоновая маска на лицо",
+    "Допинг",
+    "Личный шеф-повар и взвешенный рацион с учетом микронутриентов",
+    "Постоянное сопровождение спортивного психолога",
+    "Персональный юрист для контроля контрактов и спонсорских сделок",
+    "Набор профессиональных видеокамер для снятия влогов на YouTube",
+    "Персональный сомнолог и технологичный матрас за €10,000 для идеального сна",
+    "Очки виртуальной реальности для когнитивной тренировки периферического зрения",
+    "Умное кольцо для круглосуточного мониторинга фаз восстановления организма",
+    "Аппарат прессотерапии для быстрого разгона молочной кислоты",
+    "Личный диетолог-биохакер и набор индивидуально подобранных БАДов",
+    "Бутсы со специальным гибридным шипованием для мокрого и вязкого газона",
+    "Портативный генератор гипоксии для имитации тренировок в высокогорье",
+    "Уникальная криокамера, установленная прямо в собственном особняке",
+    "Личный тренер по дыхательным практикам, йоге и медитации",
+    "Аналитическая программа на базе ИИ, выявляющая слабые зоны вратарей лиги",
+    'Персональная программа восстановления после каждого матча',
+    'Профессиональный GPS-датчик для анализа ускорений и торможений',
+    'Индивидуальные ортопедические стельки для снижения нагрузки на суставы',
+    'Портативная система охлаждения для мышц после игры',
+    'Тактический планшет с базой данных по соперникам',
+    'Комплект запасных бутс под разные типы газона',
+    'Персональный специалист по восстановлению сна',
+    'Набор эластичных бинтов и защитных фиксаторов',
+    'Профессиональный пульсометр с историей тренировочных нагрузок',
+    'Индивидуальный рацион на выездных матчах',
+    'Портативный компрессионный массажер',
+    'Система анализа техники бега на основе датчиков',
+    'Запасная пара бутс с усиленной защитой стопы',
+    'Персональный аналитик стандартных положений',
+]
 
-        # Экономика: мягкая миграция для уже существующих SQLite-инсталляций.
-        try:
-            await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0, premium_until TEXT NOT NULL DEFAULT '')")
-            await db.execute("ALTER TABLE bunker_economy ADD COLUMN equipped_badge TEXT NOT NULL DEFAULT ''")
-            await db.execute("CREATE TABLE IF NOT EXISTS bunker_star_payments (charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, product_id TEXT NOT NULL, stars INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-            try:
-                await db.execute("ALTER TABLE bunker_economy ADD COLUMN premium_until TEXT NOT NULL DEFAULT ''")
-            except Exception:
-                pass
-        except Exception:
-            pass
+SECRETS = [
+    "Секретно болеет за главнейшего заклятого врага вашего клуба",
+    "Получил тяжелую травму дома, но соврал клубу, что повредился на тренировке",
+    "Скрывает серьезные проблемы с игровой зависимостью и долги в казино",
+    "Был пойман на нарушении режима в ночном клубе",
+    "Получает скрытые выплаты от сторонних спонсоров в обход финансового фэйр-плей",
+    "Регулярно сливает информацию о составе и тактике журналистам перед матчами",
+    "Имеет давний конфликт с главным тренером и принципиально игнорирует его установки",
+    "Отказывается учить местный язык, из-за чего общается на поле только жестами",
+    "Имеет тайный предварительный контракт с клубом из Саудовской Аравии",
+    "В юности был отчислен из трех академий за систематические нарушения дисциплины",
+    "Попал в профессиональный футбол из любительской лиги благодаря случайному видео",
+    "Начинал карьеру как центральный защитник, но скрыл это при переходе в атаку",
+    "В детстве 7 лет занимался балетом, благодаря чему имеет невероятную гибкость",
+    "Принимал запрещенный жиросжигатель перед началом предсезонных сборов",
+    "На самом деле ему на 3 года больше, чем написано в паспорте (переписанный)",
+    "Был забанен на 6 месяцев за ставки на матчи собственной лиги",
+    "Сын вице-президента клуба, попал в основную команду по блату",
+    "Чуть не завершил карьеру два года назад из-за полного эмоционального выгорания",
+    "Имеет личную неприязнь к капитану команды и принципиально не пасует ему в игре",
+    "Задрот компьютерных игр, сидит в CS2 до 5 утра перед матчами",
+    "Ни разу в жизни не смотрел полный футбольный матч от начала до конца",
+    "Подписал скрытый предварительный контракт с прямым конкурентом по лиге",
+    "Скрывает от медицинского штаба начальную стадию грыжи, чтобы не сесть на скамейку",
+    "Ведет анонимный Telegram-канал, где критикует партнеров по команде",
+    "Потерял спортивную мотивацию на следующий день после подписания жирного контракта",
+    "Принимает решения о трансферах, советуясь с личным астрологом и нумерологом",
+    "В контракте есть тайный пункт о гарантированном выходе в старте минимум в 75% матчей",
+    "Панически боится летать на самолетах, перед выездами тайно принимает успокоительные",
+    "Получает процент с продаж именных футболок, поэтому часто генерирует медийные скандалы",
+    "Находится в холодной войне со спортивным директором из-за невыплаченных бонусов",
+    "Планирует форсировать свой трансфер зимой через скрытый саботаж тренировок",
+    'Тайно согласился на меньшую зарплату ради перехода в другой клуб',
+    'Скрывает конфликт с одним из лидеров раздевалки',
+    'Перед важными матчами избегает командных собраний',
+    'Имеет устную договоренность о переходе после окончания сезона',
+    'Несколько раз отказывался играть на неудобной позиции вопреки тренеру',
+    'Скрывает хронические проблемы с режимом восстановления',
+    'Тайно поддерживает контакт с бывшим агентом клуба-конкурента',
+    'После ошибок на поле долго не может восстановить концентрацию',
+    'Однажды самостоятельно сорвал тренировочный план команды',
+    'Получает личные бонусы за определенное количество матчей в сезоне',
+    'Считает себя незаменимым и конфликтует из-за ротации',
+    'Скрывает от команды предложение от другого клуба',
+    'Перед матчами предпочитает индивидуальную подготовку командной',
+    'Имеет репутацию игрока, который плохо реагирует на критику',
+]
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS votes (
-                chat_id INTEGER,
-                voter_id INTEGER,
-                target_id INTEGER,
-                PRIMARY KEY (chat_id, voter_id)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS reveals (
-                chat_id INTEGER,
-                user_id INTEGER,
-                trait TEXT,
-                round_num INTEGER,
-                PRIMARY KEY (chat_id, user_id, trait)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS hidden_captains (
-                chat_id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                round_num INTEGER
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                games_played INTEGER DEFAULT 0,
-                wins INTEGER DEFAULT 0
-            )
-        """)
-        await db.commit()
-
-# --- СТАТИСТИКА ---
-
-async def get_user_profile(user_id: int, username: str):
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT games_played, wins FROM bunker_users WHERE user_id = $1", user_id)
-            if not row:
-                await conn.execute("INSERT INTO bunker_users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username", user_id, username)
-                return (0, 0)
-            await conn.execute("UPDATE bunker_users SET username = $2 WHERE user_id = $1", user_id, username)
-            return (row["games_played"], row["wins"])
-    async with connect_db() as db:
-        async with db.execute("SELECT games_played, wins FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                await db.execute("INSERT INTO users (user_id, username, games_played, wins) VALUES (?, ?, 0, 0)", (user_id, username))
-                await db.commit()
-                return (0, 0)
-            return (row[0], row[1])
-
-async def update_user_stats(user_id: int, username: str, won: bool):
-    inc_win = 1 if won else 0
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO bunker_users (user_id, username, games_played, wins)
-                VALUES ($1, $2, 1, $3)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    games_played = bunker_users.games_played + 1,
-                    wins = bunker_users.wins + EXCLUDED.wins
-            """, user_id, username, inc_win)
-        return
-    async with connect_db() as db:
-        await db.execute("""
-            INSERT INTO users (user_id, username, games_played, wins)
-            VALUES (?, ?, 1, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                games_played = games_played + 1,
-                wins = wins + excluded.wins
-        """, (user_id, username, inc_win))
-        await db.commit()
+def get_sampled_list(source_list: list, count: int) -> list:
+    sampled = random.sample(source_list, k=min(count, len(source_list)))
+    if count > len(source_list):
+        sampled += random.choices(source_list, k=count - len(source_list))
+    random.shuffle(sampled)
+    return sampled
 
 
-# --- ЭКОНОМИКА / МАГАЗИН ---
+# --- ПУЛ КАРТОЧЕК КЛУБОВ ---
+CLUB_NAMES = [
+    "Барселона", "Реал Мадрид", "Ливерпуль", "Манчестер Сити", "Бавария", "ПСЖ",
+    "Арсенал", "Челси", "Интер", "Ювентус", "Боруссия Дортмунд", "Атлетико Мадрид",
+    "Милан", "Тоттенхэм", "Наполи", "Бенфика", "Аякс", "Порту", "РБ Лейпциг",
+    "Марсель", "Монако", "Астон Вилла", "Вест Хэм", "Рома", "Лацио"
+]
+CLUB_BUDGETS = [60, 80, 100, 120, 150, 180, 220, 260, 300, 350, 400, 500]
+CLUB_SQUADS = [
+    "Состав почти готов к сезону, но не хватает глубины на одной позиции",
+    "Много опытных игроков, но мало молодых вариантов на будущее",
+    "Молодой состав с высоким потенциалом и нестабильностью",
+    "Сбалансированный состав без явной слабой зоны",
+    "Сильная основа, но скамейка заметно уступает старту",
+    "Команда перегружена игроками одного профиля",
+    "Есть несколько лидеров, вокруг которых строится весь проект",
+    "Состав требует перестройки после неудачного сезона",
+    "Много универсалов, способных закрывать несколько ролей",
+    "Команде не хватает глубины после травм",
+    "Есть перспективная академия, но молодёжи не хватает опыта",
+    "Состав дорогой, но возрастной"
+]
+CLUB_FINANCE = [
+    "Стабильные финансы и возможность планировать трансферы на несколько лет",
+    "Большой доход, но руководство требует осторожных расходов",
+    "Бюджет есть, но один дорогой контракт сильно ограничит манёвры",
+    "Финансовая ситуация напряжённая — ошибка на рынке будет дорогой",
+    "Клуб готов рискнуть ради результата в этом сезоне",
+    "Финансовый отдел требует сохранить резерв на январь",
+    "Есть деньги на два крупных решения, но не на длинную лавку",
+    "Трансферный отдел ищет недооценённые варианты вместо звёзд"
+]
+CLUB_INFRA = [
+    "Современный тренировочный центр",
+    "Сильная академия и развитая система скаутинга",
+    "Отличная медицинская база",
+    "Большая международная фан-база",
+    "Стадион даёт высокий коммерческий доход",
+    "Сильная аналитическая команда",
+    "Медицинский штаб перегружен после серии травм",
+    "Академия требует вложений",
+    "Клуб активно развивает инфраструктуру",
+    "Команда хорошо работает с молодыми игроками"
+]
+CLUB_REPUTATION = [
+    "Готов бороться за титулы прямо сейчас",
+    "Нуждается в громком результате после провального сезона",
+    "Славится умением раскрывать молодых игроков",
+    "Не любит долгие перестройки",
+    "Ожидает от новичков немедленного результата",
+    "Предпочитает стабильность громким экспериментам",
+    "Хочет вернуть статус одного из лидеров лиги",
+    "Строит новый проект вокруг молодого тренера",
+    "Находится под давлением болельщиков",
+    "Ищет новую идентичность после смены тренера"
+]
+CLUB_PROBLEMS = [
+    "нужно срочно обновить одну линию состава",
+    "после травм требуется дополнительная глубина",
+    "нужно снизить средний возраст команды",
+    "нельзя допустить ещё одного провального трансферного окна",
+    "руководство требует сохранить часть бюджета",
+    "клубу нужен новый лидер раздевалки",
+    "нужно совместить результат сейчас и развитие на будущее",
+    "скауты спорят с тренером о направлении проекта",
+    "одна позиция давно закрывается временными решениями",
+    "клубу нужно найти способ не перегрузить зарплатную ведомость"
+]
+CLUB_SECRETS = [
+    "Руководство тайно готовит смену тренера",
+    "Один из лидеров команды хочет уйти летом",
+    "В клубе уже договорились о продаже важного игрока",
+    "Спонсор требует более громкого проекта",
+    "Академия получила неожиданно сильное поколение игроков",
+    "Главный тренер настаивает на сохранении бюджета до зимы",
+    "Клуб ведёт переговоры с инвестором",
+    "Один дорогой контракт может быть пересмотрен",
+    "Внутри клуба спорят о приоритетах трансферной политики",
+    "Скаутский отдел нашёл несколько скрытых кандидатов"
+]
 
-def _economy_date():
-    from datetime import datetime, timedelta, timezone
-    # Казахстанский часовой пояс по умолчанию; можно изменить через ECONOMY_TZ_OFFSET.
-    offset = int(os.getenv("ECONOMY_TZ_OFFSET", "5"))
-    return (datetime.now(timezone.utc) + timedelta(hours=offset)).date().isoformat()
+def _position_role(position: str) -> str:
+    """Return the logical role of a player position. This is used by scenarios,
+    so a full-back can never accidentally satisfy a Central Defender requirement."""
+    for role, values in POSITIONS.items():
+        if position in values:
+            return role
+    return "unknown"
 
-async def _ensure_economy_user_sqlite(db, user_id: int):
-    await db.execute("INSERT OR IGNORE INTO users (user_id, username, games_played, wins) VALUES (?, '', 0, 0)", (user_id,))
 
-async def get_coins(user_id: int) -> int:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT coins FROM bunker_economy WHERE user_id = $1", user_id)
-            if not row:
-                await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-                return 0
-            return int(row["coins"])
-    async with connect_db() as db:
-        await _ensure_economy_user_sqlite(db, user_id)
-        # SQLite fallback stores economy in a dedicated table.
-        await db.execute("CREATE TABLE IF NOT EXISTS bunker_economy (user_id INTEGER PRIMARY KEY, coins INTEGER NOT NULL DEFAULT 0, daily_date TEXT NOT NULL DEFAULT '', daily_games INTEGER NOT NULL DEFAULT 0, daily_wins INTEGER NOT NULL DEFAULT 0, daily_reveals INTEGER NOT NULL DEFAULT 0, daily_votes INTEGER NOT NULL DEFAULT 0, equipped_title TEXT NOT NULL DEFAULT '', equipped_frame TEXT NOT NULL DEFAULT '', equipped_card_theme TEXT NOT NULL DEFAULT 'classic', equipped_victory TEXT NOT NULL DEFAULT 'classic', equipped_badge TEXT NOT NULL DEFAULT '', owner_granted INTEGER NOT NULL DEFAULT 0, premium_until TEXT NOT NULL DEFAULT '')")
-        await db.execute("INSERT OR IGNORE INTO bunker_economy (user_id) VALUES (?)", (user_id,))
-        async with db.execute("SELECT coins FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
-            row = await cur.fetchone()
-        await db.commit()
-        return int(row[0]) if row else 0
+def generate_game_packs(num_players: int, line_type: str = "attacker", game_type: str = "player", required_positions=None) -> list:
+    """Generate a game with machine-readable role metadata.
+    Required roles are inserted into different slots, preventing the old bug where
+    two requirements could overwrite the same player."""
+    if game_type == "club":
+        return generate_club_packs(num_players)
 
-async def add_coins(user_id: int, amount: int):
-    if amount <= 0:
-        return await get_coins(user_id)
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.execute("INSERT INTO bunker_economy (user_id, coins) VALUES ($1, $2) ON CONFLICT(user_id) DO UPDATE SET coins = bunker_economy.coins + $2", user_id, amount)
-            row = await conn.fetchrow("SELECT coins FROM bunker_economy WHERE user_id = $1", user_id)
-            return int(row["coins"])
-    async with connect_db() as db:
-        await get_coins(user_id)
-        await db.execute("UPDATE bunker_economy SET coins = coins + ? WHERE user_id = ?", (amount, user_id))
-        await db.commit()
-        return await get_coins(user_id)
-
-async def spend_coins(user_id: int, amount: int) -> bool:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            result = await conn.execute("UPDATE bunker_economy SET coins = coins - $2 WHERE user_id = $1 AND coins >= $2", user_id, amount)
-            return result.endswith("1")
-    async with connect_db() as db:
-        await get_coins(user_id)
-        cur = await db.execute("UPDATE bunker_economy SET coins = coins - ? WHERE user_id = ? AND coins >= ?", (amount, user_id, amount))
-        await db.commit()
-        return cur.rowcount == 1
-
-async def has_purchase(user_id: int, item_id: str) -> bool:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT 1 FROM bunker_purchases WHERE user_id = $1 AND item_id = $2", user_id, item_id)
-            return row is not None
-    async with connect_db() as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS bunker_purchases (user_id INTEGER NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(user_id,item_id))")
-        async with db.execute("SELECT 1 FROM bunker_purchases WHERE user_id = ? AND item_id = ?", (user_id, item_id)) as cur:
-            return await cur.fetchone() is not None
-
-async def purchase_item(user_id: int, item_id: str, price: int) -> bool:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            async with conn.transaction():
-                exists = await conn.fetchrow("SELECT 1 FROM bunker_purchases WHERE user_id = $1 AND item_id = $2", user_id, item_id)
-                if exists:
-                    return True
-                updated = await conn.execute("UPDATE bunker_economy SET coins = coins - $2 WHERE user_id = $1 AND coins >= $2", user_id, price)
-                if not updated.endswith("1"):
-                    return False
-                await conn.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES ($1, $2)", user_id, item_id)
-                return True
-    async with connect_db() as db:
-        await get_coins(user_id)
-        async with db.execute("SELECT 1 FROM bunker_purchases WHERE user_id = ? AND item_id = ?", (user_id, item_id)) as cur:
-            if await cur.fetchone():
-                return True
-        cur = await db.execute("UPDATE bunker_economy SET coins = coins - ? WHERE user_id = ? AND coins >= ?", (price, user_id, price))
-        if cur.rowcount != 1:
-            await db.rollback()
-            return False
-        await db.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES (?, ?)", (user_id, item_id))
-        await db.commit()
-        return True
-
-async def equip_item(user_id: int, item_type: str, item_id: str):
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.execute(f"UPDATE bunker_economy SET equipped_{item_type} = $2 WHERE user_id = $1", user_id, item_id)
-        return
-    async with connect_db() as db:
-        await get_coins(user_id)
-        await db.execute(f"UPDATE bunker_economy SET equipped_{item_type} = ? WHERE user_id = ?", (item_id, user_id))
-        await db.commit()
-
-async def get_equipped(user_id: int):
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory, equipped_badge FROM bunker_economy WHERE user_id = $1", user_id)
-            if not row:
-                await conn.execute("INSERT INTO bunker_economy (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-                return {"title":"", "frame":"", "card_theme":"classic", "victory":"classic", "badge":""}
-            return {"title":row["equipped_title"], "frame":row["equipped_frame"], "card_theme":row["equipped_card_theme"], "victory":row["equipped_victory"], "badge":row["equipped_badge"]}
-    async with connect_db() as db:
-        await get_coins(user_id)
-        async with db.execute("SELECT equipped_title, equipped_frame, equipped_card_theme, equipped_victory, equipped_badge FROM bunker_economy WHERE user_id = ?", (user_id,)) as cur:
-            row = await cur.fetchone()
-        return {"title":row[0], "frame":row[1], "card_theme":row[2], "victory":row[3], "badge":row[4]}
-
-async def record_daily_event(user_id: int, event: str, amount: int = 1):
-    rewards = {"game": 30, "win": 55, "reveal": 15, "vote": 10}
-    limits = {"game": 1, "win": 1, "reveal": 3, "vote": 5}
-    if event not in rewards:
-        return 0
-    today = _economy_date()
-    col = {"game":"daily_games", "win":"daily_wins", "reveal":"daily_reveals", "vote":"daily_votes"}[event]
-    reward = 0
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT daily_date, daily_games, daily_wins, daily_reveals, daily_votes FROM bunker_economy WHERE user_id = $1", user_id)
-            if not row:
-                await conn.execute("INSERT INTO bunker_economy (user_id, daily_date) VALUES ($1, $2)", user_id, today)
-                row = {"daily_date": today, "daily_games":0, "daily_wins":0, "daily_reveals":0, "daily_votes":0}
-            if row["daily_date"] != today:
-                await conn.execute("UPDATE bunker_economy SET daily_date=$2, daily_games=0, daily_wins=0, daily_reveals=0, daily_votes=0 WHERE user_id=$1", user_id, today)
-                current = 0
-            else:
-                current = int(row[col])
-            new_value = min(limits[event], current + amount)
-            delta = new_value - current
-            if delta > 0:
-                await conn.execute(f"UPDATE bunker_economy SET {col}=$2, coins=coins+$3 WHERE user_id=$1", user_id, new_value, rewards[event] * delta)
-                reward = rewards[event] * delta
-            return reward
-    async with connect_db() as db:
-        await get_coins(user_id)
-        async with db.execute("SELECT daily_date, %s FROM bunker_economy WHERE user_id = ?" % col, (user_id,)) as cur:
-            row = await cur.fetchone()
-        current = int(row[1] or 0) if row and row[0] == today else 0
-        if not row or row[0] != today:
-            await db.execute("UPDATE bunker_economy SET daily_date=?, daily_games=0, daily_wins=0, daily_reveals=0, daily_votes=0 WHERE user_id=?", (today, user_id))
-        new_value = min(limits[event], current + amount)
-        delta = new_value - current
-        if delta > 0:
-            await db.execute(f"UPDATE bunker_economy SET {col}=?, coins=coins+? WHERE user_id=?", (new_value, rewards[event]*delta, user_id))
-            reward = rewards[event]*delta
-        await db.commit()
-        return reward
-
-async def get_daily_progress(user_id: int):
-    today = _economy_date()
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT daily_date,daily_games,daily_wins,daily_reveals,daily_votes FROM bunker_economy WHERE user_id=$1", user_id)
-            if not row or row["daily_date"] != today:
-                return {"game":0,"win":0,"reveal":0,"vote":0}
-            return {"game":row["daily_games"],"win":row["daily_wins"],"reveal":row["daily_reveals"],"vote":row["daily_votes"]}
-    async with connect_db() as db:
-        await get_coins(user_id)
-        async with db.execute("SELECT daily_date,daily_games,daily_wins,daily_reveals,daily_votes FROM bunker_economy WHERE user_id=?", (user_id,)) as cur:
-            row=await cur.fetchone()
-        if not row or row[0] != today:
-            return {"game":0,"win":0,"reveal":0,"vote":0}
-        return {"game":row[1],"win":row[2],"reveal":row[3],"vote":row[4]}
-
-async def grant_purchase(user_id: int, item_id: str) -> bool:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            result = await conn.execute("INSERT INTO bunker_purchases (user_id, item_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, item_id)
-            return result.endswith("1")
-    async with connect_db() as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS bunker_purchases (user_id INTEGER NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(user_id,item_id))")
-        cur=await db.execute("INSERT OR IGNORE INTO bunker_purchases (user_id,item_id) VALUES (?,?)",(user_id,item_id))
-        await db.commit()
-        return cur.rowcount == 1
-
-async def extend_premium(user_id: int, days: int):
-    from datetime import datetime, timedelta, timezone
-    now=datetime.now(timezone.utc)
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row=await conn.fetchrow("SELECT premium_until FROM bunker_economy WHERE user_id=$1",user_id)
-            current=None
-            if row and row["premium_until"]:
-                try: current=datetime.fromisoformat(row["premium_until"])
-                except Exception: current=None
-            base=max(now,current) if current else now
-            until=base+timedelta(days=days)
-            await conn.execute("INSERT INTO bunker_economy(user_id,premium_until) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET premium_until=$2",user_id,until.isoformat())
-            return until
-    async with connect_db() as db:
-        await get_coins(user_id)
-        async with db.execute("SELECT premium_until FROM bunker_economy WHERE user_id=?",(user_id,)) as cur: row=await cur.fetchone()
-        current=None
-        if row and row[0]:
-            try: current=datetime.fromisoformat(row[0])
-            except Exception: current=None
-        base=max(now,current) if current else now
-        until=base+timedelta(days=days)
-        await db.execute("UPDATE bunker_economy SET premium_until=? WHERE user_id=?",(until.isoformat(),user_id))
-        await db.commit()
-        return until
-
-async def get_premium_until(user_id: int):
-    from datetime import datetime, timezone
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row=await conn.fetchrow("SELECT premium_until FROM bunker_economy WHERE user_id=$1",user_id)
-            value=row["premium_until"] if row else ""
+    if line_type == "mixed":
+        position_pool = POSITIONS["attacker"] + POSITIONS["defender"] + POSITIONS["midfielder"]
+        positions = get_sampled_list(position_pool, num_players)
+    elif line_type in POSITIONS:
+        positions = get_sampled_list(POSITIONS[line_type], num_players)
     else:
-        async with connect_db() as db:
-            await get_coins(user_id)
-            async with db.execute("SELECT premium_until FROM bunker_economy WHERE user_id=?",(user_id,)) as cur: row=await cur.fetchone()
-            value=row[0] if row else ""
-    if not value: return None
-    try:
-        dt=datetime.fromisoformat(value)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
+        positions = get_sampled_list(POSITIONS["attacker"], num_players)
 
-async def is_premium(user_id: int) -> bool:
-    from datetime import datetime, timezone
-    dt=await get_premium_until(user_id)
-    return bool(dt and dt > datetime.now(timezone.utc))
+    required_positions = [r for r in (required_positions or []) if r in POSITIONS]
+    available_slots = list(range(len(positions)))
+    random.shuffle(available_slots)
 
-async def record_star_payment(charge_id: str, user_id: int, product_id: str, stars: int) -> bool:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            result = await conn.execute("INSERT INTO bunker_star_payments(charge_id,user_id,product_id,stars) VALUES($1,$2,$3,$4) ON CONFLICT(charge_id) DO NOTHING", charge_id,user_id,product_id,stars)
-            return result.endswith("1")
-    async with connect_db() as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS bunker_star_payments (charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, product_id TEXT NOT NULL, stars INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-        cur=await db.execute("INSERT OR IGNORE INTO bunker_star_payments(charge_id,user_id,product_id,stars) VALUES(?,?,?,?)",(charge_id,user_id,product_id,stars))
-        await db.commit()
-        return cur.rowcount == 1
+    # Every mandatory role gets its own slot.
+    for required_role in required_positions:
+        if not available_slots:
+            break
+        idx = available_slots.pop()
+        positions[idx] = random.choice(POSITIONS[required_role])
 
-async def owner_grant_if_needed(user_id: int, amount: int) -> bool:
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT owner_granted FROM bunker_economy WHERE user_id=$1", user_id)
-            if row and row["owner_granted"]:
-                return False
-            await conn.execute("INSERT INTO bunker_economy(user_id,coins,owner_granted) VALUES($1,$2,1) ON CONFLICT(user_id) DO UPDATE SET coins=bunker_economy.coins+$2, owner_granted=1", user_id, amount)
-            return True
-    async with connect_db() as db:
-        await get_coins(user_id)
-        async with db.execute("SELECT owner_granted FROM bunker_economy WHERE user_id=?", (user_id,)) as cur:
-            row=await cur.fetchone()
-        if row and row[0]: return False
-        await db.execute("UPDATE bunker_economy SET coins=coins+?, owner_granted=1 WHERE user_id=?", (amount,user_id))
-        await db.commit()
-        return True
+    skill_pool = (SKILLS["attacker"] + SKILLS["defender"] + SKILLS["midfielder"]) if line_type == "mixed" else SKILLS.get(line_type, SKILLS["attacker"])
+    skills = get_sampled_list(skill_pool, num_players)
+    healths = get_sampled_list(HEALTH_TRAITS, num_players)
+    inventories = get_sampled_list(INVENTORIES, num_players)
+    secrets = get_sampled_list(SECRETS, num_players)
 
-async def health_check():
-    async with connect_db() as db:
-        await db.execute("SELECT 1")
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
+    packs = []
+    for i in range(num_players):
+        position = positions[i]
+        packs.append({
+            "position": position,
+            "position_role": _position_role(position),
+            "age": random.randint(17, 35),
+            "price": f"€{random.randint(20, 200)}M",
+            "health": healths[i],
+            "skill": skills[i],
+            "inventory": inventories[i],
+            "secret": secrets[i]
+        })
+    return packs
 
-# --- ЛОГИКА ЛОББИ ---
+def generate_club_packs(num_players: int) -> list:
+    names = get_sampled_list(CLUB_NAMES, num_players)
+    packs = []
+    for i in range(num_players):
+        packs.append({
+            "club": names[i],
+            "budget": f"€{random.choice(CLUB_BUDGETS)}M",
+            "squad": random.choice(CLUB_SQUADS),
+            "finance": random.choice(CLUB_FINANCE),
+            "infrastructure": random.choice(CLUB_INFRA),
+            "reputation": random.choice(CLUB_REPUTATION),
+            "problem": random.choice(CLUB_PROBLEMS),
+            "secret": random.choice(CLUB_SECRETS),
+        })
+    return packs
 
 
-async def _ensure_lobby_setting_columns():
-    async with connect_db() as db:
-        async with db.execute("PRAGMA table_info(lobbies)") as cur:
-            cols = {row[1] for row in await cur.fetchall()}
-        additions = {
-            "game_type": "TEXT DEFAULT 'player'",
-            "discussion_time": "INTEGER DEFAULT 60",
-            "voting_time": "INTEGER DEFAULT 105",
-            "reveal_time": "INTEGER DEFAULT 40",
-        }
-        for name, definition in additions.items():
-            if name not in cols:
-                await db.execute(f"ALTER TABLE lobbies ADD COLUMN {name} {definition}")
-        await db.commit()
+def _maybe_market_event(base_budget: int) -> tuple[int, str]:
+    """Rare market event. It appears in roughly one game out of five and can
+    modify the financial condition. The final validator uses the resulting value."""
+    if random.random() >= 0.20:
+        return base_budget, ""
 
-async def _default_settings():
-    return {"game_type": "player", "discussion_time": 60, "voting_time": 105, "reveal_time": 40}
+    event = random.choice([
+        ("📉 РЫНОК ПРОСЕЛ", -30, "Из-за падения рынка лимит трансфера временно снижен на €30M."),
+        ("📈 РЫНОК ПЕРЕГРЕТ", +40, "Клуб получил дополнительный резерв и готов увеличить лимит на €40M."),
+        ("💼 СПОНСОРСКИЙ БОНУС", +50, "Неожиданный бонус спонсора увеличил доступный лимит на €50M."),
+        ("🧾 ЖЁСТКАЯ ЭКОНОМИЯ", -40, "Руководство урезало трансферный фонд ещё на €40M.")
+    ])
+    title, delta, description = event
+    return max(40, base_budget + delta), f"{title}: {description}"
 
-async def _get_persistent_chat_settings(chat_id: int) -> dict:
-    defaults = await _default_settings()
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT game_type, discussion_time, voting_time, reveal_time FROM bunker_chat_settings WHERE chat_id=$1",
-                chat_id,
-            )
-            if not row:
-                await conn.execute(
-                    "INSERT INTO bunker_chat_settings(chat_id) VALUES($1) ON CONFLICT(chat_id) DO NOTHING",
-                    chat_id,
-                )
-                return defaults.copy()
-            return {
-                "game_type": row["game_type"] or "player",
-                "discussion_time": int(row["discussion_time"] or 60),
-                "voting_time": int(row["voting_time"] or 105),
-                "reveal_time": int(row["reveal_time"] or 40),
-            }
-    await _ensure_lobby_setting_columns()
-    async with connect_db() as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bunker_chat_settings (
-                chat_id INTEGER PRIMARY KEY,
-                game_type TEXT NOT NULL DEFAULT 'player',
-                discussion_time INTEGER NOT NULL DEFAULT 60,
-                voting_time INTEGER NOT NULL DEFAULT 105,
-                reveal_time INTEGER NOT NULL DEFAULT 40
-            )
-        """)
-        async with db.execute("SELECT game_type, discussion_time, voting_time, reveal_time FROM bunker_chat_settings WHERE chat_id=?", (chat_id,)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            await db.execute("INSERT OR IGNORE INTO bunker_chat_settings(chat_id) VALUES(?)", (chat_id,))
-            await db.commit()
-            return defaults.copy()
-        return {"game_type": row[0] or "player", "discussion_time": row[1] or 60, "voting_time": row[2] or 105, "reveal_time": row[3] or 40}
 
-async def get_chat_settings(chat_id: int) -> dict:
-    """Persistent settings configured for the group, independent of active games."""
-    return await _get_persistent_chat_settings(chat_id)
+def generate_scenario(players_count: int, game_type: str = "player") -> dict:
+    """Generate a scenario together with structured conditions.
+    The text is only the presentation; the conditions are used by the validator."""
+    if game_type == "club":
+        return generate_club_scenario(players_count)
 
-async def get_lobby_settings(chat_id: int) -> dict:
-    """Return active-lobby snapshot; otherwise return the group's persistent settings."""
-    await _ensure_lobby_setting_columns()
-    async with connect_db() as db:
-        async with db.execute("SELECT status, game_type, discussion_time, voting_time, reveal_time FROM lobbies WHERE chat_id=?", (chat_id,)) as cur:
-            row = await cur.fetchone()
-    if row and row[0] not in ("ended", "cancelled"):
-        return {"game_type": row[1] or "player", "discussion_time": row[2] or 60, "voting_time": row[3] or 105, "reveal_time": row[4] or 40}
-    return await _get_persistent_chat_settings(chat_id)
+    base_budget = random.choice([90, 100, 120, 140, 160, 180, 200, 230, 260, 300, 350])
+    budget, market_event = _maybe_market_event(base_budget)
+    club = random.choice(CLUB_NAMES)
 
-async def set_lobby_setting(chat_id: int, key: str, value):
-    allowed={"game_type","discussion_time","voting_time","reveal_time"}
-    if key not in allowed:
-        return False
-    await _ensure_lobby_setting_columns()
-    # Persistent group preference: survives lobby deletion and process restarts.
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.execute(
-                f"INSERT INTO bunker_chat_settings(chat_id, {key}) VALUES($1, $2) ON CONFLICT(chat_id) DO UPDATE SET {key}=EXCLUDED.{key}",
-                chat_id, value,
-            )
+    scenario_pool = [
+        ("ДВОЙНОЕ УСИЛЕНИЕ",
+         "Клубу нужно закрыть две разные задачи одним решением.",
+         "mixed_roles"),
+        ("ПЕРЕСТРОЙКА ПОСЛЕ СЕЗОНА",
+         "Новый тренер получил право привести только двух игроков.",
+         "defender_attacker"),
+        ("ПОСЛЕДНИЕ ЧАСЫ ОКНА",
+         "Спортивный директор выбирает двух игроков перед закрытием окна.",
+         "midfielder_attacker"),
+        ("ТОЧЕЧНАЯ ПЕРЕСТРОЙКА",
+         "Клуб хочет добавить молодого игрока и более опытного партнёра.",
+         "young_old"),
+        ("ТРАНСФЕРЫ БЕЗ ПЕРЕПЛАТЫ",
+         "Руководство разрешило только рациональную пару трансферов.",
+         "cheap_pair"),
+        ("НОВЫЙ БАЛАНС",
+         "Команде нужен игрок из обороны и игрок, способный помочь впереди.",
+         "defender_attacker"),
+        ("ПРОЕКТ НА БУДУЩЕЕ",
+         "Клуб ищет сочетание опыта и потенциала, не выходя за рамки фонда.",
+         "young_old"),
+        ("ПОСЛЕ ПРОДАЖИ ЛИДЕРА",
+         "Деньги есть, но руководство не хочет тратить их на двух дорогих игроков.",
+         "cheap_pair"),
+        ("ЗАПАСНОЙ ПЛАН",
+         "Основная цель сорвалась, поэтому клуб собирает рабочую пару из доступных вариантов.",
+         "mixed_roles"),
+        ("НОВЫЙ ТРЕНЕР, НОВЫЕ ПРАВИЛА",
+         "Тренер требует сочетать физическую мощь и контроль мяча.",
+         "defender_midfielder"),
+        ("БЕЗОПАСНЫЙ ТРАНСФЕР",
+         "Клуб не готов брать двух игроков с высокой трансферной стоимостью.",
+         "cheap_pair"),
+        ("МОЛОДОСТЬ + ОПЫТ",
+         "Один новичок должен быть перспективным, второй — готовым сразу дать результат.",
+         "young_old"),
+        ("ЦЕНТР ПОД УСИЛЕНИЕ",
+         "Руководство считает, что команде не хватает качества в центре поля и обороне.",
+         "defender_midfielder"),
+        ("АТАКА ПОД КОНТРОЛЕМ",
+         "Клуб хочет усилить атаку, но не потерять баланс.",
+         "midfielder_attacker"),
+        ("ТРАНСФЕРНЫЙ КОМПРОМИСС",
+         "Два игрока должны вписаться в один ограниченный пакет.",
+         "mixed_roles"),
+    ]
+    title, context, rule_code = random.choice(scenario_pool)
+
+    conditions = {"winners_needed": 2, "max_total_price": budget, "rule": rule_code}
+    required_roles = []
+    if rule_code == "defender_attacker":
+        required_roles = ["defender", "attacker"]
+        rule_text = "В паре обязательно должны быть защитник и атакующий игрок."
+    elif rule_code == "defender_midfielder":
+        required_roles = ["defender", "midfielder"]
+        rule_text = "В паре обязательно должны быть защитник и полузащитник."
+    elif rule_code == "midfielder_attacker":
+        required_roles = ["midfielder", "attacker"]
+        rule_text = "В паре обязательно должны быть полузащитник и атакующий игрок."
+    elif rule_code == "young_old":
+        conditions.update({"young_max_age": 25, "old_min_age": 28})
+        rule_text = "Один игрок должен быть не старше 25 лет, второй — не моложе 28 лет."
+    elif rule_code == "cheap_pair":
+        conditions["max_each_price"] = 120
+        rule_text = "Цена каждого игрока — не более €120M."
     else:
-        async with connect_db() as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS bunker_chat_settings (
-                    chat_id INTEGER PRIMARY KEY,
-                    game_type TEXT NOT NULL DEFAULT 'player',
-                    discussion_time INTEGER NOT NULL DEFAULT 60,
-                    voting_time INTEGER NOT NULL DEFAULT 105,
-                    reveal_time INTEGER NOT NULL DEFAULT 40
-                )
-            """)
-            await db.execute(f"INSERT INTO bunker_chat_settings(chat_id,{key}) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET {key}=excluded.{key}", (chat_id,value))
-            await db.commit()
-    # Keep a lobby snapshot stable; only change it while the lobby is still being configured.
-    async with connect_db() as db:
-        await db.execute(f"UPDATE lobbies SET {key}=? WHERE chat_id=? AND status='lobby'", (value,chat_id))
-        await db.commit()
-    return True
+        required_roles = [random.choice(["defender", "midfielder", "attacker"])]
+        conditions["required_role"] = required_roles[0]
+        role_names = {"defender":"защитником", "midfielder":"полузащитником", "attacker":"атакующим игроком"}
+        rule_text = f"Хотя бы один игрок должен быть {role_names[required_roles[0]]}."
 
-async def reset_lobby_settings(chat_id: int):
-    await _ensure_lobby_setting_columns()
-    defaults = await _default_settings()
-    if _stats_pool:
-        async with _stats_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO bunker_chat_settings(chat_id) VALUES($1)
-                ON CONFLICT(chat_id) DO UPDATE SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40
-            """, chat_id)
-    else:
-        async with connect_db() as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS bunker_chat_settings (
-                    chat_id INTEGER PRIMARY KEY,
-                    game_type TEXT NOT NULL DEFAULT 'player',
-                    discussion_time INTEGER NOT NULL DEFAULT 60,
-                    voting_time INTEGER NOT NULL DEFAULT 105,
-                    reveal_time INTEGER NOT NULL DEFAULT 40
-                )
-            """)
-            await db.execute("INSERT INTO bunker_chat_settings(chat_id) VALUES(?) ON CONFLICT(chat_id) DO UPDATE SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40", (chat_id,))
-            await db.commit()
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET game_type='player', discussion_time=60, voting_time=105, reveal_time=40 WHERE chat_id=? AND status='lobby'", (chat_id,))
-        await db.commit()
+    conditions["required_roles"] = required_roles
 
-async def create_lobby(chat_id: int, host_id: int) -> bool:
-    """Создаёт лобби только если в чате нет активной игры. Возвращает True/False."""
-    await _ensure_lobby_setting_columns()
-    prefs = await _get_persistent_chat_settings(chat_id)
-    async with connect_db() as db:
-        async with db.execute("SELECT status FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-        if row and row[0] not in ("ended", "cancelled"):
-            return False
-
-        await db.execute("DELETE FROM lobbies WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM players WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM reveals WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM hidden_captains WHERE chat_id = ?", (chat_id,))
-        await db.execute(
-            "INSERT INTO lobbies (chat_id, host_id, status, current_round, current_turn_user_id, game_type, discussion_time, voting_time, reveal_time) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?)",
-            (chat_id, host_id, "lobby", prefs["game_type"], prefs["discussion_time"], prefs["voting_time"], prefs["reveal_time"])
-        )
-        await db.commit()
-        return True
-
-async def try_start_lobby(chat_id: int) -> bool:
-    """Атомарно переводит лобби из lobby в starting. Защищает от двойного старта."""
-    async with connect_db() as db:
-        cursor = await db.execute(
-            "UPDATE lobbies SET status = 'starting' WHERE chat_id = ? AND status = 'lobby'",
-            (chat_id,)
-        )
-        await db.commit()
-        return cursor.rowcount == 1
+    event_block = f"\n\n🎲 <b>СОБЫТИЕ РЫНКА</b>\n{market_event}" if market_event else ""
+    text = (
+        f"⚽ <b>{title} — {club.upper()}</b>\n\n"
+        f"{context}\n\n"
+        f"📋 <b>ЧТО НУЖНО СДЕЛАТЬ</b>\n"
+        f"Выбрать <b>ровно 2 игроков</b>.\n\n"
+        f"1. {rule_text}\n"
+        f"2. Общая стоимость пары — <b>не более €{budget}M</b>.\n"
+        f"3. Оба пункта обязательны: нарушение любого = провал."
+        f"{event_block}\n\n"
+        f"💰 <b>ЛИМИТ ПАРЫ: €{budget}M</b>"
+    )
+    return {
+        "club": club, "winners_needed": 2, "line": "mixed",
+        "required_positions": required_roles, "text": text,
+        "price_requirement": budget, "market_event": market_event,
+        "budget": budget, "game_type": "player", "conditions": conditions
+    }
 
 
-async def get_lobby(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT status, host_id, scenario, current_round FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return (row[0], row[1], row[2], 0, row[3])
-            return None
-
-async def transition_lobby_status(chat_id: int, new_status: str, expected_statuses, current_round: int = None) -> bool:
-    placeholders = ",".join("?" for _ in expected_statuses)
-    async with connect_db() as db:
-        if current_round is None:
-            cur = await db.execute(f"UPDATE lobbies SET status = ? WHERE chat_id = ? AND status IN ({placeholders})", (new_status, chat_id, *expected_statuses))
-        else:
-            cur = await db.execute(f"UPDATE lobbies SET status = ?, current_round = ? WHERE chat_id = ? AND status IN ({placeholders})", (new_status, current_round, chat_id, *expected_statuses))
-        await db.commit()
-        return cur.rowcount == 1
-
-async def cancel_lobby(chat_id: int) -> bool:
-    return await transition_lobby_status(chat_id, "cancelled", ["lobby", "starting", "reveal_phase", "discussion", "voting", "finishing"])
-
-async def try_end_game(chat_id: int) -> bool:
-    return await transition_lobby_status(chat_id, "ended", ["reveal_phase", "discussion", "voting", "finishing"])
-
-async def set_lobby_status(chat_id: int, status: str, current_round: int = None):
-    async with connect_db() as db:
-        if current_round is not None:
-            await db.execute("UPDATE lobbies SET status = ?, current_round = ? WHERE chat_id = ?", (status, current_round, chat_id))
-        else:
-            await db.execute("UPDATE lobbies SET status = ? WHERE chat_id = ?", (status, chat_id))
-        await db.commit()
-
-async def set_current_turn(chat_id: int, user_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET current_turn_user_id = ? WHERE chat_id = ?", (user_id, chat_id))
-        await db.commit()
-
-async def get_current_turn(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT current_turn_user_id FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def update_lobby_scenario(chat_id: int, scenario_text: str, current_round: int = 1, scenario_data=None):
-    import json
-    payload = json.dumps(scenario_data or {}, ensure_ascii=False)
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET scenario = ?, scenario_data = ?, current_round = ? WHERE chat_id = ?", (scenario_text, payload, current_round, chat_id))
-        await db.commit()
-
-async def get_lobby_scenario_data(chat_id: int) -> dict:
-    import json
-    async with connect_db() as db:
-        async with db.execute("SELECT scenario_data FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-    if not row or not row[0]:
-        return {}
-    try:
-        return json.loads(row[0])
-    except Exception:
-        return {}
-
-async def get_tie_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT COALESCE(tie_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def increment_tie_count(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET tie_count = COALESCE(tie_count, 0) + 1, total_ties = COALESCE(total_ties, 0) + 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-async def reset_tie_count(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET tie_count = 0 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-async def get_skip_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT COALESCE(skip_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def increment_skip_count(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET skip_count = COALESCE(skip_count, 0) + 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
+def generate_club_scenario(players_count: int) -> dict:
+    budget = random.choice([100, 120, 150, 180, 220, 260, 300, 350, 400, 500])
+    destination = random.choice(CLUB_NAMES)
+    scenarios = [
+        ("РАЗРЫВ КОНТРАКТА", "Игрок покинул прежний клуб после конфликта и выбирает новый проект."),
+        ("ПОСЛЕ НЕОЖИДАННОЙ ПРОДАЖИ", "Клуб потерял лидера и срочно ищет новый проект."),
+        ("ПОСЛЕДНИЙ ШАНС", "Игрок ищет место, где сможет снова стать центральной фигурой."),
+        ("НОВЫЙ ТРЕНЕР", "После смены тренера клуб перестраивает проект."),
+        ("ПРОЕКТ НА ТРИ ГОДА", "Игроку нужен клуб, готовый вкладываться в долгосрочное развитие."),
+        ("ВОЗВРАЩЕНИЕ НА ВЕРШИНУ", "Игрок выбирает амбициозный проект после неудачного сезона."),
+        ("ДЕНЬГИ НЕ ВСЁ", "Одного бюджета недостаточно — важны реальные ресурсы клуба."),
+        ("АКАДЕМИЯ ПРОТИВ ЗВЁЗД", "Нужен клуб, который умеет развивать состав, а не только покупать готовых игроков."),
+        ("КЛУБ ДЛЯ ПЕРЕЗАПУСКА", "После тяжёлого периода нужен устойчивый проект."),
+        ("НОВАЯ РАЗДЕВАЛКА", "Игроку нужен клуб с сильным окружением и понятной ролью.")
+    ]
+    title, body = random.choice(scenarios)
+    club_conditions = {"min_budget": budget}
+    if "Академия" in title:
+        club_conditions["requires_infrastructure"] = "академ"
+    elif title == "ДЕНЬГИ НЕ ВСЁ":
+        club_conditions["requires_squad_or_infrastructure"] = True
+    elif title == "ВОЗВРАЩЕНИЕ НА ВЕРШИНУ":
+        club_conditions["requires_reputation"] = "титул"
+    elif title == "НОВАЯ РАЗДЕВАЛКА":
+        club_conditions["requires_squad"] = "лидер"
+    text = (
+        f"🏟️ <b>{title}</b>\n\n{body}\n\n"
+        f"📋 <b>УСЛОВИЯ ВЫБОРА</b>\n"
+        f"Выбрать <b>1 клуб</b>.\n"
+        f"1. Бюджет клуба — <b>не менее €{budget}M</b>."
+    )
+    if club_conditions.get("requires_infrastructure"):
+        text += "\n2. Нужна развитая академия/скаутинг."
+    elif club_conditions.get("requires_squad_or_infrastructure"):
+        text += "\n2. Нужен сильный состав или развитая инфраструктура."
+    elif club_conditions.get("requires_reputation"):
+        text += "\n2. Клуб должен реально претендовать на титулы."
+    elif club_conditions.get("requires_squad"):
+        text += "\n2. В составе должны быть лидеры, вокруг которых строится проект."
+    text += "\n\n⚠️ Всё, что перечислено в условиях, обязательно."
+    return {"club": destination, "winners_needed": 1, "line": "club", "text": text,
+            "budget": budget, "game_type": "club", "conditions": club_conditions}
 
 
-async def get_game_stats(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT current_round, COALESCE(total_votes, 0), COALESCE(total_ties, 0), COALESCE(skip_count, 0) FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            lobby_row = await cursor.fetchone()
-        async with db.execute("SELECT COUNT(*) FROM players WHERE chat_id = ? AND special_used = 1", (chat_id,)) as cursor:
-            special_used = (await cursor.fetchone())[0]
-        return {
-            "rounds": lobby_row[0] if lobby_row else 0,
-            "votes": lobby_row[1] if lobby_row else 0,
-            "ties": lobby_row[2] if lobby_row else 0,
-            "skips": lobby_row[3] if lobby_row else 0,
-            "special_cards": special_used,
-        }
 
-# --- ИГРОКИ И ПАКЕТЫ ХАРАКТЕРИСТИК ---
-
-async def add_player(chat_id: int, user_id: int, user_name: str, pack: dict):
-    async with connect_db() as db:
-        pack_json = json.dumps(pack, ensure_ascii=False)
-        await db.execute("""
-            INSERT OR REPLACE INTO players (chat_id, user_id, user_name, pack_json, is_alive)
-            VALUES (?, ?, ?, ?, 1)
-        """, (chat_id, user_id, user_name, pack_json))
-        await db.commit()
-
-async def get_players(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT user_name, user_id, pack_json FROM players WHERE chat_id = ?", (chat_id,)) as cursor:
-            return await cursor.fetchall()
-
-async def get_alive_players(chat_id: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT user_name, user_id FROM players WHERE chat_id = ? AND is_alive = 1", (chat_id,)) as cursor:
-            return await cursor.fetchall()
-
-async def get_player_pack(chat_id: int, user_id: int) -> dict:
-    async with connect_db() as db:
-        async with db.execute("SELECT pack_json FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-            return {}
-
-async def update_player_pack(chat_id: int, user_id: int, pack: dict):
-    async with connect_db() as db:
-        pack_json = json.dumps(pack, ensure_ascii=False)
-        await db.execute("UPDATE players SET pack_json = ? WHERE chat_id = ? AND user_id = ?", (pack_json, chat_id, user_id))
-        await db.commit()
-
-async def set_private_card_message_id(chat_id: int, user_id: int, message_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET private_card_message_id = ? WHERE chat_id = ? AND user_id = ?", (message_id, chat_id, user_id))
-        await db.commit()
-
-async def find_active_player_chat(user_id: int):
-    """Возвращает чат активной игры, в которой участвует пользователь."""
-    async with connect_db() as db:
-        async with db.execute(
-            """SELECT p.chat_id
-               FROM players p
-               JOIN lobbies l ON l.chat_id = p.chat_id
-              WHERE p.user_id = ?
-                AND l.status NOT IN ('ended', 'cancelled')
-              ORDER BY CASE WHEN l.status = 'lobby' THEN 0 ELSE 1 END, l.current_round DESC
-              LIMIT 1""",
-            (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
+def _price_number(value) -> int | None:
+    m = re.search(r"(\d+)", str(value or ""))
+    return int(m.group(1)) if m else None
 
 
-async def get_private_card_message_id(chat_id: int, user_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT private_card_message_id FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+def validate_scenario(scenario: dict, winners_data: list) -> tuple[bool, list[str]]:
+    """Deterministic scenario checker. Gemini is no longer responsible for deciding
+    whether a contract succeeds."""
+    conditions = scenario.get("conditions", {})
+    if scenario.get("game_type") == "club":
+        if len(winners_data) != 1:
+            return False, ["Нужно выбрать ровно 1 клуб."]
+        pack = winners_data[0][1] or {}
+        budget = _price_number(pack.get("budget"))
+        if budget is None or budget < conditions.get("min_budget", 0):
+            return False, [f"Бюджет клуба ниже требуемых €{conditions.get('min_budget', 0)}M."]
+        checks = []
+        infra = str(pack.get("infrastructure", "")).lower()
+        squad = str(pack.get("squad", "")).lower()
+        reputation = str(pack.get("reputation", "")).lower()
+        if conditions.get("requires_infrastructure") and conditions["requires_infrastructure"] not in infra:
+            checks.append("нет требуемой инфраструктуры/академии.")
+        if conditions.get("requires_squad_or_infrastructure") and not any(x in squad + " " + infra for x in ("сбалансирован", "сильная", "универсал", "академ", "аналит")):
+            checks.append("нет подходящего состава или инфраструктуры.")
+        if conditions.get("requires_reputation") and "титул" not in reputation:
+            checks.append("репутация клуба не соответствует требованию.")
+        if conditions.get("requires_squad") and "лидер" not in squad:
+            checks.append("в составе нет указанного ядра лидеров.")
+        if checks:
+            return False, checks
+        return True, [f"Бюджет €{budget}M проходит минимальный порог."]
 
-# --- СПЕЦ-КАРТЫ (МЕТОДЫ) ---
+    if len(winners_data) != conditions.get("winners_needed", 2):
+        return False, [f"Нужно выбрать ровно {conditions.get('winners_needed', 2)} игроков."]
 
-async def set_player_special_card(chat_id: int, user_id: int, card_code: str):
-    async with connect_db() as db:
-        await db.execute("""
-            UPDATE players 
-            SET special_card = ?, special_used = 0, is_blocked = 0, shield_active = 0 
-            WHERE chat_id = ? AND user_id = ?
-        """, (card_code, chat_id, user_id))
-        await db.commit()
+    packs = [p or {} for _, p in winners_data]
+    prices = [_price_number(p.get("price")) for p in packs]
+    if any(x is None for x in prices):
+        return False, ["У одного из игроков не определена цена."]
+    total = sum(prices)
+    max_total = conditions.get("max_total_price")
+    if max_total is not None and total > max_total:
+        return False, [f"Сумма пары €{total}M превышает лимит €{max_total}M."]
 
-async def get_player_special_info(chat_id: int, user_id: int):
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT special_card, special_used, is_blocked, shield_active FROM players WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id)
-        ) as cursor:
-            return await cursor.fetchone()
+    roles = [p.get("position_role") for p in packs]
+    required_roles = conditions.get("required_roles", [])
+    if required_roles and not all(role in roles for role in required_roles):
+        return False, ["В паре отсутствует обязательная линия позиции."]
+    if conditions.get("required_role") and conditions["required_role"] not in roles:
+        return False, ["В паре нет требуемой позиции."]
 
-async def update_player_special_status(chat_id: int, user_id: int, special_used: int = None, is_blocked: int = None, shield_active: int = None):
-    async with connect_db() as db:
-        if special_used is not None:
-            await db.execute("UPDATE players SET special_used = ? WHERE chat_id = ? AND user_id = ?", (special_used, chat_id, user_id))
-        if is_blocked is not None:
-            await db.execute("UPDATE players SET is_blocked = ? WHERE chat_id = ? AND user_id = ?", (is_blocked, chat_id, user_id))
-        if shield_active is not None:
-            await db.execute("UPDATE players SET shield_active = ? WHERE chat_id = ? AND user_id = ?", (shield_active, chat_id, user_id))
-        await db.commit()
+    if conditions.get("max_each_price") is not None and any(x > conditions["max_each_price"] for x in prices):
+        return False, [f"Один из игроков дороже €{conditions['max_each_price']}M."]
 
-async def set_muted_round(chat_id: int, user_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET muted_round = ? WHERE chat_id = ? AND user_id = ?", (round_num, chat_id, user_id))
-        await db.commit()
-
-async def is_muted_for_round(chat_id: int, user_id: int, round_num: int) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT muted_round FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return bool(row and row[0] == round_num)
-
-async def set_captain(chat_id: int, user_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE lobbies SET current_turn_user_id = current_turn_user_id WHERE chat_id = ?", (chat_id,))
-        # Храним скрытого капитана в отдельной таблице.
-        await db.execute("CREATE TABLE IF NOT EXISTS hidden_captains (chat_id INTEGER PRIMARY KEY, user_id INTEGER, round_num INTEGER)")
-        await db.execute("INSERT OR REPLACE INTO hidden_captains (chat_id, user_id, round_num) VALUES (?, ?, ?)", (chat_id, user_id, round_num))
-        await db.commit()
-
-async def get_captain(chat_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS hidden_captains (chat_id INTEGER PRIMARY KEY, user_id INTEGER, round_num INTEGER)")
-        async with db.execute("SELECT user_id FROM hidden_captains WHERE chat_id = ? AND round_num = ?", (chat_id, round_num)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
-
-async def set_vote_redirect(chat_id: int, user_id: int, target_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET vote_redirect_target = ?, vote_redirect_round = ? WHERE chat_id = ? AND user_id = ?", (target_id, round_num, chat_id, user_id))
-        await db.commit()
-
-async def get_vote_redirect(chat_id: int, round_num: int):
-    async with connect_db() as db:
-        async with db.execute("SELECT user_id, vote_redirect_target FROM players WHERE chat_id = ? AND vote_redirect_round = ? AND vote_redirect_target != 0", (chat_id, round_num)) as cursor:
-            row = await cursor.fetchone()
-            return (row[0], row[1]) if row else None
-
-async def clear_vote_redirect(chat_id: int, round_num: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET vote_redirect_target = 0, vote_redirect_round = 0 WHERE chat_id = ? AND vote_redirect_round = ?", (chat_id, round_num))
-        await db.commit()
-
-async def redirect_votes(chat_id: int, owner_id: int, target_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE votes SET target_id = ? WHERE chat_id = ? AND target_id = ?", (target_id, chat_id, owner_id))
-        await db.commit()
-
-# --- ВСКРЫТИЕ ХАРАКТЕРИСТИК ---
-
-async def record_reveal(chat_id: int, user_id: int, trait: str, round_num: int):
-    async with connect_db() as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO reveals (chat_id, user_id, trait, round_num) VALUES (?, ?, ?, ?)",
-            (chat_id, user_id, trait, round_num)
-        )
-        await db.commit()
-
-async def is_trait_revealed(chat_id: int, user_id: int, trait: str) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND trait = ?", (chat_id, user_id, trait)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def has_revealed_in_round(chat_id: int, user_id: int, round_num: int) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT 1 FROM reveals WHERE chat_id = ? AND user_id = ? AND round_num = ?", (chat_id, user_id, round_num)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def get_unrevealed_traits(chat_id: int, user_id: int, all_traits=None):
-    # Список характеристик зависит от режима игры. В старой версии здесь
-    # всегда были характеристики игрока, поэтому в режиме клубов бот мог
-    # автоматически выбрать несуществующий "Навык" или "Багаж".
-    if all_traits is None:
-        all_traits = ["position", "age", "price", "health", "skill", "inventory", "secret"]
-    async with connect_db() as db:
-        async with db.execute("SELECT trait FROM reveals WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            revealed = [row[0] for row in await cursor.fetchall()]
-    return [t for t in all_traits if t not in revealed]
-
-async def get_lobby_game_type_snapshot(chat_id: int):
-    """Тип конкретной игры, сохранённый в лобби, включая уже завершённую игру."""
-    await _ensure_lobby_setting_columns()
-    async with connect_db() as db:
-        async with db.execute("SELECT game_type FROM lobbies WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-    return (row[0] or "player") if row else None
-
-# --- ГОЛОСОВАНИЕ И ИСКЛЮЧЕНИЕ ---
-
-async def clear_votes(chat_id: int):
-    async with connect_db() as db:
-        await db.execute("DELETE FROM votes WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-async def has_user_voted(chat_id: int, voter_id: int) -> bool:
-    async with connect_db() as db:
-        async with db.execute("SELECT 1 FROM votes WHERE chat_id = ? AND voter_id = ?", (chat_id, voter_id)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def get_non_voted_alive_players(chat_id: int):
-    async with connect_db() as db:
-        query = """
-            SELECT p.user_id, p.user_name 
-            FROM players p
-            WHERE p.chat_id = ? AND p.is_alive = 1
-            AND p.user_id NOT IN (SELECT voter_id FROM votes WHERE chat_id = ?)
-        """
-        async with db.execute(query, (chat_id, chat_id)) as cursor:
-            return await cursor.fetchall()
-
-async def add_vote(chat_id: int, voter_id: int, target_id: int):
-    async with connect_db() as db:
-        await db.execute("INSERT OR REPLACE INTO votes (chat_id, voter_id, target_id) VALUES (?, ?, ?)", (chat_id, voter_id, target_id))
-        await db.execute("UPDATE lobbies SET total_votes = COALESCE(total_votes, 0) + 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-
-async def get_username(chat_id: int, user_id: int) -> str:
-    async with connect_db() as db:
-        async with db.execute("SELECT user_name FROM players WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else "Игрок"
-
-async def get_voters_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        async with db.execute("SELECT COUNT(*) FROM votes WHERE chat_id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-async def get_skip_votes_count(chat_id: int) -> int:
-    async with connect_db() as db:
-        query = """
-            SELECT COALESCE(SUM(CASE WHEN hc.user_id = v.voter_id THEN 2 ELSE 1 END), 0)
-            FROM votes v
-            LEFT JOIN hidden_captains hc
-              ON hc.chat_id = v.chat_id
-             AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
-            WHERE v.chat_id = ? AND v.target_id = 0
-        """
-        async with db.execute(query, (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return int(row[0] or 0)
-
-async def get_votes_detailed(chat_id: int):
-    async with connect_db() as db:
-        query = """
-            SELECT v.target_id, p.user_name,
-                   SUM(CASE WHEN hc.user_id = v.voter_id THEN 2 ELSE 1 END) as cnt
-            FROM votes v
-            JOIN players p ON v.chat_id = p.chat_id AND v.target_id = p.user_id
-            LEFT JOIN hidden_captains hc
-              ON hc.chat_id = v.chat_id
-             AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
-            WHERE v.chat_id = ? AND v.target_id != 0
-            GROUP BY v.target_id, p.user_name
-            ORDER BY cnt DESC
-        """
-        async with db.execute(query, (chat_id,)) as cursor:
-            return await cursor.fetchall()
-
-async def eliminate_player(chat_id: int, user_id: int):
-    async with connect_db() as db:
-        await db.execute("UPDATE players SET is_alive = 0 WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-        await db.commit()
+    ages = [p.get("age") for p in packs]
+    if "young_max_age" in conditions and "old_min_age" in conditions:
+        if not (any(isinstance(a, int) and a <= conditions["young_max_age"] for a in ages)
+                and any(isinstance(a, int) and a >= conditions["old_min_age"] for a in ages)):
+            return False, ["Пара не соответствует сочетанию возраста."]
+    return True, [f"Сумма пары €{total}M — в пределах лимита €{max_total}M."]
