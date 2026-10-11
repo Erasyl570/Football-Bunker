@@ -15,6 +15,9 @@ import google.generativeai as genai
 
 import database as db
 import cards
+import scenarios
+import extras
+import traits
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -105,6 +108,9 @@ CARD_IMAGES = {
     "inventory": "https://i.ibb.co/qL8JH60p/5-A3-AD710-D4-C9-443-B-AD86-14029-ED7-D237.png",
     "secret": "https://i.ibb.co/LzJ1zstj/7-DC7-EFD5-B294-4-EC8-BE3-D-EDF77-BFD93-DF.png"
 }
+# v15: новые характеристики используют готовые картинки близких по смыслу карт.
+CARD_IMAGES["contract"] = CARD_IMAGES["price"]
+CARD_IMAGES["vibe"] = CARD_IMAGES["skill"]
 
 SPECIAL_CARD_NAMES = {
     "swap_position": "🔄 Фиксированный обмен [Позиция]",
@@ -156,16 +162,38 @@ SPECIAL_CARD_DESCRIPTIONS = {
 
 TRAIT_LABELS = {
     "position": "Позиция", "age": "Возраст", "price": "Трансферная цена",
+    "contract": "Контракт", "vibe": "Характер",
     "health": "Здоровье", "skill": "Навык", "inventory": "Багаж", "secret": "Секрет",
     "club": "Клуб", "budget": "Бюджет", "squad": "Состав", "finance": "Финансы",
     "infrastructure": "Инфраструктура", "reputation": "Репутация", "problem": "Проблема"
 }
 
-PLAYER_TRAITS = [("position", "💼 Позицию"), ("age", "👤 Возраст"), ("price", "💰 Цену"), ("health", "❤️ Здоровье"), ("skill", "🎯 Навык"), ("inventory", "🎒 Багаж"), ("secret", "🔍 Секрет")]
+PLAYER_TRAITS = [("position", "💼 Позицию"), ("age", "👤 Возраст"), ("price", "💰 Цену"), ("health", "❤️ Здоровье"), ("skill", "🎯 Навык"), ("contract", "📝 Контракт"), ("vibe", "🧠 Характер"), ("inventory", "🎒 Багаж"), ("secret", "🔍 Секрет")]
+
+# Единый источник правды для отображения карточек: (ключ, эмодзи, название).
+PLAYER_CARD_ROWS = [("position", "💼", "Позиция"), ("age", "👤", "Возраст"), ("price", "💰", "Цена"),
+                    ("health", "❤️", "Здоровье"), ("skill", "🎯", "Навык"), ("contract", "📝", "Контракт"),
+                    ("vibe", "🧠", "Характер"), ("inventory", "🎒", "Багаж"), ("secret", "🔍", "Секрет")]
+CLUB_CARD_ROWS = [("budget", "💰", "Бюджет"), ("squad", "👥", "Состав"), ("finance", "📊", "Финансы"),
+                  ("infrastructure", "🏟️", "Инфраструктура"), ("reputation", "🏆", "Репутация"),
+                  ("problem", "⚠️", "Проблема"), ("secret", "🔍", "Секрет")]
+
+
+def _fmt_trait_value(key, val):
+    if val in (None, ""):
+        return "-"
+    if key == "age" and val != "-":
+        return f"{val} лет"
+    return str(val)
 CLUB_TRAITS = [("budget", "💰 Бюджет"), ("squad", "👥 Состав"), ("finance", "📊 Финансы"), ("infrastructure", "🏟 Инфраструктуру"), ("reputation", "🏆 Репутацию"), ("problem", "⚠️ Проблему"), ("secret", "🔍 Секрет")]
 
 ECONOMY_OWNER_ID = int(os.getenv("ECONOMY_OWNER_ID", "1624967415"))
 OWNER_STARTING_COINS = 10000
+
+# Реферальная программа: награда выдаётся после ПЕРВОЙ сыгранной игры приглашённого.
+REF_INVITEE_BONUS = 200
+REF_REFERRER_BONUS = 400
+REF_MAX_REWARDS = 50   # потолок наград на одного пригласившего (защита от ферм)
 SHOP_ITEMS = {
     # Титулы
     "title_tactician": {"type": "title", "name": "🧠 Тактик", "price": 450, "desc": "Отображается рядом с именем в профиле."},
@@ -317,19 +345,21 @@ async def is_game_active(chat_id: int) -> bool:
     return lobby is not None and lobby[0] not in ("ended", "cancelled")
 
 # --- ДЕТЕРМИНИРОВАННЫЙ ФИНАЛ СЦЕНАРИЯ ---
-async def build_contract_verdict(chat_id: int, alive_players: list) -> str:
+async def build_contract_verdict(chat_id: int, alive_players: list):
+    """Возвращает (текст_вердикта, успех, строки_проверки)."""
     scenario = await db.get_lobby_scenario_data(chat_id)
     if not scenario:
-        return "⚠️ <i>Структурированные условия этой игры не сохранены. Старый формат сценария нельзя надёжно проверить автоматически.</i>"
+        return ("⚠️ <i>Структурированные условия этой игры не сохранены. Старый формат сценария нельзя надёжно проверить автоматически.</i>",
+                False, [])
 
     winners_data = []
     for p_name, p_id in alive_players:
         winners_data.append((p_name, await db.get_player_pack(chat_id, p_id) or {}))
 
-    success, reasons = cards.validate_scenario(scenario, winners_data)
-    if success:
-        return "📌 <b>ВЕРДИКТ: УСПЕХ</b>\n📝 " + " ".join(html.escape(x) for x in reasons)
-    return "📌 <b>ВЕРДИКТ: ПРОВАЛ</b>\n📝 " + " ".join(html.escape(x) for x in reasons)
+    success, reasons = scenarios.validate_scenario(scenario, winners_data)
+    body = "\n".join(html.escape(x) for x in reasons)
+    head = "📌 <b>ВЕРДИКТ: УСПЕХ</b>" if success else "📌 <b>ВЕРДИКТ: ПРОВАЛ</b>"
+    return f"{head}\n{body}", success, reasons
 
 
 # --- ОЦЕНКА ИТОГОВ С GEMINI AI (ЧЕРЕЗ SDK С ТАЙМАУТОМ) ---
@@ -433,30 +463,26 @@ async def build_private_card_text(chat_id: int, user_id: int) -> str:
     game_type = await get_game_type(chat_id)
     if game_type == "club":
         title = html.escape(str(pack.get("club", "Клуб")))
-        lines = [
-            f"🏟️ <b>КАРТОЧКА КЛУБА — {title}</b>",
-            "───────────────────",
-            f"💰 <b>Бюджет:</b> <code>{html.escape(str(pack.get('budget','-')))}</code>",
-            f"👥 <b>Состав:</b> <code>{html.escape(str(pack.get('squad','-')))}</code>",
-            f"📊 <b>Финансы:</b> <code>{html.escape(str(pack.get('finance','-')))}</code>",
-            f"🏟️ <b>Инфраструктура:</b> <code>{html.escape(str(pack.get('infrastructure','-')))}</code>",
-            f"🏆 <b>Репутация:</b> <code>{html.escape(str(pack.get('reputation','-')))}</code>",
-            f"⚠️ <b>Проблема:</b> <code>{html.escape(str(pack.get('problem','-')))}</code>",
-            f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret','-')))}</i>",
-        ]
+        lines = [f"🏟️ <b>КАРТОЧКА КЛУБА — {title}</b>", "───────────────────"]
+        rows = CLUB_CARD_ROWS
     else:
         title_name = await db.get_username(chat_id, user_id) or "Игрок"
-        lines = [
-            f"⚽ <b>КАРТОЧКА ИГРОКА — {html.escape(title_name)}</b>",
-            "───────────────────",
-            f"💼 <b>Позиция:</b> <code>{html.escape(str(pack.get('position','-')))}</code>",
-            f"👤 <b>Возраст:</b> <code>{pack.get('age','-')} лет</code>",
-            f"💰 <b>Цена:</b> <code>{html.escape(str(pack.get('price','-')))}</code>",
-            f"❤️ <b>Здоровье:</b> <code>{html.escape(str(pack.get('health','-')))}</code>",
-            f"🎯 <b>Навык:</b> <code>{html.escape(str(pack.get('skill','-')))}</code>",
-            f"🎒 <b>Багаж:</b> <code>{html.escape(str(pack.get('inventory','-')))}</code>",
-            f"🔍 <b>Секрет:</b> <i>{html.escape(str(pack.get('secret','-')))}</i>",
-        ]
+        lines = [f"⚽ <b>КАРТОЧКА ИГРОКА — {html.escape(title_name)}</b>", "───────────────────"]
+        rows = PLAYER_CARD_ROWS
+    for key, emoji, label in rows:
+        val = html.escape(_fmt_trait_value(key, pack.get(key, "-")))
+        if key == "secret":
+            lines.append(f"{emoji} <b>{label}:</b> <i>{val}</i>")
+        else:
+            lines.append(f"{emoji} <b>{label}:</b> <code>{val}</code>")
+        if key == "inventory":
+            passive = traits.item_passive_text(pack.get("inventory"))
+            if passive:
+                lines.append(f"   ↳ <i>{html.escape(passive)}</i>")
+    goal = pack.get("goal") or {}
+    if goal.get("text"):
+        lines += ["───────────────────",
+                  f"🎯 <b>Тайная цель (+{extras.GOAL_REWARD} 🪙):</b> <i>{html.escape(goal['text'])}</i>"]
     lines += ["───────────────────", f"✨ <b>Спец-карта:</b> <b>{html.escape(spec_title)}</b>", f"ℹ️ <b>Что делает:</b> <i>{html.escape(spec_desc)}</i>", "───────────────────", "👇 <i>Используй кнопки ниже во время своего хода.</i>"]
     return "\n".join(lines)
 
@@ -485,20 +511,7 @@ async def build_players_summary(chat_id: int) -> str:
         return ""
 
     game_type = await get_game_type(chat_id)
-    if game_type == "club":
-        trait_structure = [
-            ("budget", "Бюджет"), ("squad", "Состав"),
-            ("finance", "Финансы"), ("infrastructure", "Инфраструктура"),
-            ("reputation", "Репутация"), ("problem", "Проблема"),
-            ("secret", "Секрет")
-        ]
-    else:
-        trait_structure = [
-            ("position", "Позиция"), ("age", "Возраст"),
-            ("price", "Цена"), ("health", "Здоровье"),
-            ("skill", "Навык"), ("inventory", "Багаж"),
-            ("secret", "Секрет")
-        ]
+    trait_structure = [(k, label) for k, _emoji, label in (CLUB_CARD_ROWS if game_type == "club" else PLAYER_CARD_ROWS)]
 
     number_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     players_blocks = ["📋 <b>СТАТУС КАРТОЧЕК</b>", "<i>Открытое — видно всем · 🔒 — пока скрыто</i>", "───────────────────"]
@@ -568,6 +581,71 @@ async def auto_reveal_single_player(chat_id: int, user_id: int, user_name: str, 
         preview_opts = LinkPreviewOptions(is_disabled=False, url=image_url, prefer_large_media=True, show_above_text=False)
         await bot.send_message(chat_id, msg_text, parse_mode="HTML", link_preview_options=preview_opts)
 
+_BOT_USERNAME = None
+
+
+async def get_bot_username() -> str:
+    global _BOT_USERNAME
+    if not _BOT_USERNAME:
+        _BOT_USERNAME = (await bot.get_me()).username
+    return _BOT_USERNAME
+
+
+async def send_chunked(chat_id: int, header: str, blocks: list, limit: int = 3800):
+    """Telegram не принимает сообщения длиннее 4096 символов: режем длинный итог на части."""
+    current = header
+    for block in blocks:
+        piece = ("\n\n" if current else "") + block
+        if len(current) + len(piece) > limit and current.strip():
+            await bot.send_message(chat_id, current, parse_mode="HTML")
+            current = block
+        else:
+            current += piece
+    if current.strip():
+        await bot.send_message(chat_id, current, parse_mode="HTML")
+
+
+async def generate_headlines(title: str, success: bool, names: list, lines: list) -> list:
+    """3 шуточных заголовка от Gemini; при любой проблеме — готовые шаблоны."""
+    fallback = extras.fallback_headlines(success, names)
+    if not GEMINI_API_KEY or not names:
+        return fallback
+    prompt = extras.build_headline_prompt(title, success, names, [html.unescape(x) for x in lines])
+    try:
+        async with GEMINI_SEMAPHORE:
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            response = await asyncio.wait_for(
+                model.generate_content_async(prompt, request_options={"timeout": 20}), timeout=25)
+        heads = extras.parse_headlines(response.text)
+        if len(heads) >= 2:
+            return heads
+    except Exception as e:
+        print(f"[HEADLINES] Gemini недоступен, используем шаблоны: {e}")
+    return fallback
+
+
+async def grant_referral_rewards(all_players: list):
+    """Награда за приглашённых выдаётся после их первой завершённой игры (один раз)."""
+    for p_name, p_id, _ in all_players:
+        try:
+            referrer_id = await db.claim_referral_reward(p_id, REF_MAX_REWARDS)
+            if not referrer_id:
+                continue
+            await db.add_coins(p_id, REF_INVITEE_BONUS)
+            await db.add_coins(referrer_id, REF_REFERRER_BONUS)
+            notices = (
+                (p_id, f"🎁 <b>Бонус за приглашение!</b> Ты сыграл первую игру — на баланс зачислено <b>{REF_INVITEE_BONUS} 🪙</b>."),
+                (referrer_id, f"🎁 <b>Друг сыграл первую игру!</b> {html.escape(p_name)} присоединился по твоей ссылке — тебе <b>{REF_REFERRER_BONUS} 🪙</b>."),
+            )
+            for uid, text in notices:
+                try:
+                    await bot.send_message(uid, text, parse_mode="HTML")
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[REFERRAL] Не удалось выдать награду для {p_id}: {e}")
+
+
 async def announce_winners_and_end(chat_id: int, alive_players: list):
     # Сохраняем данные игры ДО перевода лобби в ended.
     # Это гарантирует, что сценарий и статистика не потеряются в финале.
@@ -590,10 +668,16 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
         if is_win:
             await db.record_daily_event(p_id, "win")
 
+    # После первой сыгранной игры приглашённого награждаем обоих.
+    await grant_referral_rewards(all_players)
+
     # После завершения показываем всем полные карточки всех участников.
+    rows = CLUB_CARD_ROWS if game_type == "club" else PLAYER_CARD_ROWS
     all_cards_blocks = []
+    full_packs = {}
     for idx, (p_name, p_id, _) in enumerate(all_players, 1):
         pack = await db.get_player_pack(chat_id, p_id) or {}
+        full_packs[p_id] = pack
         spec_info = await db.get_player_special_info(chat_id, p_id)
         spec_code = spec_info[0] if spec_info else ""
         spec_used = bool(spec_info[1]) if spec_info else False
@@ -602,32 +686,14 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
             spec_title += " (использована)"
         alive_mark = "🏆" if p_id in alive_ids else "❌"
 
+        head = f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b>"
         if game_type == "club":
-            all_cards_blocks.append(
-                f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b> — 🏟️ <b>{html.escape(str(pack.get('club','-')))}</b>\n"
-                f"├ 💰 Бюджет: <b>{html.escape(str(pack.get('budget','-')))}</b>\n"
-                f"├ 👥 Состав: <b>{html.escape(str(pack.get('squad','-')))}</b>\n"
-                f"├ 📊 Финансы: <b>{html.escape(str(pack.get('finance','-')))}</b>\n"
-                f"├ 🏟️ Инфраструктура: <b>{html.escape(str(pack.get('infrastructure','-')))}</b>\n"
-                f"├ 🏆 Репутация: <b>{html.escape(str(pack.get('reputation','-')))}</b>\n"
-                f"├ ⚠️ Проблема: <b>{html.escape(str(pack.get('problem','-')))}</b>\n"
-                f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret','-')))}</b>\n"
-                f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
-            )
-        else:
-            age = pack.get("age", "-")
-            age_text = f"{age} лет" if age != "-" else "-"
-            all_cards_blocks.append(
-                f"{alive_mark} <b>{idx}. {html.escape(p_name)}</b>\n"
-                f"├ 💼 Позиция: <b>{html.escape(str(pack.get('position','-')))}</b>\n"
-                f"├ 👤 Возраст: <b>{html.escape(str(age_text))}</b>\n"
-                f"├ 💰 Цена: <b>{html.escape(str(pack.get('price','-')))}</b>\n"
-                f"├ ❤️ Здоровье: <b>{html.escape(str(pack.get('health','-')))}</b>\n"
-                f"├ 🎯 Навык: <b>{html.escape(str(pack.get('skill','-')))}</b>\n"
-                f"├ 🎒 Багаж: <b>{html.escape(str(pack.get('inventory','-')))}</b>\n"
-                f"├ 🔍 Секрет: <b>{html.escape(str(pack.get('secret','-')))}</b>\n"
-                f"└ ✨ Спецкарта: <b>{html.escape(spec_title)}</b>"
-            )
+            head += f" — 🏟️ <b>{html.escape(str(pack.get('club', '-')))}</b>"
+        body = [f"{emoji} {label}: <b>{html.escape(_fmt_trait_value(key, pack.get(key, '-')))}</b>"
+                for key, emoji, label in rows]
+        body.append(f"✨ Спецкарта: <b>{html.escape(spec_title)}</b>")
+        all_cards_blocks.append(head + "\n" + "\n".join(
+            ("└ " if i == len(body) - 1 else "├ ") + line for i, line in enumerate(body)))
 
     if not alive_players:
         await bot.send_message(
@@ -649,13 +715,14 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
             parse_mode="HTML"
         )
 
-    # Финальный результат больше не зависит от Gemini:
+    # Финальный результат не зависит от Gemini:
     # условия сценария проверяются по структурированным данным игры.
     try:
-        ai_verdict = await build_contract_verdict(chat_id, alive_players)
+        ai_verdict, success, verdict_lines = await build_contract_verdict(chat_id, alive_players)
     except Exception as e:
         print(f"[FINAL] Ошибка проверки сценария: {e}")
         ai_verdict = "⚠️ <i>Не удалось автоматически проверить условия сценария. Карточки и итог всё равно раскрыты.</i>"
+        success, verdict_lines = False, []
 
     await bot.send_message(
         chat_id,
@@ -672,6 +739,35 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
         parse_mode="HTML"
     )
 
+    # Газетные заголовки + приглашение (карточка итогов, которой хочется поделиться).
+    try:
+        scen_data = await db.get_lobby_scenario_data(chat_id)
+        heads = await generate_headlines(scen_data.get("title", "Футбольный бункер"), success,
+                                         [p[0] for p in alive_players], verdict_lines)
+        username = await get_bot_username()
+        await bot.send_message(
+            chat_id,
+            "📰 <b>ГАЗЕТЫ ПИШУТ</b>\n───────────────────\n" + "\n".join(html.escape(h) for h in heads) +
+            f"\n\n🎮 <i>Сыграть с друзьями:</i> https://t.me/{username}",
+            parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+    except Exception as e:
+        print(f"[FINAL] Ошибка заголовков: {e}")
+
+    # Тайные цели: награда за выполненные.
+    if alive_players:
+        try:
+            results = extras.goal_results([(n, i, full_packs.get(i, {})) for n, i, _ in all_players], alive_ids)
+            for _name, uid, _text, ok in results:
+                if ok:
+                    await db.add_coins(uid, extras.GOAL_REWARD)
+            goals_msg = extras.format_goal_results(results)
+            if goals_msg:
+                await bot.send_message(chat_id, goals_msg, parse_mode="HTML")
+        except Exception as e:
+            print(f"[FINAL] Ошибка тайных целей: {e}")
+
     if alive_players:
         try:
             effects = "\n".join([await victory_effect(p_id, p_name) for p_name, p_id in alive_players])
@@ -679,13 +775,67 @@ async def announce_winners_and_end(chat_id: int, alive_players: list):
         except Exception as e:
             print(f"[FINAL] Ошибка победных эффектов: {e}")
 
-    await bot.send_message(
+    await send_chunked(
         chat_id,
-        "🔓 <b>КАРТЫ РАСКРЫТЫ</b>\n───────────────────\n"
-        "Теперь можно узнать, что на самом деле скрывал каждый игрок:\n\n" +
-        "\n\n".join(all_cards_blocks),
-        parse_mode="HTML"
+        "🔓 <b>КАРТЫ РАСКРЫТЫ</b>\n───────────────────\nТеперь можно узнать, что на самом деле скрывал каждый игрок:",
+        all_cards_blocks
     )
+
+
+async def run_round_extras(chat_id: int, current_round: int) -> float:
+    """Поворот сюжета (один раз за игру) или событие раунда.
+    Возвращает множитель времени обсуждения (1.0 — без изменений)."""
+    alive = await db.get_alive_players(chat_id)
+    if len(alive) <= 2:
+        return 1.0
+    game_type = await get_game_type(chat_id)
+    scen = await db.get_lobby_scenario_data(chat_id)
+
+    # 1) Поворот сюжета: меняет условия, но решение среди живых игроков остаётся.
+    twist_round = int((scen or {}).get("twist_round", 2))
+    if (scen and scen.get("conditions") and not scen.get("twist_done")
+            and twist_round <= current_round <= twist_round + 1 and len(alive) >= 3):
+        entries = [(name, await db.get_player_pack(chat_id, uid) or {}) for name, uid in alive]
+        res = scenarios.make_twist(scen, entries)
+        if res:
+            new_scen, text = res
+            await db.update_lobby_scenario(chat_id, new_scen["text"], current_round, new_scen)
+            cond_lines = "\n".join(f"{scenarios.NUM_EMOJI[i]} {scenarios.cond_text(c)}"
+                                   for i, c in enumerate(new_scen["conditions"]))
+            await bot.send_message(
+                chat_id,
+                f"🌪 <b>ПОВОРОТ СЮЖЕТА!</b>\n───────────────────\n{html.escape(text[:1].upper() + text[1:])}\n\n"
+                f"📋 <b>ОБНОВЛЁННЫЕ УСЛОВИЯ:</b>\n{cond_lines}",
+                parse_mode="HTML"
+            )
+            return 1.0
+
+    # 2) Событие раунда (инвентарь работает как пассивная защита / подсказка).
+    trait_keys = await get_game_traits(chat_id)
+    alive_info = []
+    for name, uid in alive:
+        pack = await db.get_player_pack(chat_id, uid) or {}
+        unrevealed = set(await db.get_unrevealed_traits(chat_id, uid, trait_keys))
+        alive_info.append({"id": uid, "name": name, "pack": pack,
+                           "revealed": {t for t in trait_keys if t not in unrevealed}})
+    ev = extras.plan_event(current_round, alive_info, game_type, TRAIT_LABELS)
+    if not ev:
+        return 1.0
+    for uid, trait in ev.get("reveals", []):
+        # round_num=0: вскрытие событием не отнимает у игрока его обычный ход в раунде.
+        await db.record_reveal(chat_id, uid, trait, 0)
+    for uid, amount in ev.get("coins", []):
+        await db.add_coins(uid, amount)
+    await bot.send_message(chat_id, ev["text"], parse_mode="HTML")
+    for uid, text in ev.get("dm", []):
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+        except Exception:
+            pass
+    for uid, _trait in ev.get("reveals", []):
+        await refresh_private_card(chat_id, uid)
+    return float(ev.get("discussion_factor", 1.0))
+
 
 async def start_round_flow(chat_id: int, current_round: int):
     try:
@@ -707,6 +857,13 @@ async def start_round_flow(chat_id: int, current_round: int):
             f"📢 <b>РАУНД {current_round} | ВСКРЫТИЕ КАРТ</b>\n───────────────────\nИгроки вытягивают по 1 карте строго по очереди.",
             parse_mode="HTML"
         )
+
+        # v15: поворот сюжета или событие раунда. Сбой здесь не должен ломать игру.
+        discussion_factor = 1.0
+        try:
+            discussion_factor = await run_round_extras(chat_id, current_round)
+        except Exception as e:
+            print(f"[ROUND EXTRAS] Раунд {current_round}, чат {chat_id}: {type(e).__name__}: {e}")
 
         for p_name, p_id in alive_players:
             if not await is_game_active(chat_id): return
@@ -755,6 +912,8 @@ async def start_round_flow(chat_id: int, current_round: int):
         discussion_time = int(settings.get("discussion_time", 60)) if settings else (60 if has_voting else 30)
         if not has_voting:
             discussion_time = min(discussion_time, 60)
+        if discussion_factor != 1.0:
+            discussion_time = max(15, int(discussion_time * discussion_factor))
 
         summary_text = await build_players_summary(chat_id)
         discussion_msg = f"💬 <b>РАУНД {current_round} | ОБСУЖДЕНИЕ ({discussion_time} СЕКУНД)</b>\n───────────────────\n"
@@ -1131,10 +1290,9 @@ async def start_game(callback: types.CallbackQuery):
         
         settings = await db.get_lobby_settings(chat_id)
         game_type = settings.get("game_type", "player") if settings else "player"
-        scen = cards.generate_scenario(num_players, game_type=game_type)
+        # v15: сценарий и карточки создаются вместе — решение гарантированно существует.
+        scen, packs = scenarios.generate_game(num_players, game_type=game_type)
         await db.update_lobby_scenario(chat_id, scen["text"], 1, scen)
-
-        packs = cards.generate_game_packs(num_players, scen["line"], game_type=game_type, required_positions=scen.get("required_positions"))
         # Баланс спец-карт: карта обмена характеристикой (swap_*)
         # может достаться только ОДНОМУ игроку за матч.
         # Остальные игроки получают карты из пула без обменов.
@@ -1191,7 +1349,7 @@ async def start_game(callback: types.CallbackQuery):
             f"{scen['text']}\n\n"
             f"👥 <b>ПРЕТЕНДЕНТЫ НА КОНТРАКТ:</b>\n{players_list_str}\n"
             f"───────────────────\n"
-            f"📩 <i>Карточки и спец-карты отправлены в ЛС.</i>{pm_warning}\n"
+            f"📩 <i>Карточки, спец-карты и тайные цели отправлены в ЛС.</i>{pm_warning}\n"
             f"⏳ <i>Раунд 1 начнется через 10 секунд!</i>"
         )
         await bot.send_message(chat_id, scenario_msg, parse_mode="HTML")
@@ -1256,12 +1414,12 @@ async def cmd_profile(message: types.Message):
 
 async def private_menu_markup():
     builder = InlineKeyboardBuilder()
-    for text, data in [("👤 Профиль","menu:profile"),("🪙 Валюта / Квесты","menu:wallet"),("🛍 Магазин","menu:shop"),("⭐ За Stars","menu:stars"),("🎒 Мои покупки","menu:inventory"),("🃏 Моя карточка","menu:card"),("📜 Правила","menu:rules")]:
+    for text, data in [("👤 Профиль","menu:profile"),("🪙 Валюта / Квесты","menu:wallet"),("🛍 Магазин","menu:shop"),("⭐ За Stars","menu:stars"),("🎒 Мои покупки","menu:inventory"),("🃏 Моя карточка","menu:card"),("🤝 Друзья","menu:ref"),("📜 Правила","menu:rules")]:
         builder.button(text=text, callback_data=data)
     try:
         me = await bot.get_me(); builder.button(text="➕ Добавить в группу", url=f"https://t.me/{me.username}?startgroup=true")
     except Exception: pass
-    builder.adjust(2,2,2,1)
+    builder.adjust(2,2,2,2,1)
     return builder.as_markup()
 
 async def private_welcome_text():
@@ -1537,9 +1695,60 @@ async def settings_callback(callback: types.CallbackQuery):
     await callback.message.edit_text(await settings_text(chat_id), reply_markup=settings_keyboard(st), parse_mode="HTML")
     await callback.answer("Настройки сохранены для группы")
 
+async def handle_referral_start(message: types.Message):
+    """Обрабатывает /start ref_<id>: запоминает, кто пригласил нового игрока."""
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].startswith("ref_"):
+        return
+    try:
+        referrer_id = int(parts[1][4:])
+    except ValueError:
+        return
+    try:
+        if await db.register_referral(message.from_user.id, referrer_id):
+            await message.answer(
+                f"🤝 <b>Ты пришёл по приглашению!</b>\nСыграй первую игру — и вы оба получите монеты "
+                f"(тебе <b>{REF_INVITEE_BONUS} 🪙</b>).",
+                parse_mode="HTML")
+    except Exception as e:
+        print(f"[REFERRAL] Не удалось записать приглашение: {e}")
+
+
+async def referral_text(user_id: int, name: str) -> str:
+    await db.get_user_profile(user_id, name)  # гарантируем, что профиль существует
+    invited, rewarded = await db.get_referral_stats(user_id)
+    username = await get_bot_username()
+    link = f"https://t.me/{username}?start=ref_{user_id}"
+    return (
+        "🤝 <b>ПРИГЛАСИ ДРУЗЕЙ</b>\n───────────────────\n"
+        f"Твоя личная ссылка:\n<code>{link}</code>\n\n"
+        f"🎁 Когда друг сыграет свою первую игру, ты получишь <b>{REF_REFERRER_BONUS} 🪙</b>, а он — <b>{REF_INVITEE_BONUS} 🪙</b>.\n"
+        f"👥 Приглашено: <b>{invited}</b> · наград получено: <b>{rewarded}</b>\n\n"
+        "<i>Награда начисляется один раз за каждого приглашённого — после завершённой игры.</i>"
+    )
+
+
+@dp.message(Command("ref"))
+async def cmd_ref(message: types.Message):
+    if message.chat.type != "private":
+        username = await get_bot_username()
+        return await message.answer(f"🤝 Реферальная ссылка выдаётся в личных сообщениях: напиши мне в ЛС — https://t.me/{username}")
+    await message.answer(await referral_text(message.from_user.id, message.from_user.first_name), parse_mode="HTML",
+                         link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+@dp.callback_query(F.data == "menu:ref")
+async def menu_ref(callback: types.CallbackQuery):
+    await callback.message.edit_text(await referral_text(callback.from_user.id, callback.from_user.first_name),
+                                     reply_markup=await private_menu_markup(), parse_mode="HTML",
+                                     link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await callback.answer()
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     if message.chat.type == "private":
+        await handle_referral_start(message)
         await message.answer(await private_welcome_text(), reply_markup=await private_menu_markup(), parse_mode="HTML")
     else:
         await message.answer("⚡️ <b>ФУТБОЛЬНЫЙ БУНКЕР</b> ⚽️\n───────────────────\nВведи <code>/game</code>, чтобы создать игру.", parse_mode="HTML")
@@ -1548,14 +1757,14 @@ async def get_rules_text():
     return (
         "📜 <b>ПРАВИЛА «ФУТБОЛЬНОГО БУНКЕРА»</b>\n───────────────────\n"
         "⚽ <b>Цель:</b> остаться в финальной паре и доказать ИИ, что команда подходит под сценарий.\n\n"
-        "🃏 <b>Карточки:</b> позиция, возраст, цена, здоровье, навык, багаж и секрет. В каждом раунде по очереди раскрывается одна карта.\n\n"
+        "🃏 <b>Карточки:</b> позиция, возраст, цена, здоровье, навык, контракт, характер, багаж и секрет. В каждом раунде по очереди раскрывается одна карта. Багаж даёт пассивные бонусы: например, личный врач прикроет от медосмотра.\n\n📋 <b>Сценарий:</b> список понятных условий (позиции, цена, возраст, здоровье, навыки, контракт, характер). Нарушение любого пункта в финале = провал. Решение всегда существует.\n\n🌪 <b>События и повороты:</b> между раундами случаются события (утечка в прессу, медосмотр, допинг-контроль), а в середине игры сюжет может измениться — условия обновятся.\n\n🎯 <b>Тайная цель:</b> у каждого игрока есть личная цель с наградой в монетах. О ней знаешь только ты — результаты вскрываются в финале.\n\n"
         "💬 <b>Обсуждение:</b> после вскрытия игроки обсуждают состав. Некоторые спецкарты можно использовать скрытно именно здесь.\n\n"
         "🗳 <b>Голосование:</b> нельзя голосовать за себя. Игрок с наибольшим числом голосов выбывает.\n\n"
         "⏭️ <b>СКИП:</b> можно выбрать максимум 3 раза за игру. Если скип набирает максимум или сравнивается с лидером, никто не выбывает. Пенальти за скип не запускается.\n\n"
         "🤝 <b>Ничья:</b> при равенстве лидеров никто не выбывает. Две ничьи подряд запускают пенальти.\n\n"
         "🎴 <b>Спецкарты:</b> одноразовые и могут менять ход игры. Некоторые действия скрыты от группы. Карты обмена характеристиками получает только один игрок за матч.\n\n"
-        "🏆 <b>Финал:</b> оставшиеся игроки проходят проверку ИИ-судьи. После окончания бот раскрывает карточки всех участников.\n\n"
-        "📋 <b>Команды:</b> /game — игра в группе, /profile — статистика, /card — актуальная карточка в ЛС, /stop — остановить игру."
+        "🏆 <b>Финал:</b> оставшиеся игроки проходят проверку условий сценария. После окончания бот раскрывает карточки всех участников.\n\n"
+        "📋 <b>Команды:</b> /game — игра в группе, /profile — статистика, /card — актуальная карточка в ЛС, /ref — пригласить друзей и получить монеты, /stop — остановить игру."
     )
 
 @dp.message(Command("rules"))
@@ -1826,7 +2035,8 @@ async def process_vote(callback: types.CallbackQuery):
         if await db.get_voters_count(chat_id) >= len(alive_players):
             await finish_voting_flow(chat_id)
     except Exception as e:
-        await callback.answer(f"❌ Ошибка голосования: {e}", show_alert=True)
+        print(f"[VOTE] Ошибка голосования: {type(e).__name__}: {e}")
+        await callback.answer("❌ Не удалось принять голос. Попробуй ещё раз.", show_alert=True)
 
 async def finish_voting_flow(chat_id: int):
     lobby = await db.get_lobby(chat_id)
