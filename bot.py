@@ -645,7 +645,7 @@ async def grant_referral_rewards(all_players: list):
                     pass
         except Exception as e:
             print(f"[REFERRAL] Не удалось выдать награду для {p_id}: {e}")
-            async def announce_winners_and_end(chat_id: int, alive_players: list):
+async def announce_winners_and_end(chat_id: int, alive_players: list):
     # Сохраняем данные игры ДО перевода лобби в ended.
     # Это гарантирует, что сценарий и статистика не потеряются в финале.
     lobby_before_end = await db.get_lobby(chat_id)
