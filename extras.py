@@ -201,7 +201,7 @@ def _e_scout(alive, labels, rng):
         rng.shuffle(others)
         for o in others:
             hidden = [k for k, v in o["pack"].items()
-                      if k in labels and k not in o["revealed"] and v not in (None, "")]
+                      if k in labels and k != "club" and k not in o["revealed"] and v not in (None, "", "-")]
             if hidden:
                 key = rng.choice(hidden)
                 val = o["pack"][key]
