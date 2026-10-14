@@ -63,6 +63,11 @@ GEMINI_CACHE = {}
 # Сообщения «очередь игрока» в общем чате. Удаляются сразу после вскрытия карты.
 REVEAL_QUEUE_MESSAGES = {}
 
+# Ожидающие подтверждения действия «Вспышка»: (chat_id, actor_id) -> (target_user_id, дедлайн).
+# callback_data приходит от клиента и может быть подделана, поэтому вскрытие по
+# «Вспышке» разрешено только сразу после реального выбора цели владельцем карты.
+PENDING_FLASH_ACTIONS = {}
+
 def format_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     minutes, secs = divmod(seconds, 60)
@@ -219,8 +224,8 @@ SHOP_ITEMS = {
     "victory_cold": {"type": "victory", "name": "🧊 Без лишних слов", "price": 1800, "desc": "Сдержанная подача после победы."},
     "victory_last": {"type": "victory", "name": "🚪 Последний в бункере", "price": 2200, "desc": "Фраза после победы."},
 }
-# Служебный титул создателя: не отображается в магазине, но считается покупкой владельца.
-SHOP_ITEMS["title_creator"] = {"type": "title", "name": "👑 Создатель игры", "price": 0, "desc": "Уникальный титул владельца Football Bunker."}
+# Служебный титул создателя: скрыт от покупки в магазине, но считается покупкой владельца.
+SHOP_ITEMS["title_creator"] = {"type": "title", "name": "👑 Создатель игры", "price": 0, "desc": "Уникальный титул владельца Football Bunker.", "hidden": True}
 
 # Платные товары только за Telegram Stars (XTR). Никакого P2W.
 STAR_PRODUCTS = {
@@ -266,7 +271,7 @@ async def economy_profile_text(user_id: int, username: str) -> str:
 async def economy_shop_text(user_id: int, category: str = "home") -> str:
     coins = await db.get_coins(user_id)
     if category == "titles":
-        items = [(i,x) for i,x in SHOP_ITEMS.items() if x["type"] == "title"]
+        items = [(i,x) for i,x in SHOP_ITEMS.items() if x["type"] == "title" and not x.get("hidden")]
         title = "🏷 <b>ТИТУЛЫ</b>"
         note = "Титул отображается рядом с именем в профиле."
     elif category == "phrases":
@@ -301,6 +306,8 @@ async def shop_keyboard(user_id: int, category: str = "home"):
     else:
         eq = await db.get_equipped(user_id)
         for item_id, item in SHOP_ITEMS.items():
+            if item.get("hidden"):
+                continue
             if item["type"] != ("title" if category == "titles" else "victory"):
                 continue
             owned = await db.has_purchase(user_id, item_id)
@@ -1043,7 +1050,7 @@ async def process_secret_target(callback: types.CallbackQuery):
     if actor_id not in alive_ids or target_user_id not in alive_ids or actor_id == target_user_id:
         return await callback.answer("❌ Некорректная цель.", show_alert=True)
     spec_info = await db.get_player_special_info(chat_id, actor_id)
-    if not spec_info or spec_info[1] or spec_info[0] != card_code:
+    if not spec_info or spec_info[1] or spec_info[2] or spec_info[0] != card_code:
         return await callback.answer("❌ Эта спец-карта уже недоступна.", show_alert=True)
     lobby = await db.get_lobby(chat_id)
     if not lobby or lobby[0] != "discussion":
@@ -1078,6 +1085,19 @@ async def process_special_target(callback: types.CallbackQuery):
     alive_players = await db.get_alive_players(chat_id)
     if actor.id not in {p[1] for p in alive_players}:
         return await callback.answer("❌ Выбывшие игроки не могут использовать спец-карты!", show_alert=True)
+
+    # БЕЗОПАСНОСТЬ: callback_data подделываема, поэтому второй шаг обязан сам
+    # убедиться, что карту применяет её владелец, карта не использована
+    # и не заблокирована Желтой карточкой.
+    if not await is_game_active(chat_id):
+        return await callback.answer("❌ Игра не активна!", show_alert=True)
+
+    actor_spec = await db.get_player_special_info(chat_id, actor.id)
+    if not actor_spec or actor_spec[1] or actor_spec[2] or actor_spec[0] != card_code:
+        return await callback.answer("❌ Эта спец-карта тебе не доступна.", show_alert=True)
+
+    if target_user_id == actor.id or target_user_id not in {p[1] for p in alive_players}:
+        return await callback.answer("❌ Некорректная цель.", show_alert=True)
 
     target_info = await db.get_player_special_info(chat_id, target_user_id)
     if target_info and target_info[3] == 1:
@@ -1169,6 +1189,8 @@ async def process_special_target(callback: types.CallbackQuery):
                     callback_data=f"act_flash:{u_trait}:{target_user_id}:{chat_id}"
                 )
             builder.adjust(2)
+            # Разрешаем ровно одно вскрытие: выбранная цель + 10 минут на выбор карты.
+            PENDING_FLASH_ACTIONS[(chat_id, actor.id)] = (target_user_id, time.time() + 600)
             await callback.message.edit_text(
                 f"📸 <b>ВСПЫШКА:</b> Выбери, какую закрытую карту игрока <b>{html.escape(target_name)}</b> принудительно вскрыть в общий чат:",
                 reply_markup=builder.as_markup(), parse_mode="HTML"
@@ -1192,7 +1214,7 @@ async def process_special_target(callback: types.CallbackQuery):
             await refresh_private_card(chat_id, actor.id)
             await refresh_private_card(chat_id, target_user_id)
 
-            await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(a_trait, a_trait)}] случайно поменялась с закрытой картой {target_name}!", parse_mode="HTML")
+            await bot.send_message(actor.id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(a_trait, a_trait)}] случайно поменялась с закрытой картой {html.escape(target_name)}!", parse_mode="HTML")
             await bot.send_message(target_user_id, f"🎲 <b>Трансферный хаос:</b> Твоя закрытая карта [{TRAIT_LABELS.get(t_trait, t_trait)}] случайно поменялась с чужой закрытой картой!", parse_mode="HTML")
         await callback.message.edit_text("✅ Спец-карта успешно использована!")
 
@@ -1210,6 +1232,15 @@ async def process_flash_reveal(callback: types.CallbackQuery):
     if actor.id not in {p[1] for p in alive_players}:
         return await callback.answer("❌ Выбывшие игроки не могут вскрывать карты!", show_alert=True)
 
+    # БЕЗОПАСНОСТЬ: callback_data подделываема. Вскрыть карту по "Вспышке" можно
+    # только если владелец спец-карты реально выбрал ЭТУ цель на предыдущем шаге.
+    if not await is_game_active(chat_id):
+        return await callback.answer("❌ Игра не активна!", show_alert=True)
+    pending_flash = PENDING_FLASH_ACTIONS.get((chat_id, actor.id))
+    if not pending_flash or pending_flash[0] != target_user_id or pending_flash[1] < time.time():
+        return await callback.answer("❌ Действие «Вспышка» не подтверждено. Сначала выбери цель через свою спец-карту.", show_alert=True)
+    PENDING_FLASH_ACTIONS.pop((chat_id, actor.id), None)
+
     valid_traits = await get_game_traits(chat_id)
     if trait not in valid_traits:
         return await callback.answer("❌ Эта карта отсутствует в текущем режиме игры.", show_alert=True)
@@ -1217,6 +1248,8 @@ async def process_flash_reveal(callback: types.CallbackQuery):
     pack = await db.get_player_pack(chat_id, target_user_id)
     if trait not in pack or pack.get(trait) in (None, ""):
         return await callback.answer("❌ Значение карты не найдено.", show_alert=True)
+    if trait not in await db.get_unrevealed_traits(chat_id, target_user_id, valid_traits):
+        return await callback.answer("❌ Эта карта уже открыта.", show_alert=True)
     val = pack[trait]
     if trait == "age":
         val = f"{val} лет"
