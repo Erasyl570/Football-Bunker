@@ -402,6 +402,9 @@ async def purchase_item(user_id: int, item_id: str, price: int) -> bool:
         return True
 
 async def equip_item(user_id: int, item_type: str, item_id: str):
+    allowed_types = {"title", "frame", "card_theme", "victory", "badge"}
+    if item_type not in allowed_types:
+        return
     if _stats_pool:
         async with _stats_pool.acquire() as conn:
             await conn.execute(f"UPDATE bunker_economy SET equipped_{item_type} = $2 WHERE user_id = $1", user_id, item_id)
@@ -1007,11 +1010,8 @@ async def has_revealed_in_round(chat_id: int, user_id: int, round_num: int) -> b
             return await cursor.fetchone() is not None
 
 async def get_unrevealed_traits(chat_id: int, user_id: int, all_traits=None):
-    # Список характеристик зависит от режима игры. В старой версии здесь
-    # всегда были характеристики игрока, поэтому в режиме клубов бот мог
-    # автоматически выбрать несуществующий "Навык" или "Багаж".
     if all_traits is None:
-        all_traits = ["position", "age", "price", "health", "skill", "inventory", "secret"]
+        all_traits = ["position", "age", "price", "health", "skill", "contract", "vibe", "inventory", "secret"]
     async with connect_db() as db:
         async with db.execute("SELECT trait FROM reveals WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)) as cursor:
             revealed = [row[0] for row in await cursor.fetchall()]
@@ -1079,7 +1079,6 @@ async def get_skip_votes_count(chat_id: int) -> int:
         async with db.execute(query, (chat_id,)) as cursor:
             row = await cursor.fetchone()
             return int(row[0] or 0)
-
 async def get_votes_detailed(chat_id: int):
     async with connect_db() as db:
         query = """
@@ -1090,7 +1089,7 @@ async def get_votes_detailed(chat_id: int):
             LEFT JOIN hidden_captains hc
               ON hc.chat_id = v.chat_id
              AND hc.round_num = (SELECT current_round FROM lobbies WHERE chat_id = v.chat_id)
-            WHERE v.chat_id = ? AND v.target_id != 0
+            WHERE v.chat_id = ? AND v.target_id != 0 AND p.is_alive = 1
             GROUP BY v.target_id, p.user_name
             ORDER BY cnt DESC
         """
